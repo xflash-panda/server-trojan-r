@@ -1,7 +1,14 @@
 use h2::Ping;
-use tracing::{warn, debug};
+use tracing::{debug, warn};
 
-use super::{PING_INTERVAL_SECS, PING_TIMEOUT_SECS, MAX_MISSED_PINGS};
+/// Ping interval in seconds
+const PING_INTERVAL_SECS: u64 = 30;
+
+/// Ping timeout in seconds
+const PING_TIMEOUT_SECS: u64 = 20;
+
+/// Maximum missed pings before connection is considered dead
+const MAX_MISSED_PINGS: u32 = 3;
 
 pub(crate) struct H2Heartbeat {
     ping_pong: Option<h2::PingPong>,
@@ -31,7 +38,7 @@ impl H2Heartbeat {
 
     pub async fn poll(&mut self) -> Result<(), &'static str> {
         let waiting_pong = matches!(self.state, HeartbeatState::WaitingPong(_));
-        
+
         if waiting_pong {
             if let Some(ref mut pp) = self.ping_pong {
                 tokio::select! {
@@ -106,4 +113,3 @@ impl H2Heartbeat {
         }
     }
 }
-

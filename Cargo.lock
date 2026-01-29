@@ -1497,6 +1497,7 @@ dependencies = [
  "pin-project-lite",
  "rustls",
  "rustls-pemfile",
+ "scopeguard",
  "serde",
  "sha2",
  "tempfile",

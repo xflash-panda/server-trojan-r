@@ -1,17 +1,28 @@
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use bytes::{BytesMut, Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
+use h2::{Reason, RecvStream, SendStream};
+use std::collections::VecDeque;
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::io;
-use std::collections::VecDeque;
-use h2::{SendStream, RecvStream, Reason};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 
-use super::codec::{parse_grpc_message, encode_grpc_message};
-use super::{MAX_FRAME_SIZE, GRPC_MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE};
+use super::codec::{encode_grpc_message, parse_grpc_message};
+
+/// Read buffer size for gRPC transport
+const READ_BUFFER_SIZE: usize = 512 * 1024;
+
+/// Maximum frame size for HTTP/2
+pub(super) const MAX_FRAME_SIZE: u32 = 64 * 1024;
+
+/// Maximum gRPC message size
+const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
+
+/// Maximum send queue bytes
+pub(super) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;
 
 /// gRPC 传输层（兼容 v2ray）
-/// 
+///
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
 pub struct GrpcH2cTransport {
     pub(crate) recv_stream: RecvStream,
@@ -88,7 +99,8 @@ impl GrpcH2cTransport {
 
             let capacity = self.send_stream.capacity();
             if capacity == 0 {
-                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
+                self.send_stream
+                    .reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
                 match self.send_stream.poll_capacity(cx) {
                     Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
                     Poll::Ready(Some(Ok(_))) => return Poll::Pending,
@@ -109,8 +121,9 @@ impl GrpcH2cTransport {
             }
 
             let send_size = remaining.min(capacity);
-            let chunk = frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
-            
+            let chunk =
+                frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
+
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
                     self.current_frame_offset += send_size;
@@ -173,22 +186,23 @@ impl AsyncRead for GrpcH2cTransport {
                 Ok(Some((consumed, payload))) => {
                     let to_copy = payload.len().min(buf.remaining());
                     buf.put_slice(&payload[..to_copy]);
-                    
+
                     if to_copy < payload.len() {
                         self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
                         self.read_pos = 0;
                     }
-                    
+
                     self.read_pending.advance(consumed);
-                    
+
                     let to_release = self.pending_release_capacity.min(consumed);
                     if to_release > 0 {
-                        if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
+                        if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release)
+                        {
                             warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
                         }
                         self.pending_release_capacity -= to_release;
                     }
-                    
+
                     return Poll::Ready(Ok(()));
                 }
                 Ok(None) => {}
@@ -230,7 +244,7 @@ impl AsyncWrite for GrpcH2cTransport {
         if self.closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "transport closed"
+                "transport closed",
             )));
         }
 
@@ -251,25 +265,19 @@ impl AsyncWrite for GrpcH2cTransport {
         Poll::Ready(Ok(to_write))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_send_queued(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed = true;
-        
+
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {
                 if self.current_frame.is_some() || !self.send_queue.is_empty() {
                     return Poll::Pending;
                 }
-                
+
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert("grpc-status", "0".parse().unwrap());
                 match self.send_stream.send_trailers(trailers) {
@@ -291,4 +299,3 @@ impl AsyncWrite for GrpcH2cTransport {
         }
     }
 }
-
