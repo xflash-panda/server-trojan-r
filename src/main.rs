@@ -1,24 +1,24 @@
-mod utils;
-mod udp;
 mod address;
 mod config;
-mod tls;
-mod ws;
-mod grpc;
 mod error;
+mod grpc;
 mod logger;
 mod relay;
+mod tls;
+mod udp;
+mod utils;
+mod ws;
 
 use logger::log;
 
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use anyhow::{Result, anyhow};
 use tokio_rustls::TlsAcceptor;
-use bytes::Bytes;
 
 const BUF_SIZE: usize = 32 * 1024;
 
@@ -141,20 +141,19 @@ impl TrojanRequest {
 
         let payload = Bytes::copy_from_slice(&buf[cursor..]);
 
-        Ok((TrojanRequest {
-            password,
-            cmd,
-            addr,
-            payload,
-        }, cursor))
+        Ok((
+            TrojanRequest {
+                password,
+                cmd,
+                addr,
+                payload,
+            },
+            cursor,
+        ))
     }
 }
 
-async fn handle_connection<S>(
-    server: Arc<Server>,
-    stream: S,
-    peer_addr: String,
-) -> Result<()>
+async fn handle_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -170,7 +169,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // 读取 Trojan 请求
     let mut buf = vec![0u8; BUF_SIZE];
     let n = stream.read(&mut buf).await?;
-    
+
     if n == 0 {
         return Err(anyhow!("Connection closed before receiving request"));
     }
@@ -188,7 +187,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
         return Err(anyhow!("Incorrect password"));
     }
-    
+
     log::authentication(&peer_addr, true);
 
     match request.cmd {
@@ -200,7 +199,13 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
                 return Err(anyhow!("UDP support is disabled"));
             }
-            udp::handle_udp_associate(Arc::clone(&server.udp_associations), stream, request.addr, peer_addr).await
+            udp::handle_udp_associate(
+                Arc::clone(&server.udp_associations),
+                stream,
+                request.addr,
+                peer_addr,
+            )
+            .await
         }
     }
 }
@@ -214,7 +219,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     peer_addr: String,
 ) -> Result<()> {
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
-    
+
     let remote_addr = target_addr.to_socket_addr().await?;
     let mut remote_stream = match tokio::time::timeout(
         tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
@@ -245,7 +250,9 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         client_stream,
         remote_stream,
         CONNECTION_TIMEOUT_SECS,
-    ).await {
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
             log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
@@ -258,13 +265,8 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-
 // 连接检测与分发
-pub async fn accept_connection<S>(
-    server: Arc<Server>,
-    stream: S,
-    peer_addr: String,
-) -> Result<()>
+pub async fn accept_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -273,14 +275,14 @@ where
             let peer_addr_for_log = peer_addr.clone();
             log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
             let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
-            let result = grpc_conn.run(move |transport| {
-                let server = Arc::clone(&server);
-                let peer_addr = peer_addr.clone();
-                async move {
-                    handle_connection(server, transport, peer_addr).await
-                }
-            }).await;
-            
+            let result = grpc_conn
+                .run(move |transport| {
+                    let server = Arc::clone(&server);
+                    let peer_addr = peer_addr.clone();
+                    async move { handle_connection(server, transport, peer_addr).await }
+                })
+                .await;
+
             match &result {
                 Ok(()) => {
                     log::info!(peer = %peer_addr_for_log, "gRPC connection closed normally");
@@ -296,9 +298,7 @@ where
             let ws_transport = ws::WebSocketTransport::new(ws_stream);
             handle_connection(server, ws_transport, peer_addr).await
         }
-        TransportMode::Tcp => {
-            handle_connection(server, stream, peer_addr).await
-        }
+        TransportMode::Tcp => handle_connection(server, stream, peer_addr).await,
     }
 }
 
@@ -312,7 +312,7 @@ impl Server {
             TransportMode::Grpc => "gRPC",
         };
         let tls_enabled = server.tls_acceptor.is_some();
-        
+
         log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
 
         // UDP清理任务
@@ -323,7 +323,7 @@ impl Server {
                 Ok((stream, addr)) => {
                     log::connection(&addr.to_string(), "new");
                     let server_clone = Arc::clone(&server);
-                    
+
                     tokio::spawn(async move {
                         let peer_addr = addr.to_string();
                         let result = async {
@@ -373,8 +373,9 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(addr).await?;
     let password = utils::password_to_hex(&config.password);
-    let enable_ws = config.enable_ws;
-    let enable_grpc = config.enable_grpc;
+    let enable_ws = config.enable_ws.unwrap_or(false);
+    let enable_grpc = config.enable_grpc.unwrap_or(false);
+    let enable_udp = config.enable_udp.unwrap_or(true);
     let transport_mode = if enable_grpc {
         TransportMode::Grpc
     } else if enable_ws {
@@ -383,13 +384,13 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         TransportMode::Tcp
     };
 
-    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key, transport_mode);
+    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key, transport_mode)?;
 
     Ok(Server {
         listener,
         password,
         transport_mode,
-        enable_udp: config.enable_udp,
+        enable_udp,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
     })
@@ -399,9 +400,9 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 async fn main() -> Result<()> {
     let log_level = logger::get_log_level_from_args();
     logger::init_logger(log_level);
-    
+
     let config = config::ServerConfig::load()?;
-    
+
     let server = build_server(config).await?;
     server.run().await
 }

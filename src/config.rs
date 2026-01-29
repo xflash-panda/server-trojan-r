@@ -1,5 +1,5 @@
-use clap::Parser;
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
@@ -19,16 +19,16 @@ pub struct ServerConfig {
     pub password: String,
 
     /// Enable WebSocket mode
-    #[arg(long, default_value_t = false)]
-    pub enable_ws: bool,
+    #[arg(long)]
+    pub enable_ws: Option<bool>,
 
     /// Enable gRPC mode
-    #[arg(long, default_value_t = false)]
-    pub enable_grpc: bool,
+    #[arg(long)]
+    pub enable_grpc: Option<bool>,
 
     /// Enable UDP support
-    #[arg(long, default_value_t = true)]
-    pub enable_udp: bool,
+    #[arg(long)]
+    pub enable_udp: Option<bool>,
 
     /// TLS certificate file path (optional)
     #[arg(long)]
@@ -81,13 +81,13 @@ impl ServerConfig {
             if config.password.is_empty() {
                 config.password = file_config.password;
             }
-            if !config.enable_ws {
+            if config.enable_ws.is_none() {
                 config.enable_ws = file_config.enable_ws;
             }
-            if !config.enable_grpc {
+            if config.enable_grpc.is_none() {
                 config.enable_grpc = file_config.enable_grpc;
             }
-            if config.enable_udp {
+            if config.enable_udp.is_none() {
                 config.enable_udp = file_config.enable_udp;
             }
             if config.cert.is_none() {
@@ -103,12 +103,25 @@ impl ServerConfig {
 
         // 验证密码不为空
         if config.password.is_empty() {
-            return Err(anyhow!("Password must be provided either via --password or config file"));
+            return Err(anyhow!(
+                "Password must be provided either via --password or config file"
+            ));
         }
 
-        if config.enable_ws && config.enable_grpc {
-            return Err(anyhow!("WebSocket mode and gRPC mode cannot be enabled simultaneously"));
+        // Apply defaults for Option<bool> fields
+        let enable_ws = config.enable_ws.unwrap_or(false);
+        let enable_grpc = config.enable_grpc.unwrap_or(false);
+        let enable_udp = config.enable_udp.unwrap_or(true);
+
+        if enable_ws && enable_grpc {
+            return Err(anyhow!(
+                "WebSocket mode and gRPC mode cannot be enabled simultaneously"
+            ));
         }
+
+        config.enable_ws = Some(enable_ws);
+        config.enable_grpc = Some(enable_grpc);
+        config.enable_udp = Some(enable_udp);
 
         Ok(config)
     }
@@ -201,9 +214,9 @@ impl TomlConfig {
             host: self.server.host,
             port: self.server.port,
             password: self.server.password,
-            enable_ws: self.server.enable_ws,
-            enable_grpc: self.server.enable_grpc,
-            enable_udp: self.server.enable_udp,
+            enable_ws: Some(self.server.enable_ws),
+            enable_grpc: Some(self.server.enable_grpc),
+            enable_udp: Some(self.server.enable_udp),
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
             config_file: None,
@@ -216,13 +229,15 @@ impl TomlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_toml_config_from_file() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, r#"
+        writeln!(
+            file,
+            r#"
 [server]
 host = "0.0.0.0"
 port = "8080"
@@ -230,7 +245,9 @@ password = "test_password"
 enable_ws = true
 enable_grpc = false
 enable_udp = true
-"#).unwrap();
+"#
+        )
+        .unwrap();
 
         let config = TomlConfig::from_file(file.path()).unwrap();
         assert_eq!(config.server.host, "0.0.0.0");
@@ -244,7 +261,9 @@ enable_udp = true
     #[test]
     fn test_toml_config_with_tls() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, r#"
+        writeln!(
+            file,
+            r#"
 [server]
 host = "127.0.0.1"
 port = "443"
@@ -253,7 +272,9 @@ password = "secure_password"
 [tls]
 cert = "/path/to/cert.pem"
 key = "/path/to/key.pem"
-"#).unwrap();
+"#
+        )
+        .unwrap();
 
         let config = TomlConfig::from_file(file.path()).unwrap();
         assert!(config.tls.is_some());
@@ -265,7 +286,9 @@ key = "/path/to/key.pem"
     #[test]
     fn test_toml_config_with_log() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, r#"
+        writeln!(
+            file,
+            r#"
 [server]
 host = "127.0.0.1"
 port = "8080"
@@ -273,7 +296,9 @@ password = "test"
 
 [log]
 level = "debug"
-"#).unwrap();
+"#
+        )
+        .unwrap();
 
         let config = TomlConfig::from_file(file.path()).unwrap();
         assert!(config.log.is_some());
@@ -282,7 +307,9 @@ level = "debug"
 
     #[test]
     fn test_toml_config_default_log_level() {
-        let log = LogSettings { level: default_log_level() };
+        let log = LogSettings {
+            level: default_log_level(),
+        };
         assert_eq!(log.level, "info");
     }
 
@@ -315,9 +342,9 @@ level = "debug"
         assert_eq!(server_config.host, "0.0.0.0");
         assert_eq!(server_config.port, "8080");
         assert_eq!(server_config.password, "test");
-        assert!(server_config.enable_ws);
-        assert!(!server_config.enable_grpc);
-        assert!(server_config.enable_udp);
+        assert_eq!(server_config.enable_ws, Some(true));
+        assert_eq!(server_config.enable_grpc, Some(false));
+        assert_eq!(server_config.enable_udp, Some(true));
         assert_eq!(server_config.cert, Some("/cert.pem".to_string()));
         assert_eq!(server_config.key, Some("/key.pem".to_string()));
         assert_eq!(server_config.log_level, Some("debug".to_string()));
@@ -368,5 +395,95 @@ level = "debug"
         let debug_str = format!("{:?}", settings);
         assert!(debug_str.contains("127.0.0.1"));
         assert!(debug_str.contains("8080"));
+    }
+
+    // Tests for Option<bool> config merge behavior
+    #[test]
+    fn test_server_config_enable_flags_defaults() {
+        // Test that Option<bool> fields properly apply defaults
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: "8080".to_string(),
+            password: "test".to_string(),
+            enable_ws: None,
+            enable_grpc: None,
+            enable_udp: None,
+            cert: None,
+            key: None,
+            config_file: None,
+            generate_config: None,
+            log_level: None,
+        };
+
+        // Verify defaults: ws=false, grpc=false, udp=true
+        assert_eq!(config.enable_ws.unwrap_or(false), false);
+        assert_eq!(config.enable_grpc.unwrap_or(false), false);
+        assert_eq!(config.enable_udp.unwrap_or(true), true);
+    }
+
+    #[test]
+    fn test_server_config_enable_udp_can_be_disabled_from_file() {
+        // This tests the fix for the enable_udp merge logic bug
+        // Previously, enable_udp=false in config file would be ignored
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[server]
+host = "0.0.0.0"
+port = "8080"
+password = "test"
+enable_udp = false
+"#
+        )
+        .unwrap();
+
+        let toml_config = TomlConfig::from_file(file.path()).unwrap();
+        let server_config = toml_config.to_server_config();
+
+        // Verify enable_udp=false is correctly preserved from file
+        assert_eq!(server_config.enable_udp, Some(false));
+    }
+
+    #[test]
+    fn test_server_config_option_bool_explicit_values() {
+        // Test that explicit true/false values are properly wrapped in Some()
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: "8080".to_string(),
+            password: "test".to_string(),
+            enable_ws: Some(true),
+            enable_grpc: Some(false),
+            enable_udp: Some(false), // Explicitly disabled
+            cert: None,
+            key: None,
+            config_file: None,
+            generate_config: None,
+            log_level: None,
+        };
+
+        assert_eq!(config.enable_ws, Some(true));
+        assert_eq!(config.enable_grpc, Some(false));
+        assert_eq!(config.enable_udp, Some(false));
+    }
+
+    #[test]
+    fn test_toml_config_enable_udp_default_is_true() {
+        // Test that TOML config defaults enable_udp to true when not specified
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[server]
+host = "127.0.0.1"
+port = "8080"
+password = "test"
+"#
+        )
+        .unwrap();
+
+        let config = TomlConfig::from_file(file.path()).unwrap();
+        // enable_udp should default to true when not specified
+        assert!(config.server.enable_udp);
     }
 }

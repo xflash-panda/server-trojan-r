@@ -1,9 +1,5 @@
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{
-    fmt::time::LocalTime,
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-};
+use tracing_subscriber::{fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Log level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +44,8 @@ impl Default for LogLevel {
 pub fn get_log_level_from_args() -> Option<LogLevel> {
     let args: Vec<String> = std::env::args().collect();
 
-    let log_level_from_cli = args.iter()
+    let log_level_from_cli = args
+        .iter()
         .position(|a| a == "--log-level")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| LogLevel::from_str(s));
@@ -61,22 +58,27 @@ pub fn get_log_level_from_args() -> Option<LogLevel> {
         .position(|a| a == "--config-file" || a == "-c")
         .and_then(|i| args.get(i + 1))
         .and_then(|config_path| {
-            std::fs::read_to_string(config_path).ok()
+            std::fs::read_to_string(config_path)
+                .ok()
                 .and_then(|content| {
-                    toml::from_str::<toml::Value>(&content).ok()
+                    toml::from_str::<toml::Value>(&content)
+                        .ok()
                         .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
                         .and_then(|s| LogLevel::from_str(&s))
                 })
         })
 }
 
+/// Time format for log timestamps
+const LOG_TIME_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+    "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]"
+);
+
 pub fn init_logger(log_level: Option<LogLevel>) {
     let level = log_level.unwrap_or_default();
 
     let filter = tracing_subscriber::filter::Targets::new()
-        .with_targets(vec![
-            ("trojan_rs", level.to_level_filter()),
-        ])
+        .with_targets(vec![("trojan_rs", level.to_level_filter())])
         .with_default(LevelFilter::INFO);
 
     let registry = tracing_subscriber::registry();
@@ -85,11 +87,7 @@ pub fn init_logger(log_level: Option<LogLevel>) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_timer(LocalTime::new(
-                    time::format_description::parse(
-                        "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]"
-                    ).unwrap(),
-                ))
+                .with_timer(LocalTime::new(LOG_TIME_FORMAT)),
         )
         .init();
 }
@@ -115,7 +113,12 @@ pub mod log {
     #[allow(dead_code)]
     pub fn transport(transport: &str, event: &str, details: Option<&str>) {
         if let Some(details) = details {
-            info!(transport = transport, event = event, details = details, "Transport");
+            info!(
+                transport = transport,
+                event = event,
+                details = details,
+                "Transport"
+            );
         } else {
             info!(transport = transport, event = event, "Transport");
         }
@@ -129,5 +132,62 @@ pub mod log {
         } else {
             debug!(event = event, "Protocol");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_level_from_str_valid() {
+        assert_eq!(LogLevel::from_str("trace"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::from_str("debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::from_str("info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::from_str("warn"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::from_str("error"), Some(LogLevel::Error));
+    }
+
+    #[test]
+    fn test_log_level_from_str_case_insensitive() {
+        assert_eq!(LogLevel::from_str("TRACE"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::from_str("Debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::from_str("INFO"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::from_str("WARN"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::from_str("Error"), Some(LogLevel::Error));
+    }
+
+    #[test]
+    fn test_log_level_from_str_invalid() {
+        assert_eq!(LogLevel::from_str("invalid"), None);
+        assert_eq!(LogLevel::from_str(""), None);
+        assert_eq!(LogLevel::from_str("warning"), None);
+    }
+
+    #[test]
+    fn test_log_level_to_level_filter() {
+        assert_eq!(LogLevel::Trace.to_level_filter(), LevelFilter::TRACE);
+        assert_eq!(LogLevel::Debug.to_level_filter(), LevelFilter::DEBUG);
+        assert_eq!(LogLevel::Info.to_level_filter(), LevelFilter::INFO);
+        assert_eq!(LogLevel::Warn.to_level_filter(), LevelFilter::WARN);
+        assert_eq!(LogLevel::Error.to_level_filter(), LevelFilter::ERROR);
+    }
+
+    #[test]
+    fn test_log_level_default() {
+        assert_eq!(LogLevel::default(), LogLevel::Info);
+    }
+
+    #[test]
+    fn test_log_time_format_is_valid() {
+        // This test verifies that the compile-time format description is valid
+        // by checking it can format a time without panicking
+        use time::OffsetDateTime;
+        let now = OffsetDateTime::now_utc();
+        let formatted = now.format(LOG_TIME_FORMAT);
+        assert!(formatted.is_ok());
+        let formatted_str = formatted.unwrap();
+        // Format: "YY-MM-DD HH:MM:SS"
+        assert!(formatted_str.len() >= 17);
     }
 }
