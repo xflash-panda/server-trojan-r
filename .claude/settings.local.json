@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(cargo test:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: Trojan protocol server in Rust\n\n- Core Trojan protocol implementation with TCP/WebSocket/gRPC transports\n- UDP association support\n- TLS encryption support\n- TOML configuration file support\n- Comprehensive unit tests \\(96 tests\\)\n- CI/CD workflows for testing and multi-platform builds\n- Code coverage with tarpaulin\nEOF\n\\)\")"
+    ]
+  }
+}
