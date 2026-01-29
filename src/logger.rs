@@ -1,12 +1,11 @@
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
-    fmt,
+    fmt::time::LocalTime,
     layer::SubscriberExt,
     util::SubscriberInitExt,
-    EnvFilter,
 };
-use toml;
 
-/// 日志级别
+/// Log level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Trace,
@@ -17,7 +16,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// 从字符串解析日志级别
+    /// Parse log level from string
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "trace" => Some(LogLevel::Trace),
@@ -29,13 +28,13 @@ impl LogLevel {
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn to_level_filter(&self) -> LevelFilter {
         match self {
-            LogLevel::Trace => "trace",
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
+            LogLevel::Trace => LevelFilter::TRACE,
+            LogLevel::Debug => LevelFilter::DEBUG,
+            LogLevel::Info => LevelFilter::INFO,
+            LogLevel::Warn => LevelFilter::WARN,
+            LogLevel::Error => LevelFilter::ERROR,
         }
     }
 }
@@ -48,16 +47,16 @@ impl Default for LogLevel {
 
 pub fn get_log_level_from_args() -> Option<LogLevel> {
     let args: Vec<String> = std::env::args().collect();
-    
+
     let log_level_from_cli = args.iter()
         .position(|a| a == "--log-level")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| LogLevel::from_str(s));
-    
+
     if log_level_from_cli.is_some() {
         return log_level_from_cli;
     }
-    
+
     args.iter()
         .position(|a| a == "--config-file" || a == "-c")
         .and_then(|i| args.get(i + 1))
@@ -72,24 +71,25 @@ pub fn get_log_level_from_args() -> Option<LogLevel> {
 }
 
 pub fn init_logger(log_level: Option<LogLevel>) {
-    let filter = if let Ok(env_filter) = EnvFilter::try_from_default_env() {
-        env_filter
-    } else {
-        let level = log_level.unwrap_or_default();
-        EnvFilter::new(&format!("trojan_rs={}", level.as_str()))
-    };
+    let level = log_level.unwrap_or_default();
 
-    tracing_subscriber::registry()
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_targets(vec![
+            ("trojan_rs", level.to_level_filter()),
+        ])
+        .with_default(LevelFilter::INFO);
+
+    let registry = tracing_subscriber::registry();
+    registry
         .with(filter)
         .with(
-            fmt::layer()
+            tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_thread_ids(false)
-                .with_thread_names(false)
-                .with_file(false)
-                .with_line_number(true)
-                .with_ansi(true)
-                .compact(),
+                .with_timer(LocalTime::new(
+                    time::format_description::parse(
+                        "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]"
+                    ).unwrap(),
+                ))
         )
         .init();
 }
@@ -97,12 +97,12 @@ pub fn init_logger(log_level: Option<LogLevel>) {
 pub mod log {
     pub use tracing::{debug, error, info, warn};
 
-    /// 记录连接事件
+    /// Log connection events
     pub fn connection(addr: &str, event: &str) {
         info!(peer = addr, event = event, "Connection");
     }
 
-    /// 记录认证事件
+    /// Log authentication events
     pub fn authentication(addr: &str, success: bool) {
         if success {
             info!(peer = addr, "Authentication successful");
@@ -111,7 +111,7 @@ pub mod log {
         }
     }
 
-    /// 记录传输层事件
+    /// Log transport layer events
     #[allow(dead_code)]
     pub fn transport(transport: &str, event: &str, details: Option<&str>) {
         if let Some(details) = details {
@@ -121,7 +121,7 @@ pub mod log {
         }
     }
 
-    /// 记录协议解析事件
+    /// Log protocol parsing events
     #[allow(dead_code)]
     pub fn protocol(event: &str, error: Option<&str>) {
         if let Some(err) = error {
@@ -131,4 +131,3 @@ pub mod log {
         }
     }
 }
-
