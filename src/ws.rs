@@ -1,16 +1,19 @@
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_tungstenite::{WebSocketStream as TungsteniteStream, tungstenite::Message};
-use futures_util::{Stream, Sink};
+use bytes::Bytes;
+use futures_util::{Sink, Stream};
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::io;
-use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream as TungsteniteStream};
+
+/// Initial write buffer capacity (4KB - typical MTU size)
+const INITIAL_WRITE_BUFFER_CAPACITY: usize = 4 * 1024;
 
 pub struct WebSocketTransport<S> {
     ws_stream: Pin<Box<TungsteniteStream<S>>>,
     read_buffer: Bytes,
     read_pos: usize,
-    write_buffer: Vec<u8>,  // 保持 Vec<u8>， WebSocket 库需要
+    write_buffer: Vec<u8>, // 保持 Vec<u8>， WebSocket 库需要
     write_pending: bool,
     closed: bool,
 }
@@ -24,7 +27,8 @@ where
             ws_stream: Box::pin(ws_stream),
             read_buffer: Bytes::new(),
             read_pos: 0,
-            write_buffer: Vec::new(),
+            // Pre-allocate write buffer to reduce reallocation during writes
+            write_buffer: Vec::with_capacity(INITIAL_WRITE_BUFFER_CAPACITY),
             write_pending: false,
             closed: false,
         }
@@ -66,7 +70,8 @@ where
                 buf.put_slice(&data[..to_copy]);
 
                 if to_copy < data.len() {
-                    self.read_buffer = Bytes::copy_from_slice(&data[to_copy..]);
+                    // Zero-copy: convert Vec to Bytes and slice, avoiding copy_from_slice
+                    self.read_buffer = Bytes::from(data).slice(to_copy..);
                     self.read_pos = 0;
                 }
 
@@ -138,29 +143,23 @@ where
 
         // 将新数据添加到缓冲区
         self.write_buffer.extend_from_slice(buf);
-        
+
         // 尝试立即发送
         match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
             Poll::Ready(Ok(())) => {
                 let data = std::mem::take(&mut self.write_buffer);
                 match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
-                    Ok(()) => {
-                        Poll::Ready(Ok(buf.len()))
-                    }
-                    Err(e) => {
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("WebSocket send error: {}", e),
-                        )))
-                    }
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("WebSocket send error: {}", e),
+                    ))),
                 }
             }
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("WebSocket error: {}", e),
-                )))
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("WebSocket error: {}", e),
+            ))),
             Poll::Pending => {
                 self.write_pending = true;
                 Poll::Ready(Ok(buf.len()))
@@ -168,17 +167,17 @@ where
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // 确保所有待发送的数据都已发送
         if self.write_pending {
             match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
                 Poll::Ready(Ok(())) => {
                     if !self.write_buffer.is_empty() {
                         let data = std::mem::take(&mut self.write_buffer);
-                        match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
+                        match Sink::start_send(
+                            self.ws_stream.as_mut(),
+                            Message::Binary(data.into()),
+                        ) {
                             Ok(()) => {
                                 self.write_pending = false;
                             }
@@ -203,14 +202,15 @@ where
             }
         }
 
-        Sink::poll_flush(self.ws_stream.as_mut(), cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("WebSocket flush error: {}", e)))
+        Sink::poll_flush(self.ws_stream.as_mut(), cx).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("WebSocket flush error: {}", e),
+            )
+        })
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed = true;
         // 刷新所有待发送的数据
         // WebSocket 连接的关闭由底层流处理，这里只需要确保数据已刷新

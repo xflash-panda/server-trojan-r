@@ -154,4 +154,3 @@ mod tests {
         assert!(test_fn().is_err());
     }
 }
-

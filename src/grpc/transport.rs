@@ -9,8 +9,11 @@ use tracing::warn;
 
 use super::codec::{encode_grpc_message, parse_grpc_message};
 
-/// Read buffer size for gRPC transport
-const READ_BUFFER_SIZE: usize = 512 * 1024;
+/// Initial read buffer size for gRPC transport (start small, grow as needed)
+const INITIAL_READ_BUFFER_SIZE: usize = 8 * 1024; // 8KB initial
+
+/// Maximum read buffer size for gRPC transport
+const MAX_READ_BUFFER_SIZE: usize = 512 * 1024; // 512KB max
 
 /// Maximum frame size for HTTP/2
 pub(super) const MAX_FRAME_SIZE: u32 = 64 * 1024;
@@ -43,7 +46,8 @@ impl GrpcH2cTransport {
         Self {
             recv_stream,
             send_stream,
-            read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
+            // Start with small buffer, will grow on demand
+            read_pending: BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE),
             read_buf: Bytes::new(),
             read_pos: 0,
             pending_release_capacity: 0,
@@ -52,6 +56,18 @@ impl GrpcH2cTransport {
             current_frame: None,
             current_frame_offset: 0,
             closed: false,
+        }
+    }
+
+    /// Ensure read buffer has capacity, growing if needed up to max
+    #[inline]
+    fn ensure_read_capacity(&mut self, additional: usize) {
+        let needed = self.read_pending.len() + additional;
+        if self.read_pending.capacity() < needed {
+            let new_capacity = needed
+                .max(self.read_pending.capacity() * 2)
+                .min(MAX_READ_BUFFER_SIZE);
+            self.read_pending.reserve(new_capacity - self.read_pending.len());
         }
     }
 
@@ -212,6 +228,8 @@ impl AsyncRead for GrpcH2cTransport {
             match self.recv_stream.poll_data(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     let chunk_len = chunk.len();
+                    // Ensure capacity before extending (lazy growth)
+                    self.ensure_read_capacity(chunk_len);
                     self.read_pending.extend_from_slice(&chunk);
                     self.pending_release_capacity += chunk_len;
                 }
@@ -297,5 +315,47 @@ impl AsyncWrite for GrpcH2cTransport {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_buffer_size() {
+        // Verify initial buffer size is small
+        assert_eq!(INITIAL_READ_BUFFER_SIZE, 8 * 1024);
+        assert!(INITIAL_READ_BUFFER_SIZE < MAX_READ_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn test_max_buffer_size() {
+        // Verify max buffer size
+        assert_eq!(MAX_READ_BUFFER_SIZE, 512 * 1024);
+    }
+
+    #[test]
+    fn test_buffer_constants_ratio() {
+        // Initial should be much smaller than max (at least 10x smaller)
+        assert!(INITIAL_READ_BUFFER_SIZE * 10 <= MAX_READ_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn test_grpc_max_message_size() {
+        // Verify gRPC message size limit
+        assert_eq!(GRPC_MAX_MESSAGE_SIZE, 32 * 1024);
+    }
+
+    #[test]
+    fn test_max_send_queue_bytes() {
+        // Verify send queue limit
+        assert_eq!(MAX_SEND_QUEUE_BYTES, 512 * 1024);
+    }
+
+    #[test]
+    fn test_max_frame_size() {
+        // Verify HTTP/2 frame size limit
+        assert_eq!(MAX_FRAME_SIZE, 64 * 1024);
     }
 }

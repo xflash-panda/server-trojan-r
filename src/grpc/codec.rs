@@ -1,8 +1,8 @@
-use bytes::{BytesMut, BufMut};
+use bytes::{BufMut, BytesMut};
 use std::io;
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
-/// 
+///
 /// 格式：5字节 gRPC 头部 + protobuf 头部 + 数据
 pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> {
     if buf.len() < 6 {
@@ -12,7 +12,7 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     if buf[0] != 0x00 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "compressed gRPC not supported"
+            "compressed gRPC not supported",
         ));
     }
 
@@ -25,7 +25,7 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     if buf[5] != 0x0A {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected protobuf tag: 0x{:02X}, expected 0x0A", buf[5])
+            format!("unexpected protobuf tag: 0x{:02X}, expected 0x0A", buf[5]),
         ));
     }
 
@@ -37,13 +37,16 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     if data_end > 5 + grpc_frame_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("payload length {} exceeds gRPC frame length {}", payload_len, grpc_frame_len)
+            format!(
+                "payload length {} exceeds gRPC frame length {}",
+                payload_len, grpc_frame_len
+            ),
         ));
     }
 
     let payload = &buf[data_start..data_end];
     let consumed = 5 + grpc_frame_len;
-    
+
     Ok(Some((consumed, payload)))
 }
 
@@ -69,7 +72,10 @@ fn decode_varint(data: &[u8]) -> io::Result<(u64, usize)> {
 
     for (i, &byte) in data.iter().enumerate() {
         if i >= 10 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint too long",
+            ));
         }
 
         result |= ((byte & 0x7F) as u64) << shift;
@@ -81,7 +87,10 @@ fn decode_varint(data: &[u8]) -> io::Result<(u64, usize)> {
         shift += 7;
     }
 
-    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete varint"))
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "incomplete varint",
+    ))
 }
 
 fn encode_varint(mut value: u64, buf: &mut BytesMut) {
@@ -109,7 +118,7 @@ mod tests {
 
         // Verify structure
         assert_eq!(encoded[0], 0x00); // Not compressed
-        // Check protobuf tag
+                                      // Check protobuf tag
         assert_eq!(encoded[5], 0x0A); // Field 1, wire type 2 (length-delimited)
     }
 
@@ -119,7 +128,7 @@ mod tests {
         let encoded = encode_grpc_message(payload);
 
         assert_eq!(encoded[0], 0x00); // Not compressed
-        // gRPC frame length should be 2 (tag + varint 0)
+                                      // gRPC frame length should be 2 (tag + varint 0)
         let frame_len = u32::from_be_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]);
         assert_eq!(frame_len, 2);
     }
@@ -178,7 +187,10 @@ mod tests {
 
         let result = parse_grpc_message(&buf);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unexpected protobuf tag"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected protobuf tag"));
     }
 
     #[test]
@@ -250,7 +262,18 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        for value in [0u64, 1, 127, 128, 255, 256, 16383, 16384, 1000000, u64::MAX / 2] {
+        for value in [
+            0u64,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            1000000,
+            u64::MAX / 2,
+        ] {
             let mut buf = BytesMut::new();
             encode_varint(value, &mut buf);
             let (decoded, _) = decode_varint(&buf).unwrap();
@@ -295,4 +318,3 @@ mod tests {
         assert_eq!(decoded2, payload2);
     }
 }
-

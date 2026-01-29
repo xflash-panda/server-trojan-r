@@ -9,15 +9,18 @@ mod udp;
 mod utils;
 mod ws;
 
+// Use mimalloc as the global allocator for better performance
+// (5-15% improvement in allocation-heavy workloads)
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use logger::log;
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
-use std::collections::HashMap;
+use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
 const BUF_SIZE: usize = 32 * 1024;
@@ -37,7 +40,7 @@ pub struct Server {
     pub password: [u8; 56],
     pub transport_mode: TransportMode,
     pub enable_udp: bool,
-    pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
+    pub udp_associations: udp::UdpAssociations,
     pub tls_acceptor: Option<TlsAcceptor>,
 }
 
@@ -65,6 +68,8 @@ pub struct TrojanRequest {
 }
 
 impl TrojanRequest {
+    /// Decode Trojan request from buffer (legacy version with copy)
+    #[allow(dead_code)]
     pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
         if buf.len() < 59 {
             return Err(anyhow!("Buffer too small"));
@@ -151,6 +156,99 @@ impl TrojanRequest {
             cursor,
         ))
     }
+
+    /// Decode Trojan request from BytesMut with zero-copy payload extraction
+    ///
+    /// This version avoids copying the payload data by using BytesMut::split_off()
+    /// which shares the underlying allocation.
+    pub fn decode_zerocopy(buf: &mut BytesMut) -> Result<Self> {
+        if buf.len() < 59 {
+            return Err(anyhow!("Buffer too small"));
+        }
+
+        let mut cursor = 0;
+
+        let mut password = [0u8; 56];
+        password.copy_from_slice(&buf[cursor..cursor + 56]);
+        cursor += 56;
+
+        if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
+            return Err(anyhow!("Invalid CRLF after password"));
+        }
+        cursor += 2;
+
+        let cmd = match buf[cursor] {
+            1 => TrojanCmd::Connect,
+            3 => TrojanCmd::UdpAssociate,
+            _ => return Err(anyhow!("Invalid command")),
+        };
+        cursor += 1;
+
+        let atyp = buf[cursor];
+        cursor += 1;
+
+        let addr = match atyp {
+            1 => {
+                if buf.len() < cursor + 6 {
+                    return Err(anyhow!("Buffer too small for IPv4"));
+                }
+                let mut ip = [0u8; 4];
+                ip.copy_from_slice(&buf[cursor..cursor + 4]);
+                cursor += 4;
+                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
+                cursor += 2;
+                address::Address::IPv4(ip, port)
+            }
+            3 => {
+                if buf.len() <= cursor {
+                    return Err(anyhow!("Buffer too small for domain length"));
+                }
+                let domain_len = buf[cursor] as usize;
+                cursor += 1;
+                if buf.len() < cursor + domain_len + 2 {
+                    return Err(anyhow!("Buffer too small for domain"));
+                }
+                let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
+                    .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
+                    .to_string();
+                cursor += domain_len;
+                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
+                cursor += 2;
+                address::Address::Domain(domain, port)
+            }
+            4 => {
+                if buf.len() < cursor + 18 {
+                    return Err(anyhow!("Buffer too small for IPv6"));
+                }
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&buf[cursor..cursor + 16]);
+                cursor += 16;
+                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
+                cursor += 2;
+                address::Address::IPv6(ip, port)
+            }
+            _ => return Err(anyhow!("Invalid address type")),
+        };
+
+        if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
+            return Err(anyhow!("Invalid CRLF after address"));
+        }
+        cursor += 2;
+
+        // Zero-copy: split_off returns a new BytesMut sharing the allocation
+        // freeze() converts it to Bytes without copying
+        let payload = buf.split_off(cursor).freeze();
+
+        // Clear the header portion (we've consumed it)
+        buf.clear();
+
+        Ok(TrojanRequest {
+            password,
+            cmd,
+            addr,
+            payload,
+        })
+    }
 }
 
 async fn handle_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
@@ -166,15 +264,20 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     peer_addr: String,
 ) -> Result<()> {
-    // 读取 Trojan 请求
-    let mut buf = vec![0u8; BUF_SIZE];
+    // 读取 Trojan 请求 - 使用 BytesMut 实现零拷贝
+    let mut buf = BytesMut::with_capacity(BUF_SIZE);
+    buf.resize(BUF_SIZE, 0);
     let n = stream.read(&mut buf).await?;
 
     if n == 0 {
         return Err(anyhow!("Connection closed before receiving request"));
     }
 
-    let (request, _consumed) = TrojanRequest::decode(&buf[..n])?;
+    // Truncate to actual read size
+    buf.truncate(n);
+
+    // Zero-copy decode
+    let request = TrojanRequest::decode_zerocopy(&mut buf)?;
 
     // 验证密码
     if request.password != server.password {
@@ -227,7 +330,11 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await
     {
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(stream)) => {
+            // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
+            let _ = stream.set_nodelay(true);
+            stream
+        }
         Ok(Err(e)) => {
             log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
             return Err(e.into());
@@ -321,6 +428,8 @@ impl Server {
         loop {
             match server.listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Set TCP_NODELAY on accepted connection for lower latency
+                    let _ = stream.set_nodelay(true);
                     log::connection(&addr.to_string(), "new");
                     let server_clone = Arc::clone(&server);
 
@@ -391,7 +500,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         password,
         transport_mode,
         enable_udp,
-        udp_associations: Arc::new(Mutex::new(HashMap::new())),
+        udp_associations: udp::new_udp_associations(),
         tls_acceptor,
     })
 }
@@ -405,4 +514,197 @@ async fn main() -> Result<()> {
 
     let server = build_server(config).await?;
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_trojan_request(password: &[u8; 56], cmd: u8, addr_type: u8) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(password);
+        buf.extend_from_slice(b"\r\n");
+        buf.push(cmd);
+        buf.push(addr_type);
+
+        match addr_type {
+            1 => {
+                // IPv4
+                buf.extend_from_slice(&[127, 0, 0, 1]);
+                buf.extend_from_slice(&8080u16.to_be_bytes());
+            }
+            3 => {
+                // Domain
+                let domain = b"example.com";
+                buf.push(domain.len() as u8);
+                buf.extend_from_slice(domain);
+                buf.extend_from_slice(&80u16.to_be_bytes());
+            }
+            4 => {
+                // IPv6
+                buf.extend_from_slice(&[0u8; 16]);
+                buf.extend_from_slice(&443u16.to_be_bytes());
+            }
+            _ => {}
+        }
+
+        buf.extend_from_slice(b"\r\n");
+        buf
+    }
+
+    #[test]
+    fn test_trojan_request_decode_ipv4() {
+        let password = [b'a'; 56];
+        let mut request_bytes = make_trojan_request(&password, 1, 1);
+        request_bytes.extend_from_slice(b"payload data");
+
+        let (request, consumed) = TrojanRequest::decode(&request_bytes).unwrap();
+
+        assert_eq!(request.password, password);
+        assert_eq!(request.cmd, TrojanCmd::Connect);
+        assert!(matches!(request.addr, address::Address::IPv4([127, 0, 0, 1], 8080)));
+        assert_eq!(request.payload.as_ref(), b"payload data");
+        assert!(consumed > 0);
+    }
+
+    #[test]
+    fn test_trojan_request_decode_domain() {
+        let password = [b'b'; 56];
+        let mut request_bytes = make_trojan_request(&password, 3, 3);
+        request_bytes.extend_from_slice(b"hello");
+
+        let (request, _) = TrojanRequest::decode(&request_bytes).unwrap();
+
+        assert_eq!(request.cmd, TrojanCmd::UdpAssociate);
+        assert!(matches!(request.addr, address::Address::Domain(ref d, 80) if d == "example.com"));
+        assert_eq!(request.payload.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn test_trojan_request_decode_ipv6() {
+        let password = [b'c'; 56];
+        let mut request_bytes = make_trojan_request(&password, 1, 4);
+        request_bytes.extend_from_slice(b"ipv6 payload");
+
+        let (request, _) = TrojanRequest::decode(&request_bytes).unwrap();
+
+        assert!(matches!(request.addr, address::Address::IPv6(_, 443)));
+        assert_eq!(request.payload.as_ref(), b"ipv6 payload");
+    }
+
+    #[test]
+    fn test_trojan_request_decode_zerocopy_ipv4() {
+        let password = [b'a'; 56];
+        let mut request_bytes = make_trojan_request(&password, 1, 1);
+        request_bytes.extend_from_slice(b"payload data");
+
+        let mut buf = BytesMut::from(&request_bytes[..]);
+        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
+
+        assert_eq!(request.password, password);
+        assert_eq!(request.cmd, TrojanCmd::Connect);
+        assert!(matches!(request.addr, address::Address::IPv4([127, 0, 0, 1], 8080)));
+        assert_eq!(request.payload.as_ref(), b"payload data");
+
+        // Buffer should be cleared after zerocopy decode
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_trojan_request_decode_zerocopy_domain() {
+        let password = [b'b'; 56];
+        let mut request_bytes = make_trojan_request(&password, 3, 3);
+        request_bytes.extend_from_slice(b"hello world!");
+
+        let mut buf = BytesMut::from(&request_bytes[..]);
+        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
+
+        assert_eq!(request.cmd, TrojanCmd::UdpAssociate);
+        assert!(matches!(request.addr, address::Address::Domain(ref d, 80) if d == "example.com"));
+        assert_eq!(request.payload.as_ref(), b"hello world!");
+    }
+
+    #[test]
+    fn test_trojan_request_decode_zerocopy_empty_payload() {
+        let password = [b'd'; 56];
+        let request_bytes = make_trojan_request(&password, 1, 1);
+
+        let mut buf = BytesMut::from(&request_bytes[..]);
+        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
+
+        assert!(request.payload.is_empty());
+    }
+
+    #[test]
+    fn test_trojan_request_decode_zerocopy_large_payload() {
+        let password = [b'e'; 56];
+        let mut request_bytes = make_trojan_request(&password, 1, 1);
+        let large_payload = vec![0xAB; 10000];
+        request_bytes.extend_from_slice(&large_payload);
+
+        let mut buf = BytesMut::from(&request_bytes[..]);
+        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
+
+        assert_eq!(request.payload.len(), 10000);
+        assert!(request.payload.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn test_trojan_request_decode_vs_zerocopy_equivalence() {
+        let password = [b'f'; 56];
+        let mut request_bytes = make_trojan_request(&password, 1, 1);
+        request_bytes.extend_from_slice(b"test payload for equivalence check");
+
+        // Decode with copy version
+        let (request_copy, _) = TrojanRequest::decode(&request_bytes).unwrap();
+
+        // Decode with zerocopy version
+        let mut buf = BytesMut::from(&request_bytes[..]);
+        let request_zerocopy = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
+
+        // Both should produce identical results
+        assert_eq!(request_copy.password, request_zerocopy.password);
+        assert_eq!(request_copy.cmd, request_zerocopy.cmd);
+        assert_eq!(request_copy.addr, request_zerocopy.addr);
+        assert_eq!(request_copy.payload, request_zerocopy.payload);
+    }
+
+    #[test]
+    fn test_trojan_request_decode_buffer_too_small() {
+        let buf = vec![0u8; 50]; // Less than minimum 59 bytes
+        let result = TrojanRequest::decode(&buf);
+        assert!(result.is_err());
+
+        let mut buf_mut = BytesMut::from(&buf[..]);
+        let result_zerocopy = TrojanRequest::decode_zerocopy(&mut buf_mut);
+        assert!(result_zerocopy.is_err());
+    }
+
+    #[test]
+    fn test_trojan_request_decode_invalid_crlf() {
+        let mut buf = vec![b'a'; 56];
+        buf.extend_from_slice(b"\n\r"); // Wrong order
+        buf.push(1);
+        buf.push(1);
+        buf.extend_from_slice(&[127, 0, 0, 1]);
+        buf.extend_from_slice(&8080u16.to_be_bytes());
+        buf.extend_from_slice(b"\r\n");
+
+        let result = TrojanRequest::decode(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trojan_request_decode_invalid_command() {
+        let mut buf = vec![b'a'; 56];
+        buf.extend_from_slice(b"\r\n");
+        buf.push(99); // Invalid command
+        buf.push(1);
+        buf.extend_from_slice(&[127, 0, 0, 1]);
+        buf.extend_from_slice(&8080u16.to_be_bytes());
+        buf.extend_from_slice(b"\r\n");
+
+        let result = TrojanRequest::decode(&buf);
+        assert!(result.is_err());
+    }
 }

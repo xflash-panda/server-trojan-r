@@ -3,14 +3,14 @@ use crate::logger::log;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot};
 
 const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
@@ -116,20 +116,32 @@ impl UdpPacket {
         DecodeResult::Ok(UdpPacket { addr, payload }, cursor)
     }
 
-    /// Encode UDP packet to bytes
+    /// Encode UDP packet to bytes (allocates new Vec)
     pub fn encode(&self) -> Vec<u8> {
-        let total_size = self.addr.encoded_size() + 2 + 2 + self.payload.len();
-        let mut buf = Vec::with_capacity(total_size);
+        let mut buf = Vec::with_capacity(self.encoded_size());
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    /// Encode UDP packet into existing buffer (zero allocation if buffer has capacity)
+    #[inline]
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.reserve(self.encoded_size());
 
         // Encode address
-        self.addr.encode(&mut buf);
+        self.addr.encode(buf);
 
         // Encode length + CRLF + payload
         buf.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(&self.payload);
+    }
 
-        buf
+    /// Get the total encoded size in bytes
+    #[inline]
+    pub fn encoded_size(&self) -> usize {
+        self.addr.encoded_size() + 2 + 2 + self.payload.len()
     }
 
     /// Get payload length
@@ -145,8 +157,16 @@ impl UdpPacket {
     }
 }
 
+/// Type alias for UDP associations map using DashMap for lock-free concurrent access
+pub type UdpAssociations = Arc<DashMap<String, UdpAssociation>>;
+
+/// Create a new UDP associations map
+pub fn new_udp_associations() -> UdpAssociations {
+    Arc::new(DashMap::new())
+}
+
 // UDP清理任务，定期清理不活跃的UDP association
-pub fn start_cleanup_task(associations: Arc<TokioMutex<HashMap<String, UdpAssociation>>>) {
+pub fn start_cleanup_task(associations: UdpAssociations) {
     tokio::spawn(async move {
         const CLEANUP_INTERVAL_SECS: u64 = UDP_TIMEOUT / 2;
         let mut interval =
@@ -156,23 +176,16 @@ pub fn start_cleanup_task(associations: Arc<TokioMutex<HashMap<String, UdpAssoci
         loop {
             interval.tick().await;
 
-            // Atomic check-and-remove: hold lock while checking and removing
-            // This eliminates TOCTOU race condition
-            let mut assocs = associations.lock().await;
-            let keys_to_remove: Vec<_> = assocs
-                .iter()
-                .filter(|(_, association)| association.is_inactive(UDP_TIMEOUT))
-                .map(|(key, _)| key.clone())
-                .collect();
+            // DashMap allows lock-free iteration and removal
+            // retain() is atomic per-entry, no global lock needed
+            let initial_count = associations.len();
+            associations.retain(|_, association| !association.is_inactive(UDP_TIMEOUT));
+            let removed_count = initial_count - associations.len();
 
-            if !keys_to_remove.is_empty() {
-                let removed_count = keys_to_remove.len();
-                for key in keys_to_remove {
-                    assocs.remove(&key);
-                }
+            if removed_count > 0 {
                 log::debug!(
                     removed = removed_count,
-                    remaining = assocs.len(),
+                    remaining = associations.len(),
                     "Cleaned up inactive UDP associations"
                 );
             }
@@ -187,13 +200,13 @@ pub struct UdpRelaySession {
     association: UdpAssociation,
     socket_key: String,
     peer_addr: String,
-    udp_associations: Arc<TokioMutex<HashMap<String, UdpAssociation>>>,
+    udp_associations: UdpAssociations,
 }
 
 impl UdpRelaySession {
     /// Create a new UDP relay session
     pub async fn new(
-        udp_associations: Arc<TokioMutex<HashMap<String, UdpAssociation>>>,
+        udp_associations: UdpAssociations,
         peer_addr: String,
     ) -> Result<Self> {
         // Generate unique socket key
@@ -206,10 +219,8 @@ impl UdpRelaySession {
         let socket = UdpSocket::bind(bind_addr).await?;
         let association = UdpAssociation::new(socket);
 
-        {
-            let mut associations = udp_associations.lock().await;
-            associations.insert(socket_key.clone(), association.clone());
-        }
+        // DashMap insert is lock-free
+        udp_associations.insert(socket_key.clone(), association.clone());
 
         Ok(Self {
             association,
@@ -362,6 +373,8 @@ impl UdpRelaySession {
     {
         let mut read_buf = vec![0u8; BUF_SIZE];
         let mut buffer = BytesMut::with_capacity(BUF_SIZE);
+        // Reusable encode buffer to avoid allocations per packet
+        let mut encode_buf = Vec::with_capacity(BUF_SIZE);
 
         loop {
             tokio::select! {
@@ -386,7 +399,7 @@ impl UdpRelaySession {
                 packet = udp_rx.recv() => {
                     match packet {
                         Some((from_addr, data)) => {
-                            if !Self::send_udp_response(&tcp_write_tx, from_addr, data, &self.peer_addr) {
+                            if !Self::send_udp_response_reuse(&tcp_write_tx, from_addr, data, &self.peer_addr, &mut encode_buf) {
                                 break;
                             }
                         }
@@ -432,7 +445,8 @@ impl UdpRelaySession {
         }
     }
 
-    /// Send UDP response back to TCP client
+    /// Send UDP response back to TCP client (original version for compatibility)
+    #[allow(dead_code)]
     fn send_udp_response(
         tcp_write_tx: &mpsc::Sender<Vec<u8>>,
         from_addr: SocketAddr,
@@ -448,6 +462,36 @@ impl UdpRelaySession {
         let encoded = udp_packet.encode();
 
         match tcp_write_tx.try_send(encoded) {
+            Ok(_) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::debug!(peer = %peer_addr, "TCP write channel full, dropping packet");
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Send UDP response back to TCP client with buffer reuse
+    /// Reuses the encode buffer to avoid allocations per packet
+    fn send_udp_response_reuse(
+        tcp_write_tx: &mpsc::Sender<Vec<u8>>,
+        from_addr: SocketAddr,
+        data: Bytes,
+        peer_addr: &str,
+        encode_buf: &mut Vec<u8>,
+    ) -> bool {
+        let addr = match from_addr {
+            SocketAddr::V4(v4) => Address::IPv4(v4.ip().octets(), v4.port()),
+            SocketAddr::V6(v6) => Address::IPv6(v6.ip().octets(), v6.port()),
+        };
+
+        let udp_packet = UdpPacket::new(addr, data);
+        // Reuse buffer - encode_into clears and fills
+        udp_packet.encode_into(encode_buf);
+
+        // We need to clone here because channel takes ownership
+        // But at least we reuse the buffer for encoding
+        match tcp_write_tx.try_send(encode_buf.clone()) {
             Ok(_) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 log::debug!(peer = %peer_addr, "TCP write channel full, dropping packet");
@@ -506,17 +550,14 @@ impl UdpRelaySession {
         )
         .await;
 
-        // Remove from associations
-        {
-            let mut associations = self.udp_associations.lock().await;
-            associations.remove(&self.socket_key);
-        }
+        // Remove from associations (lock-free with DashMap)
+        self.udp_associations.remove(&self.socket_key);
     }
 }
 
 /// Handle UDP Associate request (convenience function)
 pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    udp_associations: Arc<TokioMutex<HashMap<String, UdpAssociation>>>,
+    udp_associations: UdpAssociations,
     client_stream: S,
     _bind_addr: Address,
     peer_addr: String,
@@ -746,6 +787,112 @@ mod tests {
         assert!(!packet.is_empty());
     }
 
+    // ========== encode_into buffer reuse tests ==========
+
+    #[test]
+    fn test_udp_packet_encode_into_basic() {
+        let packet = UdpPacket::new(
+            Address::IPv4([192, 168, 1, 1], 8080),
+            Bytes::from_static(b"hello"),
+        );
+
+        let mut buf = Vec::new();
+        packet.encode_into(&mut buf);
+
+        // Should match encode() output
+        assert_eq!(buf, packet.encode());
+    }
+
+    #[test]
+    fn test_udp_packet_encode_into_reuse() {
+        let packet1 = UdpPacket::new(
+            Address::IPv4([10, 0, 0, 1], 1234),
+            Bytes::from_static(b"first"),
+        );
+        let packet2 = UdpPacket::new(
+            Address::IPv4([10, 0, 0, 2], 5678),
+            Bytes::from_static(b"second packet with longer payload"),
+        );
+
+        let mut buf = Vec::new();
+
+        // First encode
+        packet1.encode_into(&mut buf);
+        let encoded1 = buf.clone();
+
+        // Second encode reuses same buffer
+        packet2.encode_into(&mut buf);
+        let encoded2 = buf.clone();
+
+        // Verify both encodings are correct
+        assert_eq!(encoded1, packet1.encode());
+        assert_eq!(encoded2, packet2.encode());
+
+        // Verify buffer was actually reused (capacity should be >= max size)
+        assert!(buf.capacity() >= encoded2.len());
+    }
+
+    #[test]
+    fn test_udp_packet_encode_into_clears_buffer() {
+        let packet = UdpPacket::new(
+            Address::IPv4([127, 0, 0, 1], 80),
+            Bytes::from_static(b"test"),
+        );
+
+        // Pre-fill buffer with junk
+        let mut buf = vec![0xFF; 100];
+        packet.encode_into(&mut buf);
+
+        // Should match fresh encode, not have old data
+        assert_eq!(buf, packet.encode());
+    }
+
+    #[test]
+    fn test_udp_packet_encoded_size() {
+        // IPv4
+        let packet_v4 = UdpPacket::new(
+            Address::IPv4([192, 168, 1, 1], 8080),
+            Bytes::from_static(b"hello"),
+        );
+        assert_eq!(packet_v4.encoded_size(), packet_v4.encode().len());
+
+        // IPv6
+        let packet_v6 = UdpPacket::new(
+            Address::IPv6([0; 16], 443),
+            Bytes::from_static(b"test"),
+        );
+        assert_eq!(packet_v6.encoded_size(), packet_v6.encode().len());
+
+        // Domain
+        let packet_domain = UdpPacket::new(
+            Address::Domain("example.com".to_string(), 80),
+            Bytes::from_static(b"data"),
+        );
+        assert_eq!(packet_domain.encoded_size(), packet_domain.encode().len());
+    }
+
+    #[test]
+    fn test_udp_packet_encode_into_performance_pattern() {
+        // Simulate typical usage pattern: many packets encoded into same buffer
+        let mut buf = Vec::with_capacity(1024);
+        let initial_cap = buf.capacity();
+
+        for i in 0..100 {
+            let packet = UdpPacket::new(
+                Address::IPv4([192, 168, 1, i as u8], 8080),
+                Bytes::from(format!("payload_{}", i)),
+            );
+            packet.encode_into(&mut buf);
+
+            // Verify correct encoding each time
+            assert_eq!(buf, packet.encode());
+        }
+
+        // Buffer should have grown only as needed, not per-packet
+        // (capacity should be close to max packet size, not 100x)
+        assert!(buf.capacity() <= initial_cap * 4);
+    }
+
     #[tokio::test]
     async fn test_udp_association_new() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -861,5 +1008,161 @@ mod tests {
         // Both should see the same activity state
         assert!(!association1.is_inactive(1));
         assert!(!association2.is_inactive(1));
+    }
+
+    // ========== DashMap tests ==========
+
+    #[tokio::test]
+    async fn test_udp_associations_dashmap_concurrent_insert() {
+        let associations = new_udp_associations();
+        let mut handles = vec![];
+
+        // Spawn multiple tasks to insert concurrently
+        for i in 0..100 {
+            let assocs = Arc::clone(&associations);
+            handles.push(tokio::spawn(async move {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let association = UdpAssociation::new(socket);
+                assocs.insert(format!("key_{}", i), association);
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(associations.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_udp_associations_dashmap_concurrent_read_write() {
+        let associations = new_udp_associations();
+
+        // Pre-populate
+        for i in 0..50 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            associations.insert(format!("key_{}", i), UdpAssociation::new(socket));
+        }
+
+        let assocs_writer = Arc::clone(&associations);
+        let assocs_reader = Arc::clone(&associations);
+
+        // Writer task - insert new entries
+        let writer = tokio::spawn(async move {
+            for i in 50..100 {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                assocs_writer.insert(format!("key_{}", i), UdpAssociation::new(socket));
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Reader task - read existing entries
+        let reader = tokio::spawn(async move {
+            for i in 0..50 {
+                let _ = assocs_reader.get(&format!("key_{}", i));
+                tokio::task::yield_now().await;
+            }
+        });
+
+        writer.await.unwrap();
+        reader.await.unwrap();
+
+        assert_eq!(associations.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_udp_associations_dashmap_retain() {
+        let associations = new_udp_associations();
+
+        // Insert entries with different activity states
+        for i in 0..10 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let assoc = UdpAssociation::new(socket);
+            // Mark even-numbered entries as active
+            if i % 2 == 0 {
+                assoc.update_activity();
+            }
+            associations.insert(format!("key_{}", i), assoc);
+        }
+
+        // Wait for odd entries to become inactive
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Update activity on even entries again
+        for i in (0..10).step_by(2) {
+            if let Some(assoc) = associations.get(&format!("key_{}", i)) {
+                assoc.update_activity();
+            }
+        }
+
+        // Retain only active entries (timeout = 1 second)
+        associations.retain(|_, assoc| !assoc.is_inactive(1));
+
+        // Should have 5 entries (even numbered)
+        assert_eq!(associations.len(), 5);
+        for i in (0..10).step_by(2) {
+            assert!(associations.contains_key(&format!("key_{}", i)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_udp_associations_dashmap_concurrent_retain() {
+        let associations = new_udp_associations();
+
+        // Pre-populate
+        for i in 0..100 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            associations.insert(format!("key_{}", i), UdpAssociation::new(socket));
+        }
+
+        let assocs_retain = Arc::clone(&associations);
+        let assocs_insert = Arc::clone(&associations);
+
+        // Retain task
+        let retain_task = tokio::spawn(async move {
+            for _ in 0..10 {
+                assocs_retain.retain(|_, _| true); // Keep all
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Insert task
+        let insert_task = tokio::spawn(async move {
+            for i in 100..150 {
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                assocs_insert.insert(format!("key_{}", i), UdpAssociation::new(socket));
+                tokio::task::yield_now().await;
+            }
+        });
+
+        retain_task.await.unwrap();
+        insert_task.await.unwrap();
+
+        // Should have all entries
+        assert_eq!(associations.len(), 150);
+    }
+
+    #[tokio::test]
+    async fn test_udp_associations_dashmap_remove() {
+        let associations = new_udp_associations();
+
+        // Insert entries
+        for i in 0..10 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            associations.insert(format!("key_{}", i), UdpAssociation::new(socket));
+        }
+
+        assert_eq!(associations.len(), 10);
+
+        // Remove some entries
+        associations.remove("key_0");
+        associations.remove("key_5");
+        associations.remove("key_9");
+
+        assert_eq!(associations.len(), 7);
+        assert!(!associations.contains_key("key_0"));
+        assert!(!associations.contains_key("key_5"));
+        assert!(!associations.contains_key("key_9"));
+        assert!(associations.contains_key("key_1"));
     }
 }

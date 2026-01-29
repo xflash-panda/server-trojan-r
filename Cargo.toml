@@ -29,6 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["tracing-log", "std", "local
 time = { version = "0.3", features = ["macros", "local-offset"] }
 pin-project-lite = "0.2"
 scopeguard = "1.2.0"
+dashmap = "6.1"
+moka = { version = "0.12", features = ["future"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tokio-test = "0.4"
