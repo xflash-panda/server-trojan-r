@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use moka::future::Cache;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -14,6 +14,55 @@ const DNS_NEGATIVE_CACHE_TTL_SECS: u64 = 30;
 
 /// Maximum number of DNS cache entries
 const DNS_CACHE_MAX_ENTRIES: u64 = 10_000;
+
+/// Check if an IP address is private/internal (DNS rebinding protection)
+fn is_private_ip(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()                    // 127.0.0.0/8
+                || ip.is_private()              // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || ip.is_link_local()           // 169.254.0.0/16
+                || ip.is_broadcast()            // 255.255.255.255
+                || ip.is_unspecified()          // 0.0.0.0
+                || is_shared_address(ip)        // 100.64.0.0/10 (CGNAT)
+                || is_benchmarking(ip)          // 198.18.0.0/15
+                || is_reserved(ip)              // 240.0.0.0/4
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()                    // ::1
+                || ip.is_unspecified()          // ::
+                || is_ipv6_unique_local(ip)     // fc00::/7
+                || is_ipv6_link_local(ip)       // fe80::/10
+        }
+    }
+}
+
+/// 100.64.0.0/10 - Shared Address Space (CGNAT)
+fn is_shared_address(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xC0) == 64
+}
+
+/// 198.18.0.0/15 - Benchmarking
+fn is_benchmarking(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 198 && (octets[1] & 0xFE) == 18
+}
+
+/// 240.0.0.0/4 - Reserved for future use
+fn is_reserved(ip: &Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
+/// fc00::/7 - Unique Local Addresses
+fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xFE00) == 0xFC00
+}
+
+/// fe80::/10 - Link-Local Addresses
+fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xFFC0) == 0xFE80
+}
 
 /// Cached DNS result
 #[derive(Clone, Debug)]
@@ -39,6 +88,9 @@ static ADDR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 pub const ATYP_IPV4: u8 = 1;
 pub const ATYP_DOMAIN: u8 = 3;
 pub const ATYP_IPV6: u8 = 4;
+
+/// Maximum domain name length (RFC 1035)
+const MAX_DOMAIN_LENGTH: usize = 255;
 
 /// Address decode result
 #[derive(Debug)]
@@ -100,6 +152,10 @@ impl Address {
                     return DecodeResult::NeedMoreData;
                 }
 
+                if domain_len > MAX_DOMAIN_LENGTH {
+                    return DecodeResult::Invalid("domain name too long");
+                }
+
                 let domain = match std::str::from_utf8(&buf[cursor..cursor + domain_len]) {
                     Ok(s) => s.to_string(),
                     Err(_) => return DecodeResult::Invalid("invalid UTF-8 in domain"),
@@ -135,8 +191,10 @@ impl Address {
             }
             Address::Domain(domain, port) => {
                 buf.push(ATYP_DOMAIN);
-                buf.push(domain.len() as u8);
-                buf.extend_from_slice(domain.as_bytes());
+                // Truncate domain if exceeds max length (should not happen with valid input)
+                let domain_len = domain.len().min(MAX_DOMAIN_LENGTH);
+                buf.push(domain_len as u8);
+                buf.extend_from_slice(&domain.as_bytes()[..domain_len]);
                 buf.extend_from_slice(&port.to_be_bytes());
             }
             Address::IPv6(ip, port) => {
@@ -150,10 +208,22 @@ impl Address {
     /// Get encoded size in bytes
     pub fn encoded_size(&self) -> usize {
         match self {
-            Address::IPv4(_, _) => 1 + 4 + 2,              // type + ip + port
-            Address::Domain(domain, _) => 1 + 1 + domain.len() + 2, // type + len + domain + port
-            Address::IPv6(_, _) => 1 + 16 + 2,            // type + ip + port
+            Address::IPv4(_, _) => 1 + 4 + 2, // type + ip + port
+            Address::Domain(domain, _) => {
+                // type + len + domain (capped) + port
+                1 + 1 + domain.len().min(MAX_DOMAIN_LENGTH) + 2
+            }
+            Address::IPv6(_, _) => 1 + 16 + 2, // type + ip + port
         }
+    }
+
+    /// Validate domain name and create Address
+    /// Returns None if domain exceeds maximum length
+    pub fn new_domain(domain: String, port: u16) -> Option<Self> {
+        if domain.len() > MAX_DOMAIN_LENGTH {
+            return None;
+        }
+        Some(Address::Domain(domain, port))
     }
 
     pub fn port(&self) -> u16 {
@@ -210,16 +280,32 @@ impl Address {
                 let addrs: Vec<SocketAddr> = addrs.collect();
                 if addrs.is_empty() {
                     let msg = format!("No addresses found for domain: {}", domain);
-                    // Use shorter TTL for negative cache
                     DNS_CACHE
                         .insert(cache_key, DnsCacheEntry::Failed(msg.clone()))
                         .await;
                     Err(anyhow!("{}", msg))
                 } else {
-                    DNS_CACHE
-                        .insert(cache_key, DnsCacheEntry::Success(addrs.clone()))
-                        .await;
-                    Ok(addrs[0])
+                    // Filter out private/internal IPs to prevent DNS rebinding attacks
+                    let public_addrs: Vec<SocketAddr> = addrs
+                        .into_iter()
+                        .filter(|addr| !is_private_ip(&addr.ip()))
+                        .collect();
+
+                    if public_addrs.is_empty() {
+                        let msg = format!(
+                            "DNS rebinding protection: domain {} resolved to private IP",
+                            domain
+                        );
+                        DNS_CACHE
+                            .insert(cache_key, DnsCacheEntry::Failed(msg.clone()))
+                            .await;
+                        Err(anyhow!("{}", msg))
+                    } else {
+                        DNS_CACHE
+                            .insert(cache_key, DnsCacheEntry::Success(public_addrs.clone()))
+                            .await;
+                        Ok(public_addrs[0])
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -534,10 +620,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_domain_to_socket_addr_localhost() {
+    async fn test_domain_to_socket_addr_localhost_blocked() {
+        // localhost resolves to 127.0.0.1 which is blocked by DNS rebinding protection
         let addr = Address::Domain("localhost".to_string(), 8080);
         let result = addr.to_socket_addr().await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("DNS rebinding protection"));
     }
 
     #[tokio::test]
@@ -569,23 +660,26 @@ mod tests {
     // ========== DNS cache tests ==========
 
     #[tokio::test]
-    async fn test_dns_cache_localhost() {
+    async fn test_dns_cache_private_ip_blocked() {
         // Clear cache first
         Address::clear_dns_cache().await;
 
+        // localhost resolves to private IP, should be blocked
         let addr = Address::Domain("localhost".to_string(), 9999);
 
-        // First call - cache miss
+        // First call - cache miss, blocked by DNS rebinding protection
         let result1 = addr.to_socket_addr().await;
-        assert!(result1.is_ok());
+        assert!(result1.is_err());
 
-        // Second call - should hit cache
+        // Second call - should hit negative cache
         let result2 = addr.to_socket_addr().await;
-        assert!(result2.is_ok());
+        assert!(result2.is_err());
 
-        // Both should return valid addresses
-        assert!(result1.unwrap().port() == 9999);
-        assert!(result2.unwrap().port() == 9999);
+        // Both should fail with DNS rebinding protection error
+        assert!(result1
+            .unwrap_err()
+            .to_string()
+            .contains("DNS rebinding protection"));
     }
 
     #[tokio::test]
@@ -631,15 +725,17 @@ mod tests {
         // Clear cache first
         Address::clear_dns_cache().await;
 
-        // Same domain, different ports should be cached separately
+        // Same domain (private IP), different ports should be cached separately
+        // Both should fail due to DNS rebinding protection
         let addr1 = Address::Domain("localhost".to_string(), 8080);
         let addr2 = Address::Domain("localhost".to_string(), 9090);
 
-        let result1 = addr1.to_socket_addr().await.unwrap();
-        let result2 = addr2.to_socket_addr().await.unwrap();
+        let result1 = addr1.to_socket_addr().await;
+        let result2 = addr2.to_socket_addr().await;
 
-        assert_eq!(result1.port(), 8080);
-        assert_eq!(result2.port(), 9090);
+        // Both should fail (localhost resolves to private IP)
+        assert!(result1.is_err());
+        assert!(result2.is_err());
     }
 
     #[tokio::test]
@@ -658,6 +754,7 @@ mod tests {
         let mut handles = vec![];
 
         // Spawn multiple tasks to access DNS cache concurrently
+        // Using localhost which resolves to private IP (will be blocked)
         for i in 0..10 {
             handles.push(tokio::spawn(async move {
                 let addr = Address::Domain("localhost".to_string(), 8000 + i);
@@ -665,10 +762,10 @@ mod tests {
             }));
         }
 
-        // Wait for all to complete
+        // Wait for all to complete - all should fail due to DNS rebinding protection
         for handle in handles {
             let result = handle.await.unwrap();
-            assert!(result.is_ok());
+            assert!(result.is_err());
         }
     }
 }
