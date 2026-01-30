@@ -51,21 +51,28 @@ async fn read_trojan_request(
     let mut temp_buf = [0u8; BUF_SIZE];
 
     loop {
-        // Try to decode with current buffer
+        // Try to decode with current buffer (check completeness first to avoid clone)
         if buf.len() >= TrojanRequest::MIN_SIZE {
-            // Clone buffer for decode attempt (decode_zerocopy consumes the buffer)
-            let mut decode_buf = buf.clone();
-            match TrojanRequest::decode_zerocopy(&mut decode_buf) {
-                DecodeResult::Ok(req, consumed) => {
-                    // Successfully decoded, advance the original buffer
-                    let _ = buf.split_to(consumed);
-                    // Append any remaining data as payload is already in req
-                    return Ok(req);
+            match TrojanRequest::check_complete(buf) {
+                Ok(_header_len) => {
+                    // Buffer contains complete request, now decode it
+                    match TrojanRequest::decode_zerocopy(buf) {
+                        DecodeResult::Ok(req, _) => {
+                            return Ok(req);
+                        }
+                        DecodeResult::Invalid(e) => {
+                            return Err(anyhow!("Invalid request: {}", e));
+                        }
+                        DecodeResult::NeedMoreData => {
+                            // Should not happen after check_complete succeeds
+                            unreachable!("check_complete succeeded but decode failed");
+                        }
+                    }
                 }
-                DecodeResult::NeedMoreData => {
+                Err(None) => {
                     // Need more data, continue reading
                 }
-                DecodeResult::Invalid(e) => {
+                Err(Some(e)) => {
                     return Err(anyhow!("Invalid request: {}", e));
                 }
             }
@@ -169,15 +176,8 @@ async fn handle_connect(
     user_id: UserId,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    // Get host and port for routing
-    let (host, port) = match &target {
-        Address::IPv4(ip, port) => (std::net::Ipv4Addr::from(*ip).to_string(), *port),
-        Address::IPv6(ip, port) => (std::net::Ipv6Addr::from(*ip).to_string(), *port),
-        Address::Domain(domain, port) => (domain.clone(), *port),
-    };
-
-    // Route the connection
-    let outbound_type = server.router.route(&host, port).await;
+    // Route the connection (passing Address directly avoids string allocation)
+    let outbound_type = server.router.route(&target).await;
 
     // Check if connection should be rejected
     if matches!(outbound_type, core::hooks::OutboundType::Reject) {
@@ -415,8 +415,23 @@ async fn run_server(
         None
     };
 
-    // Bind TCP listener
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Bind TCP listener with SO_REUSEADDR for fast restarts
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
+    let socket = socket2::Socket::new(
+        match socket_addr {
+            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+        },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    // Allow immediate rebind after restart (skip TIME_WAIT)
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&socket_addr.into())?;
+    socket.listen(1024)?; // Increase backlog for high concurrency
+
+    let listener = tokio::net::TcpListener::from_std(socket.into())?;
     let local_addr = listener.local_addr()?;
 
     log::info!(

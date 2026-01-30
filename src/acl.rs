@@ -432,7 +432,29 @@ impl AclRouter {
 
 #[async_trait]
 impl crate::core::hooks::OutboundRouter for AclRouter {
-    async fn route(&self, host: &str, port: u16) -> crate::core::hooks::OutboundType {
+    async fn route(&self, addr: &crate::core::Address) -> crate::core::hooks::OutboundType {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        // Extract host and port without allocating strings for IPs
+        let (host, port) = match addr {
+            crate::core::Address::IPv4(ip, port) => {
+                (Ipv4Addr::from(*ip).to_string(), *port)
+            }
+            crate::core::Address::IPv6(ip, port) => {
+                (Ipv6Addr::from(*ip).to_string(), *port)
+            }
+            crate::core::Address::Domain(domain, port) => {
+                // Domain already a String, just borrow it
+                return self.route_host(domain, *port);
+            }
+        };
+
+        self.route_host(&host, port)
+    }
+}
+
+impl AclRouter {
+    fn route_host(&self, host: &str, port: u16) -> crate::core::hooks::OutboundType {
         match self.engine.match_host(host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
                 OutboundHandler::Direct(_) => crate::core::hooks::OutboundType::Direct,

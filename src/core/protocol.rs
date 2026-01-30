@@ -158,6 +158,44 @@ impl TrojanRequest {
     /// Minimum request size: 56 (password) + 2 (CRLF) + 1 (cmd) + 7 (min addr) + 2 (CRLF) = 68
     pub const MIN_SIZE: usize = 68;
 
+    /// Check if buffer contains a complete request without consuming it
+    /// Returns Ok(header_len) if complete, Err for need more data or invalid
+    pub fn check_complete(buf: &[u8]) -> Result<usize, Option<&'static str>> {
+        if buf.len() < Self::MIN_SIZE {
+            return Err(None); // Need more data
+        }
+
+        // Check first CRLF
+        if buf[56] != b'\r' || buf[57] != b'\n' {
+            return Err(Some("missing CRLF after password"));
+        }
+
+        // Validate command
+        if TrojanCmd::try_from(buf[58]).is_err() {
+            return Err(Some("invalid trojan command"));
+        }
+
+        // Check address length
+        let addr_result = Address::decode(&buf[59..]);
+        let addr_consumed = match addr_result {
+            DecodeResult::Ok(_, consumed) => consumed,
+            DecodeResult::NeedMoreData => return Err(None),
+            DecodeResult::Invalid(msg) => return Err(Some(msg)),
+        };
+
+        let crlf_pos = 59 + addr_consumed;
+
+        // Check second CRLF
+        if buf.len() < crlf_pos + 2 {
+            return Err(None);
+        }
+        if buf[crlf_pos] != b'\r' || buf[crlf_pos + 1] != b'\n' {
+            return Err(Some("missing CRLF after address"));
+        }
+
+        Ok(crlf_pos + 2)
+    }
+
     /// Decode trojan request from buffer (zero-copy for payload)
     ///
     /// Format: password(56) + CRLF + cmd(1) + address + CRLF + payload

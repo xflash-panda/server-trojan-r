@@ -1,8 +1,8 @@
 //! API-based statistics collection implementation
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::core::hooks::StatsCollector;
 use crate::core::UserId;
@@ -27,12 +27,12 @@ pub struct UserStatsSnapshot {
 /// API-based statistics collector
 ///
 /// Collects traffic statistics that can be reported to the remote panel.
-/// Uses a dual-buffer approach to avoid race conditions during reset.
+/// Uses atomic operations for lock-free collection.
 pub struct ApiStatsCollector {
     /// Active stats being written to
     stats: Arc<DashMap<UserId, UserStatsData>>,
-    /// Lock for atomic reset operations
-    reset_lock: Mutex<()>,
+    /// Flag to prevent concurrent resets
+    resetting: AtomicBool,
 }
 
 impl Default for ApiStatsCollector {
@@ -46,7 +46,7 @@ impl ApiStatsCollector {
     pub fn new() -> Self {
         Self {
             stats: Arc::new(DashMap::new()),
-            reset_lock: Mutex::new(()),
+            resetting: AtomicBool::new(false),
         }
     }
 
@@ -83,45 +83,69 @@ impl ApiStatsCollector {
 
     /// Reset all stats and return snapshots
     ///
-    /// This method uses a swap-and-collect approach to avoid race conditions:
-    /// 1. Collect all current keys
-    /// 2. For each key, atomically swap values to 0 and collect
+    /// This method uses a single-pass swap-and-collect approach:
+    /// 1. Iterate all entries once
+    /// 2. For each entry, atomically swap values to 0 and collect if non-zero
     /// 3. Any writes during this process will either be counted in this snapshot
     ///    or accumulated for the next snapshot (no data loss)
     pub fn reset_all(&self) -> Vec<UserStatsSnapshot> {
-        let _guard = self.reset_lock.lock().unwrap();
+        // Prevent concurrent resets using compare_exchange
+        if self
+            .resetting
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another reset in progress, return empty
+            return Vec::new();
+        }
 
-        // Collect keys first to avoid holding iterator during swaps
-        let keys: Vec<UserId> = self.stats.iter().map(|entry| *entry.key()).collect();
+        // Ensure we clear the flag when done
+        let _guard = scopeguard::guard((), |_| {
+            self.resetting.store(false, Ordering::Release);
+        });
 
-        let mut snapshots = Vec::with_capacity(keys.len());
+        // Single-pass: swap values and collect non-zero entries
+        let mut snapshots = Vec::new();
+        let mut all_keys = Vec::new();
 
-        for user_id in keys {
-            if let Some(entry) = self.stats.get(&user_id) {
-                let data = entry.value();
-                // Atomic swaps ensure no data is lost
-                let upload = data.upload_bytes.swap(0, Ordering::AcqRel);
-                let download = data.download_bytes.swap(0, Ordering::AcqRel);
-                let requests = data.request_count.swap(0, Ordering::AcqRel);
+        for entry in self.stats.iter() {
+            let user_id = *entry.key();
+            let data = entry.value();
 
-                // Only include if there was actual traffic
-                if upload > 0 || download > 0 || requests > 0 {
-                    snapshots.push(UserStatsSnapshot {
-                        user_id,
-                        upload_bytes: upload,
-                        download_bytes: download,
-                        request_count: requests,
-                    });
-                }
+            // Atomic swaps ensure no data is lost
+            let upload = data.upload_bytes.swap(0, Ordering::AcqRel);
+            let download = data.download_bytes.swap(0, Ordering::AcqRel);
+            let requests = data.request_count.swap(0, Ordering::AcqRel);
+
+            // Track all keys for cleanup
+            all_keys.push(user_id);
+
+            if upload > 0 || download > 0 || requests > 0 {
+                snapshots.push(UserStatsSnapshot {
+                    user_id,
+                    upload_bytes: upload,
+                    download_bytes: download,
+                    request_count: requests,
+                });
             }
         }
 
-        // Clean up entries with zero stats to prevent unbounded growth
-        self.stats.retain(|_, data| {
-            data.upload_bytes.load(Ordering::Relaxed) > 0
-                || data.download_bytes.load(Ordering::Relaxed) > 0
-                || data.request_count.load(Ordering::Relaxed) > 0
-        });
+        // Remove zero-traffic entries to prevent unbounded growth
+        // Check all entries since we swapped all to 0
+        for key in all_keys {
+            // Double-check the entry is still zero before removing
+            // (new traffic may have arrived during iteration)
+            if let Some(entry) = self.stats.get(&key) {
+                let data = entry.value();
+                if data.upload_bytes.load(Ordering::Relaxed) == 0
+                    && data.download_bytes.load(Ordering::Relaxed) == 0
+                    && data.request_count.load(Ordering::Relaxed) == 0
+                {
+                    drop(entry); // Release the reference before remove
+                    self.stats.remove(&key);
+                }
+            }
+        }
 
         snapshots
     }

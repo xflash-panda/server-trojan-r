@@ -2,6 +2,7 @@
 //!
 //! Defines the extension points that allow business logic to be injected into the core proxy.
 
+use crate::core::Address;
 use async_trait::async_trait;
 
 /// User ID type used throughout the system.
@@ -29,7 +30,7 @@ pub trait StatsCollector: Send + Sync {
 #[async_trait]
 pub trait OutboundRouter: Send + Sync {
     /// Route based on target address, returns the outbound handler
-    async fn route(&self, host: &str, port: u16) -> OutboundType;
+    async fn route(&self, addr: &Address) -> OutboundType;
 }
 
 /// Outbound type for routing decisions
@@ -46,7 +47,7 @@ pub struct DirectRouter;
 
 #[async_trait]
 impl OutboundRouter for DirectRouter {
-    async fn route(&self, _host: &str, _port: u16) -> OutboundType {
+    async fn route(&self, _addr: &Address) -> OutboundType {
         OutboundType::Direct
     }
 }
@@ -58,7 +59,8 @@ mod tests {
     #[tokio::test]
     async fn test_direct_router() {
         let router = DirectRouter;
-        let result = router.route("example.com", 80).await;
+        let addr = Address::Domain("example.com".to_string(), 80);
+        let result = router.route(&addr).await;
         assert!(matches!(result, OutboundType::Direct));
     }
 }
