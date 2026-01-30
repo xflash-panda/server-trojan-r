@@ -1,25 +1,15 @@
-//! API integration module for remote panel communication
-//!
-//! This module handles:
-//! - Node registration and verification
-//! - User fetching with hot-reload
-//! - Traffic reporting
-//! - Heartbeat sending
-//! - State persistence
+//! API client for remote panel communication
 
 use anyhow::{anyhow, Result};
 use server_r_client::{
     ApiClient, ApiError, Config as ApiConfig, NodeType, RegisterRequest, TrojanConfig, UserTraffic,
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::config::{CliArgs, User};
 use crate::logger::log;
-use crate::stats::{ConnectionManager, StatsManager};
-use crate::utils::password_to_hex;
 
 /// State file content for persistence
 #[derive(Debug, Clone)]
@@ -53,7 +43,7 @@ pub struct ApiManager {
     client: ApiClient,
     node_id: i64,
     register_id: RwLock<Option<String>>,
-    state_file_path: std::path::PathBuf,
+    state_file_path: PathBuf,
 }
 
 impl ApiManager {
@@ -79,7 +69,6 @@ impl ApiManager {
             match std::fs::read_to_string(&self.state_file_path) {
                 Ok(content) => {
                     let state = PersistentState::deserialize(content.trim())?;
-                    // Only use state if node_id matches
                     if state.node_id == self.node_id {
                         return Some(state);
                     }
@@ -99,7 +88,6 @@ impl ApiManager {
             node_id: self.node_id,
         };
 
-        // Ensure parent directory exists
         if let Some(parent) = self.state_file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -143,7 +131,6 @@ impl ApiManager {
 
     /// Initialize node - try to verify existing registration or register new
     pub async fn initialize(&self) -> Result<String> {
-        // Try to load and verify existing state
         if let Some(state) = self.load_state() {
             log::info!(
                 register_id = %state.register_id,
@@ -171,7 +158,6 @@ impl ApiManager {
             }
         }
 
-        // Register new node
         self.register().await
     }
 
@@ -187,7 +173,7 @@ impl ApiManager {
             "Registering node"
         );
 
-        let request = RegisterRequest::new(hostname, 0); // Port will be filled by panel
+        let request = RegisterRequest::new(hostname, 0);
 
         let register_id = self
             .client
@@ -196,7 +182,6 @@ impl ApiManager {
 
         log::info!(register_id = %register_id, "Node registered successfully");
 
-        // Save state
         if let Err(e) = self.save_state(&register_id) {
             log::warn!(error = %e, "Failed to save state");
         }
@@ -289,221 +274,6 @@ impl ApiManager {
     }
 }
 
-/// User manager for handling user hot-reload with kick-off capability
-pub struct UserManager {
-    /// Current users map: password_hex -> user_id
-    users: Arc<RwLock<HashMap<[u8; 56], i64>>>,
-    /// Current user IDs set for quick lookup
-    user_ids: Arc<RwLock<HashSet<i64>>>,
-    /// Connection manager for kick-off
-    connections: ConnectionManager,
-}
-
-impl UserManager {
-    /// Create a new user manager
-    pub fn new(connections: ConnectionManager) -> Self {
-        Self {
-            users: Arc::new(RwLock::new(HashMap::new())),
-            user_ids: Arc::new(RwLock::new(HashSet::new())),
-            connections,
-        }
-    }
-
-    /// Get a clone of the current users map
-    #[allow(dead_code)]
-    pub async fn get_users(&self) -> HashMap<[u8; 56], i64> {
-        self.users.read().await.clone()
-    }
-
-    /// Get arc reference to users for Server
-    pub fn get_users_arc(&self) -> Arc<RwLock<HashMap<[u8; 56], i64>>> {
-        Arc::clone(&self.users)
-    }
-
-    /// Initialize with users
-    pub async fn init(&self, users: &[User]) {
-        let mut users_map = self.users.write().await;
-        let mut user_ids = self.user_ids.write().await;
-
-        users_map.clear();
-        user_ids.clear();
-
-        for user in users {
-            let hex = password_to_hex(&user.uuid);
-            users_map.insert(hex, user.id);
-            user_ids.insert(user.id);
-        }
-
-        log::info!(count = users.len(), "Users initialized");
-    }
-
-    /// Update users with hot-reload
-    ///
-    /// - Add new users
-    /// - Remove deleted users and kick their connections
-    pub async fn update(&self, new_users: &[User]) -> (usize, usize, usize) {
-        let mut users_map = self.users.write().await;
-        let mut user_ids = self.user_ids.write().await;
-
-        // Build new user set
-        let new_user_ids: HashSet<i64> = new_users.iter().map(|u| u.id).collect();
-
-        // Find users to remove (in current but not in new)
-        let to_remove: Vec<i64> = user_ids.difference(&new_user_ids).copied().collect();
-
-        // Find users to add (in new but not in current)
-        let to_add: Vec<&User> = new_users
-            .iter()
-            .filter(|u| !user_ids.contains(&u.id))
-            .collect();
-
-        let added = to_add.len();
-        let removed = to_remove.len();
-        let mut kicked = 0;
-
-        // Remove old users
-        for user_id in &to_remove {
-            // Find and remove from users_map
-            users_map.retain(|_, id| id != user_id);
-            user_ids.remove(user_id);
-
-            // Kick connections
-            let k = self.connections.kick_user(*user_id as u64);
-            kicked += k;
-            if k > 0 {
-                log::info!(user_id = user_id, kicked = k, "User removed and kicked");
-            }
-        }
-
-        // Add new users
-        for user in to_add {
-            let hex = password_to_hex(&user.uuid);
-            users_map.insert(hex, user.id);
-            user_ids.insert(user.id);
-        }
-
-        if added > 0 || removed > 0 {
-            log::info!(
-                added = added,
-                removed = removed,
-                kicked = kicked,
-                total = users_map.len(),
-                "Users updated"
-            );
-        }
-
-        (added, removed, kicked)
-    }
-}
-
-/// Background task runner for periodic operations
-pub struct BackgroundTasks {
-    api: Arc<ApiManager>,
-    user_manager: Arc<UserManager>,
-    stats: StatsManager,
-    cli: CliArgs,
-}
-
-impl BackgroundTasks {
-    /// Create a new background task runner
-    pub fn new(
-        api: Arc<ApiManager>,
-        user_manager: Arc<UserManager>,
-        stats: StatsManager,
-        cli: CliArgs,
-    ) -> Self {
-        Self {
-            api,
-            user_manager,
-            stats,
-            cli,
-        }
-    }
-
-    /// Start all background tasks
-    pub fn start(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let fetch_users_interval = Duration::from_secs(self.cli.fetch_users_interval);
-            let report_traffics_interval = Duration::from_secs(self.cli.report_traffics_interval);
-            let heartbeat_interval = Duration::from_secs(self.cli.heartbeat_interval);
-
-            let mut fetch_users_timer = tokio::time::interval(fetch_users_interval);
-            let mut report_traffics_timer = tokio::time::interval(report_traffics_interval);
-            let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-
-            // Skip first tick (fires immediately)
-            fetch_users_timer.tick().await;
-            report_traffics_timer.tick().await;
-            heartbeat_timer.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = fetch_users_timer.tick() => {
-                        self.fetch_users_task().await;
-                    }
-                    _ = report_traffics_timer.tick() => {
-                        self.report_traffics_task().await;
-                    }
-                    _ = heartbeat_timer.tick() => {
-                        self.heartbeat_task().await;
-                    }
-                }
-            }
-        })
-    }
-
-    async fn fetch_users_task(&self) {
-        match self.api.fetch_users().await {
-            Ok(users) => {
-                self.user_manager.update(&users).await;
-            }
-            Err(e) => {
-                // "Not modified" is not an error
-                if !e.to_string().contains("Not modified") {
-                    log::warn!(error = %e, "Failed to fetch users");
-                }
-            }
-        }
-    }
-
-    async fn report_traffics_task(&self) {
-        // Get and reset all stats
-        let snapshots = self.stats.reset_all();
-
-        if snapshots.is_empty() {
-            return;
-        }
-
-        // Convert to UserTraffic
-        let traffic_data: Vec<UserTraffic> = snapshots
-            .into_iter()
-            .filter(|s| s.upload_bytes > 0 || s.download_bytes > 0)
-            .map(|s| {
-                UserTraffic::with_count(
-                    s.user_id as i64,
-                    s.upload_bytes,
-                    s.download_bytes,
-                    s.request_count,
-                )
-            })
-            .collect();
-
-        if traffic_data.is_empty() {
-            return;
-        }
-
-        if let Err(e) = self.api.submit_traffic(traffic_data).await {
-            log::warn!(error = %e, "Failed to submit traffic");
-        }
-    }
-
-    async fn heartbeat_task(&self) {
-        if let Err(e) = self.api.heartbeat().await {
-            log::warn!(error = %e, "Failed to send heartbeat");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +303,12 @@ mod tests {
         let s = state.serialize();
         let parsed = PersistentState::deserialize(&s).unwrap();
         assert_eq!(parsed.register_id, "abc:123:xyz");
+    }
+
+    #[test]
+    fn test_persistent_state_deserialize_invalid() {
+        assert!(PersistentState::deserialize("invalid").is_none());
+        assert!(PersistentState::deserialize("").is_none());
+        assert!(PersistentState::deserialize("notanumber:id").is_none());
     }
 }

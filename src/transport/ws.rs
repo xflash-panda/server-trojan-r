@@ -1,3 +1,9 @@
+//! WebSocket transport
+//!
+//! Provides WebSocket transport for Trojan protocol.
+//! Uses generic type parameter to work with any AsyncRead + AsyncWrite stream,
+//! including both plain TCP and TLS streams.
+
 use bytes::Bytes;
 use futures_util::{Sink, Stream};
 use std::io;
@@ -9,11 +15,15 @@ use tokio_tungstenite::{tungstenite::Message, WebSocketStream as TungsteniteStre
 /// Initial write buffer capacity (4KB - typical MTU size)
 const INITIAL_WRITE_BUFFER_CAPACITY: usize = 4 * 1024;
 
+/// WebSocket transport wrapper
+///
+/// Implements AsyncRead + AsyncWrite to provide a unified stream interface
+/// for any underlying transport (TCP, TLS, etc.)
 pub struct WebSocketTransport<S> {
     ws_stream: Pin<Box<TungsteniteStream<S>>>,
     read_buffer: Bytes,
     read_pos: usize,
-    write_buffer: Vec<u8>, // 保持 Vec<u8>， WebSocket 库需要
+    write_buffer: Vec<u8>,
     write_pending: bool,
     closed: bool,
 }
@@ -22,12 +32,12 @@ impl<S> WebSocketTransport<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    /// Create a new WebSocket transport from a WebSocket stream
     pub fn new(ws_stream: TungsteniteStream<S>) -> Self {
         Self {
             ws_stream: Box::pin(ws_stream),
             read_buffer: Bytes::new(),
             read_pos: 0,
-            // Pre-allocate write buffer to reduce reallocation during writes
             write_buffer: Vec::with_capacity(INITIAL_WRITE_BUFFER_CAPACITY),
             write_pending: false,
             closed: false,
@@ -48,7 +58,7 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // 如果缓冲区还有数据，先消费缓冲区
+        // If buffer has data, consume it first
         if self.read_pos < self.read_buffer.len() {
             let remaining = &self.read_buffer[self.read_pos..];
             let to_copy = remaining.len().min(buf.remaining());
@@ -63,14 +73,14 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // 直接从 WebSocket 流读取
+        // Read directly from WebSocket stream
         match Stream::poll_next(self.ws_stream.as_mut(), cx) {
             Poll::Ready(Some(Ok(Message::Binary(data)))) => {
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
 
                 if to_copy < data.len() {
-                    // Zero-copy slice, avoiding copy_from_slice
+                    // Zero-copy slice
                     self.read_buffer = data.slice(to_copy..);
                     self.read_pos = 0;
                 }
@@ -82,7 +92,7 @@ where
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Ok(_))) => {
-                // 非二进制消息，跳过
+                // Skip non-binary messages
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
@@ -111,11 +121,10 @@ where
             )));
         }
 
-        // 如果有待发送的数据，先尝试发送
+        // If there's pending data, try to send it first
         if self.write_pending {
             match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
                 Poll::Ready(Ok(())) => {
-                    // 发送缓冲区中的数据
                     let data = std::mem::take(&mut self.write_buffer);
                     match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
                         Ok(()) => {
@@ -138,10 +147,10 @@ where
             }
         }
 
-        // 将新数据添加到缓冲区
+        // Add new data to buffer
         self.write_buffer.extend_from_slice(buf);
 
-        // 尝试立即发送
+        // Try to send immediately
         match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
             Poll::Ready(Ok(())) => {
                 let data = std::mem::take(&mut self.write_buffer);
@@ -164,7 +173,7 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // 确保所有待发送的数据都已发送
+        // Ensure all pending data is sent
         if self.write_pending {
             match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
                 Poll::Ready(Ok(())) => {
@@ -201,8 +210,16 @@ where
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed = true;
-        // 刷新所有待发送的数据
-        // WebSocket 连接的关闭由底层流处理，这里只需要确保数据已刷新
         self.as_mut().poll_flush(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_buffer_capacity() {
+        assert_eq!(INITIAL_WRITE_BUFFER_CAPACITY, 4 * 1024);
     }
 }

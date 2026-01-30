@@ -1,3 +1,8 @@
+//! gRPC HTTP/2 connection manager
+//!
+//! Manages HTTP/2 connections and accepts multiple streams,
+//! each stream corresponds to an independent Trojan tunnel.
+
 use anyhow::Result;
 use bytes::Bytes;
 use h2::server;
@@ -10,7 +15,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use super::heartbeat::H2Heartbeat;
-use super::transport::{GrpcH2cTransport, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES};
+use super::transport::{GrpcTransport, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES};
 
 /// Maximum concurrent HTTP/2 streams
 const MAX_CONCURRENT_STREAMS: usize = 100;
@@ -24,38 +29,21 @@ const INITIAL_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
 /// Initial HTTP/2 connection window size
 const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
-/// gRPC HTTP/2 连接管理器
+/// gRPC HTTP/2 connection manager
 ///
-/// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
-pub struct GrpcH2cConnection<S> {
+/// Manages an HTTP/2 connection, accepting multiple streams where each
+/// stream corresponds to an independent Trojan tunnel.
+pub struct GrpcConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
     stream_semaphore: Arc<Semaphore>,
     active_count: Arc<AtomicUsize>,
 }
 
-/// Helper to spawn a task with panic-safe counter management
-///
-/// This ensures the counter is decremented even if the task panics
-#[inline]
-#[allow(dead_code)]
-fn spawn_with_counter<F, Fut>(counter: Arc<AtomicUsize>, task: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    counter.fetch_add(1, Ordering::Relaxed);
-    tokio::spawn(async move {
-        let _guard = scopeguard::guard((), |_| {
-            counter.fetch_sub(1, Ordering::Relaxed);
-        });
-        task().await;
-    });
-}
-
-impl<S> GrpcH2cConnection<S>
+impl<S> GrpcConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    /// Create a new gRPC connection from an underlying stream
     pub async fn new(stream: S) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
@@ -75,9 +63,10 @@ where
         })
     }
 
+    /// Run the connection, calling the handler for each accepted stream
     pub async fn run<F, Fut>(self, handler: F) -> Result<()>
     where
-        F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
+        F: Fn(GrpcTransport) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         let handler = Arc::new(handler);
@@ -143,7 +132,7 @@ where
                                 }
                             };
 
-                            let transport = GrpcH2cTransport::new(
+                            let transport = GrpcTransport::new(
                                 request.into_body(),
                                 send_stream,
                             );
@@ -153,7 +142,6 @@ where
                             active_count_clone.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                // Use a guard to ensure active_count is decremented even on panic
                                 let _guard = scopeguard::guard((), |_| {
                                     active_count_clone.fetch_sub(1, Ordering::Relaxed);
                                 });
@@ -188,41 +176,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
-    async fn test_spawn_with_counter_normal_completion() {
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        spawn_with_counter(Arc::clone(&counter), || async {
-            // Normal task completion
-        });
-
-        // Wait for task to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn test_spawn_with_counter_multiple_tasks() {
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        for _ in 0..5 {
-            spawn_with_counter(Arc::clone(&counter), || async {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            });
-        }
-
-        // Initially all 5 tasks should be running
-        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-        assert!(counter.load(Ordering::Relaxed) > 0);
-
-        // Wait for all tasks to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
     async fn test_scopeguard_decrements_on_panic() {
-        // Test that scopeguard pattern correctly decrements counter on panic
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
 
@@ -235,10 +189,7 @@ mod tests {
             panic!("intentional panic for testing");
         });
 
-        // Wait for task to panic
         let _ = handle.await;
-
-        // Counter should be decremented even after panic
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
@@ -253,7 +204,6 @@ mod tests {
             let _guard = scopeguard::guard((), |_| {
                 counter_clone.fetch_sub(1, Ordering::Relaxed);
             });
-            // Early return without completing the "work"
             return;
         });
 

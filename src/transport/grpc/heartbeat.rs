@@ -1,3 +1,5 @@
+//! HTTP/2 heartbeat (PING/PONG)
+
 use h2::Ping;
 use tracing::{debug, warn};
 

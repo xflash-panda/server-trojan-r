@@ -233,11 +233,13 @@ impl OutboundHandler {
     }
 
     /// Check if this handler rejects connections
+    #[allow(dead_code)]
     pub fn is_reject(&self) -> bool {
         matches!(self, OutboundHandler::Reject(_))
     }
 
     /// Check if this handler allows UDP
+    #[allow(dead_code)]
     pub fn allows_udp(&self) -> bool {
         match self {
             OutboundHandler::Direct(_) => true,
@@ -343,6 +345,7 @@ impl AclEngine {
     }
 
     /// Create a default ACL engine (direct all traffic)
+    #[allow(dead_code)]
     pub fn new_default() -> Result<Self> {
         let mut outbounds: HashMap<String, Arc<OutboundHandler>> = HashMap::new();
         outbounds.insert(
@@ -410,6 +413,44 @@ pub async fn load_acl_config(path: &Path) -> Result<AclConfig> {
     })?;
 
     Ok(config)
+}
+
+/// ACL Router adapter implementing core::hooks::OutboundRouter
+///
+/// This adapter wraps the ACL engine and implements the OutboundRouter trait
+/// for integration with the core proxy layer.
+pub struct AclRouter {
+    engine: AclEngine,
+}
+
+impl AclRouter {
+    /// Create a new ACL router from an ACL engine
+    pub fn new(engine: AclEngine) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait]
+impl crate::core::hooks::OutboundRouter for AclRouter {
+    async fn route(&self, host: &str, port: u16) -> crate::core::hooks::OutboundType {
+        match self.engine.match_host(host, port, Protocol::TCP) {
+            Some(handler) => match &*handler {
+                OutboundHandler::Direct(_) => crate::core::hooks::OutboundType::Direct,
+                OutboundHandler::Socks5 { .. } => {
+                    // For SOCKS5, ACL engine handles the connection internally
+                    // The core layer just needs to know this isn't a direct connection
+                    // For now, return Direct as ACL engine will handle the proxy
+                    crate::core::hooks::OutboundType::Direct
+                }
+                OutboundHandler::Http(_) => {
+                    // For HTTP proxy, ACL engine handles the connection internally
+                    crate::core::hooks::OutboundType::Direct
+                }
+                OutboundHandler::Reject(_) => crate::core::hooks::OutboundType::Reject,
+            },
+            None => crate::core::hooks::OutboundType::Direct,
+        }
+    }
 }
 
 #[cfg(test)]

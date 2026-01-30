@@ -31,13 +31,64 @@ use crate::business::{
 };
 use crate::core::{
     copy_bidirectional_with_stats, Address, ConnectionManager, DecodeResult, Server, TrojanCmd,
-    TrojanRequest,
+    TrojanRequest, UserId,
 };
-use crate::transport::{ConnectionMeta, TransportListener, TransportStream, TransportType};
+use crate::transport::{ConnectionMeta, TransportStream, TransportType};
 
 const BUF_SIZE: usize = 32 * 1024;
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const REQUEST_READ_TIMEOUT_SECS: u64 = 10;
+
+/// Read and decode a complete Trojan request from the stream
+///
+/// This function handles partial reads by continuing to read until
+/// a complete request is received or an error occurs.
+async fn read_trojan_request(
+    stream: &mut TransportStream,
+    buf: &mut BytesMut,
+) -> Result<TrojanRequest> {
+    let mut temp_buf = [0u8; BUF_SIZE];
+
+    loop {
+        // Try to decode with current buffer
+        if buf.len() >= TrojanRequest::MIN_SIZE {
+            // Clone buffer for decode attempt (decode_zerocopy consumes the buffer)
+            let mut decode_buf = buf.clone();
+            match TrojanRequest::decode_zerocopy(&mut decode_buf) {
+                DecodeResult::Ok(req, consumed) => {
+                    // Successfully decoded, advance the original buffer
+                    let _ = buf.split_to(consumed);
+                    // Append any remaining data as payload is already in req
+                    return Ok(req);
+                }
+                DecodeResult::NeedMoreData => {
+                    // Need more data, continue reading
+                }
+                DecodeResult::Invalid(e) => {
+                    return Err(anyhow!("Invalid request: {}", e));
+                }
+            }
+        }
+
+        // Read more data
+        let n = stream.read(&mut temp_buf).await?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err(anyhow!("Connection closed before receiving request"));
+            } else {
+                return Err(anyhow!("Connection closed with incomplete request"));
+            }
+        }
+
+        buf.extend_from_slice(&temp_buf[..n]);
+
+        // Prevent buffer from growing too large (protection against malicious clients)
+        if buf.len() > BUF_SIZE * 2 {
+            return Err(anyhow!("Request too large"));
+        }
+    }
+}
 
 /// Process a single connection
 async fn process_connection(
@@ -45,27 +96,15 @@ async fn process_connection(
     mut stream: TransportStream,
     meta: ConnectionMeta,
 ) -> Result<()> {
-    // Read Trojan request
+    // Read Trojan request with timeout and retry for incomplete data
     let mut buf = BytesMut::with_capacity(BUF_SIZE);
-    buf.resize(BUF_SIZE, 0);
-    let n = stream.read(&mut buf).await?;
 
-    if n == 0 {
-        return Err(anyhow!("Connection closed before receiving request"));
-    }
-
-    buf.truncate(n);
-
-    // Decode request (zero-copy)
-    let request = match TrojanRequest::decode_zerocopy(&mut buf) {
-        DecodeResult::Ok(req, _) => req,
-        DecodeResult::NeedMoreData => {
-            return Err(anyhow!("Incomplete request"));
-        }
-        DecodeResult::Invalid(e) => {
-            return Err(anyhow!("Invalid request: {}", e));
-        }
-    };
+    let request = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REQUEST_READ_TIMEOUT_SECS),
+        read_trojan_request(&mut stream, &mut buf),
+    )
+    .await
+    .map_err(|_| anyhow!("Request read timeout"))??;
 
     let peer_addr = meta.peer_addr.to_string();
 
@@ -127,7 +166,7 @@ async fn handle_connect(
     target: Address,
     initial_payload: bytes::Bytes,
     peer_addr: String,
-    user_id: u64,
+    user_id: UserId,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     // Get host and port for routing
@@ -176,7 +215,7 @@ async fn handle_direct_connect(
     target: &Address,
     initial_payload: bytes::Bytes,
     peer_addr: &str,
-    user_id: u64,
+    user_id: UserId,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     // Resolve target address
@@ -242,15 +281,8 @@ async fn handle_direct_connect(
     Ok(())
 }
 
-/// Build transport listener based on configuration
-async fn build_transport_listener(
-    config: &config::ServerConfig,
-) -> Result<Box<dyn TransportListener>> {
-    use crate::transport::TcpTransportListener;
-
-    let addr = format!("{}:{}", config.host, config.port);
-
-    // Determine transport type
+/// Build transport configuration
+fn build_transport_config(config: &config::ServerConfig) -> (TransportType, bool) {
     let transport_type = if config.enable_grpc {
         TransportType::Grpc
     } else if config.enable_ws {
@@ -259,18 +291,9 @@ async fn build_transport_listener(
         TransportType::Tcp
     };
 
-    // For now, just use TCP listener
-    // Full transport layer integration will be done in a future iteration
-    let tcp_listener = TcpTransportListener::bind(&addr).await?;
+    let has_tls = config.cert.is_some() && config.key.is_some();
 
-    log::info!(
-        address = %addr,
-        transport = %transport_type,
-        tls = config.cert.is_some(),
-        "Transport listener created"
-    );
-
-    Ok(Box::new(tcp_listener))
+    (transport_type, has_tls)
 }
 
 /// Build outbound router from ACL configuration
@@ -308,24 +331,144 @@ async fn build_router(
     }
 }
 
+/// Accept and handle a connection with proper transport wrapping
+async fn accept_connection<S>(
+    server: Arc<Server>,
+    stream: S,
+    peer_addr: String,
+    transport_type: TransportType,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::transport::{GrpcConnection, WebSocketTransport};
+
+    match transport_type {
+        TransportType::Grpc => {
+            let peer_addr_for_log = peer_addr.clone();
+            log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
+            let grpc_conn = GrpcConnection::new(stream).await?;
+            let result = grpc_conn
+                .run(move |grpc_transport| {
+                    let server = Arc::clone(&server);
+                    let peer_addr = peer_addr.clone();
+                    async move {
+                        let stream: TransportStream = Box::pin(grpc_transport);
+                        let meta = ConnectionMeta {
+                            peer_addr: peer_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                            transport_type: TransportType::Grpc,
+                        };
+                        process_connection(&server, stream, meta).await
+                    }
+                })
+                .await;
+
+            match &result {
+                Ok(()) => {
+                    log::info!(peer = %peer_addr_for_log, "gRPC connection closed normally");
+                }
+                Err(e) => {
+                    log::warn!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
+                }
+            }
+            result
+        }
+        TransportType::WebSocket => {
+            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+            let ws_transport = WebSocketTransport::new(ws_stream);
+            let stream: TransportStream = Box::pin(ws_transport);
+            let meta = ConnectionMeta {
+                peer_addr: peer_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                transport_type: TransportType::WebSocket,
+            };
+            process_connection(&server, stream, meta).await
+        }
+        TransportType::Tcp => {
+            let stream: TransportStream = Box::pin(stream);
+            let meta = ConnectionMeta {
+                peer_addr: peer_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                transport_type: TransportType::Tcp,
+            };
+            process_connection(&server, stream, meta).await
+        }
+    }
+}
+
 /// Run the server accept loop
 async fn run_server(
     server: Arc<Server>,
-    listener: Box<dyn TransportListener>,
-    transport_type: TransportType,
+    config: &config::ServerConfig,
 ) -> Result<()> {
-    let addr = listener.local_addr()?;
-    log::info!(address = %addr, transport = %transport_type, "Server started");
+    use crate::transport::TlsTransportListener;
+
+    let addr = format!("{}:{}", config.host, config.port);
+    let (transport_type, has_tls) = build_transport_config(config);
+
+    // Build TLS acceptor if needed
+    let tls_acceptor = if has_tls {
+        let tls_config = TlsTransportListener::load_tls_config(
+            config.cert.as_ref().unwrap(),
+            config.key.as_ref().unwrap(),
+        )?;
+        Some(tokio_rustls::TlsAcceptor::from(tls_config))
+    } else {
+        None
+    };
+
+    // Bind TCP listener
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let local_addr = listener.local_addr()?;
+
+    log::info!(
+        address = %local_addr,
+        transport = %transport_type,
+        tls = has_tls,
+        "Server started"
+    );
+
+    const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
     loop {
         match listener.accept().await {
-            Ok((stream, meta)) => {
-                let peer_addr = meta.peer_addr.to_string();
+            Ok((stream, addr)) => {
+                let peer_addr = addr.to_string();
                 log::connection(&peer_addr, "new");
 
                 let server = Arc::clone(&server);
+                let tls_acceptor = tls_acceptor.clone();
+
                 tokio::spawn(async move {
-                    let result = process_connection(&server, stream, meta).await;
+                    let result = async {
+                        // Set TCP_NODELAY for lower latency
+                        let _ = stream.set_nodelay(true);
+
+                        if let Some(tls_acceptor) = tls_acceptor {
+                            // TLS handshake with timeout
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                                tls_acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    log::debug!(peer = %peer_addr, "TLS handshake successful");
+                                    accept_connection(server, tls_stream, peer_addr.clone(), transport_type).await
+                                }
+                                Ok(Err(e)) => {
+                                    log::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                                    Err(anyhow!("TLS handshake failed: {}", e))
+                                }
+                                Err(_) => {
+                                    log::warn!(peer = %peer_addr, "TLS handshake timeout");
+                                    Err(anyhow!("TLS handshake timeout"))
+                                }
+                            }
+                        } else {
+                            accept_connection(server, stream, peer_addr.clone(), transport_type).await
+                        }
+                    }
+                    .await;
+
                     if let Err(e) = result {
                         log::debug!(peer = %peer_addr, error = %e, "Connection error");
                     }
@@ -392,15 +535,6 @@ async fn main() -> Result<()> {
     // Build router from ACL config
     let router = build_router(&server_config).await?;
 
-    // Determine transport type for logging
-    let transport_type = if server_config.enable_grpc {
-        TransportType::Grpc
-    } else if server_config.enable_ws {
-        TransportType::WebSocket
-    } else {
-        TransportType::Tcp
-    };
-
     // Build server using the builder pattern
     let server = Arc::new(
         Server::builder()
@@ -410,9 +544,6 @@ async fn main() -> Result<()> {
             .conn_manager(conn_manager)
             .build(),
     );
-
-    // Build transport listener
-    let listener = build_transport_listener(&server_config).await?;
 
     // Start background tasks
     let task_config = TaskConfig::new(
@@ -471,5 +602,5 @@ async fn main() -> Result<()> {
     });
 
     // Run server
-    run_server(server, listener, transport_type).await
+    run_server(server, &server_config).await
 }
