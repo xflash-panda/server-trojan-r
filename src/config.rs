@@ -155,6 +155,12 @@ impl From<server_r_client::User> for User {
     }
 }
 
+/// Default gRPC service name (Xray compatible)
+pub const DEFAULT_GRPC_SERVICE_NAME: &str = "GunService";
+
+/// Default WebSocket path (Xray compatible)
+pub const DEFAULT_WS_PATH: &str = "/";
+
 /// Runtime server configuration (built from remote panel config + CLI args)
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -166,6 +172,10 @@ pub struct ServerConfig {
     pub enable_ws: bool,
     /// Enable gRPC mode
     pub enable_grpc: bool,
+    /// WebSocket path (Xray default: "/")
+    pub ws_path: String,
+    /// gRPC service name (Xray default: "GunService", path becomes "/${service_name}/Tun")
+    pub grpc_service_name: String,
     /// TLS certificate file path
     pub cert: Option<PathBuf>,
     /// TLS private key file path
@@ -191,6 +201,20 @@ impl ServerConfig {
             _ => (false, false),
         };
 
+        // Extract WebSocket path from remote config (Xray default: "/")
+        let ws_path = remote
+            .websocket_config
+            .as_ref()
+            .and_then(|c| c.path.clone())
+            .unwrap_or_else(|| DEFAULT_WS_PATH.to_string());
+
+        // Extract gRPC service name from remote config (Xray default: "GunService")
+        let grpc_service_name = remote
+            .grpc_config
+            .as_ref()
+            .and_then(|c| c.service_name.clone())
+            .unwrap_or_else(|| DEFAULT_GRPC_SERVICE_NAME.to_string());
+
         // Use CLI cert/key (required)
         let cert = Some(PathBuf::from(&cli.cert_file));
         let key = Some(PathBuf::from(&cli.key_file));
@@ -200,11 +224,19 @@ impl ServerConfig {
             port: remote.server_port,
             enable_ws,
             enable_grpc,
+            ws_path,
+            grpc_service_name,
             cert,
             key,
             acl_conf_file: cli.ext_conf_file.clone(),
             data_dir: cli.data_dir.clone(),
         })
+    }
+
+    /// Get the expected gRPC path (format: "/${service_name}/Tun")
+    #[allow(dead_code)]
+    pub fn grpc_path(&self) -> String {
+        format!("/{}/Tun", self.grpc_service_name)
     }
 }
 
@@ -532,5 +564,130 @@ mod tests {
         let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
 
         assert_eq!(config.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_server_config_default_ws_path() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("ws".to_string()),
+            websocket_config: None, // No config, should use default
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+
+        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+
+        assert_eq!(config.ws_path, DEFAULT_WS_PATH);
+        assert_eq!(config.ws_path, "/");
+    }
+
+    #[test]
+    fn test_server_config_custom_ws_path() {
+        use std::collections::HashMap;
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("ws".to_string()),
+            websocket_config: Some(server_r_client::WebSocketConfig {
+                path: Some("/custom/path".to_string()),
+                headers: Some(HashMap::new()),
+            }),
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+
+        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+
+        assert_eq!(config.ws_path, "/custom/path");
+    }
+
+    #[test]
+    fn test_server_config_default_grpc_service_name() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("grpc".to_string()),
+            websocket_config: None,
+            grpc_config: None, // No config, should use default
+        };
+        let cli = create_test_cli_args();
+
+        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+
+        assert_eq!(config.grpc_service_name, DEFAULT_GRPC_SERVICE_NAME);
+        assert_eq!(config.grpc_service_name, "GunService");
+        assert_eq!(config.grpc_path(), "/GunService/Tun");
+    }
+
+    #[test]
+    fn test_server_config_custom_grpc_service_name() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("grpc".to_string()),
+            websocket_config: None,
+            grpc_config: Some(server_r_client::GrpcConfig {
+                service_name: Some("MyCustomService".to_string()),
+            }),
+        };
+        let cli = create_test_cli_args();
+
+        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+
+        assert_eq!(config.grpc_service_name, "MyCustomService");
+        assert_eq!(config.grpc_path(), "/MyCustomService/Tun");
+    }
+
+    #[test]
+    fn test_server_config_ws_config_with_empty_path() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("ws".to_string()),
+            websocket_config: Some(server_r_client::WebSocketConfig {
+                path: None, // Explicitly None
+                headers: None,
+            }),
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+
+        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+
+        // Should fall back to default
+        assert_eq!(config.ws_path, DEFAULT_WS_PATH);
+    }
+
+    #[test]
+    fn test_server_config_grpc_config_with_empty_service_name() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("grpc".to_string()),
+            websocket_config: None,
+            grpc_config: Some(server_r_client::GrpcConfig {
+                service_name: None, // Explicitly None
+            }),
+        };
+        let cli = create_test_cli_args();
+
+        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+
+        // Should fall back to default
+        assert_eq!(config.grpc_service_name, DEFAULT_GRPC_SERVICE_NAME);
     }
 }

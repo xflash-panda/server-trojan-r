@@ -37,14 +37,27 @@ pub struct GrpcConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
     stream_semaphore: Arc<Semaphore>,
     active_count: Arc<AtomicUsize>,
+    /// Expected gRPC path (format: "/${service_name}/Tun")
+    expected_path: String,
 }
+
+/// Default gRPC service name (Xray compatible)
+const DEFAULT_GRPC_SERVICE_NAME: &str = "GunService";
 
 impl<S> GrpcConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    /// Create a new gRPC connection from an underlying stream
+    /// Create a new gRPC connection from an underlying stream with default service name
+    #[allow(dead_code)]
     pub async fn new(stream: S) -> io::Result<Self> {
+        Self::with_service_name(stream, DEFAULT_GRPC_SERVICE_NAME).await
+    }
+
+    /// Create a new gRPC connection with a custom service name
+    ///
+    /// The expected path will be "/${service_name}/Tun" (v2ray/Xray compatible)
+    pub async fn with_service_name(stream: S, service_name: &str) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
             .initial_window_size(INITIAL_WINDOW_SIZE)
@@ -56,10 +69,13 @@ where
             .await
             .map_err(|e| io::Error::other(format!("h2 handshake: {}", e)))?;
 
+        let expected_path = format!("/{}/Tun", service_name);
+
         Ok(Self {
             h2_conn,
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             active_count: Arc::new(AtomicUsize::new(0)),
+            expected_path,
         })
     }
 
@@ -93,7 +109,8 @@ where
                             }
 
                             let path = request.uri().path();
-                            if !path.ends_with("/Tun") {
+                            if path != self.expected_path {
+                                debug!(path = %path, expected = %self.expected_path, "gRPC path mismatch");
                                 let response = Response::builder()
                                     .status(StatusCode::NOT_FOUND)
                                     .body(())

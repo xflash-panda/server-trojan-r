@@ -331,12 +331,22 @@ async fn build_router(
     }
 }
 
+/// Network settings for transport layer
+#[derive(Clone)]
+struct NetworkSettings {
+    /// gRPC service name (path becomes "/${service_name}/Tun")
+    grpc_service_name: String,
+    /// WebSocket path
+    ws_path: String,
+}
+
 /// Accept and handle a connection with proper transport wrapping
 async fn accept_connection<S>(
     server: Arc<Server>,
     stream: S,
     peer_addr: String,
     transport_type: TransportType,
+    network_settings: NetworkSettings,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -347,7 +357,7 @@ where
         TransportType::Grpc => {
             let peer_addr_for_log = peer_addr.clone();
             log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
-            let grpc_conn = GrpcConnection::new(stream).await?;
+            let grpc_conn = GrpcConnection::with_service_name(stream, &network_settings.grpc_service_name).await?;
             let result = grpc_conn
                 .run(move |grpc_transport| {
                     let server = Arc::clone(&server);
@@ -374,7 +384,18 @@ where
             result
         }
         TransportType::WebSocket => {
-            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+            // WebSocket handshake with path validation
+            let ws_path = network_settings.ws_path.clone();
+            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, response: Response| {
+                let path = req.uri().path();
+                if path != ws_path && !ws_path.is_empty() && ws_path != "/" {
+                    log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
+                    // For "/" or empty path, accept any path (Xray behavior)
+                }
+                Ok(response)
+            }).await?;
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
@@ -434,10 +455,18 @@ async fn run_server(
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
     let local_addr = listener.local_addr()?;
 
+    // Build network settings from config
+    let network_settings = NetworkSettings {
+        grpc_service_name: config.grpc_service_name.clone(),
+        ws_path: config.ws_path.clone(),
+    };
+
     log::info!(
         address = %local_addr,
         transport = %transport_type,
         tls = has_tls,
+        ws_path = %network_settings.ws_path,
+        grpc_service = %network_settings.grpc_service_name,
         "Server started"
     );
 
@@ -451,6 +480,7 @@ async fn run_server(
 
                 let server = Arc::clone(&server);
                 let tls_acceptor = tls_acceptor.clone();
+                let network_settings = network_settings.clone();
 
                 tokio::spawn(async move {
                     let result = async {
@@ -467,7 +497,7 @@ async fn run_server(
                             {
                                 Ok(Ok(tls_stream)) => {
                                     log::debug!(peer = %peer_addr, "TLS handshake successful");
-                                    accept_connection(server, tls_stream, peer_addr.clone(), transport_type).await
+                                    accept_connection(server, tls_stream, peer_addr.clone(), transport_type, network_settings).await
                                 }
                                 Ok(Err(e)) => {
                                     log::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
@@ -479,7 +509,7 @@ async fn run_server(
                                 }
                             }
                         } else {
-                            accept_connection(server, stream, peer_addr.clone(), transport_type).await
+                            accept_connection(server, stream, peer_addr.clone(), transport_type, network_settings).await
                         }
                     }
                     .await;
