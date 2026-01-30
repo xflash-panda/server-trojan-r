@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
 const BUF_SIZE: usize = 32 * 1024;
 
@@ -50,6 +51,8 @@ pub struct Server {
     pub acl_engine: Option<Arc<acl::AclEngine>>,
     /// Stats manager for tracking user traffic
     pub stats: stats::StatsManager,
+    /// Connection manager for tracking active connections and kick-off capability
+    pub connections: stats::ConnectionManager,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -305,6 +308,16 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     log::authentication(&peer_addr, true);
     log::debug!(peer = %peer_addr, user_id = user_id, "User authenticated");
 
+    // Register connection for tracking and kick-off capability
+    let (conn_id, cancel_token) = server.connections.register(user_id, peer_addr.clone());
+    log::debug!(peer = %peer_addr, user_id = user_id, conn_id = conn_id, "Connection registered");
+
+    // Ensure connection is unregistered when done
+    let _guard = scopeguard::guard((), |_| {
+        server.connections.unregister(conn_id);
+        log::debug!(conn_id = conn_id, "Connection unregistered");
+    });
+
     // Record proxy request for this user
     server.stats.record_request(user_id);
 
@@ -320,6 +333,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 peer_addr,
                 server.acl_engine.clone(),
                 user_stats,
+                cancel_token,
             )
             .await
         }
@@ -335,6 +349,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 peer_addr,
                 server.acl_engine.clone(),
                 user_stats,
+                cancel_token,
             )
             .await
         }
@@ -350,6 +365,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     peer_addr: String,
     acl_engine: Option<Arc<acl::AclEngine>>,
     user_stats: Arc<stats::UserStats>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     // Get host and port for ACL matching
     let (host, port) = match &target_addr {
@@ -412,21 +428,28 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
             tcp_conn.write_all(&initial_payload).await?;
         }
 
-        // Relay data with stats tracking
-        match relay::copy_bidirectional_with_stats(
+        // Relay data with stats tracking and cancellation support
+        let relay_fut = relay::copy_bidirectional_with_stats(
             client_stream,
             tcp_conn,
             CONNECTION_TIMEOUT_SECS,
             Some(user_stats),
-        )
-        .await
-        {
-            Ok(result) if result.completed => {}
-            Ok(_) => {
-                log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+        );
+
+        tokio::select! {
+            result = relay_fut => {
+                match result {
+                    Ok(r) if r.completed => {}
+                    Ok(_) => {
+                        log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+                    }
+                    Err(e) => {
+                        log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+                    }
+                }
             }
-            Err(e) => {
-                log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            _ = cancel_token.cancelled() => {
+                log::info!(peer = %peer_addr, "Connection kicked by admin");
             }
         }
     } else {
@@ -462,20 +485,28 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
             remote_stream.write_all(&initial_payload).await?;
         }
 
-        match relay::copy_bidirectional_with_stats(
+        // Relay data with stats tracking and cancellation support
+        let relay_fut = relay::copy_bidirectional_with_stats(
             client_stream,
             remote_stream,
             CONNECTION_TIMEOUT_SECS,
             Some(user_stats),
-        )
-        .await
-        {
-            Ok(result) if result.completed => {}
-            Ok(_) => {
-                log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+        );
+
+        tokio::select! {
+            result = relay_fut => {
+                match result {
+                    Ok(r) if r.completed => {}
+                    Ok(_) => {
+                        log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+                    }
+                    Err(e) => {
+                        log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+                    }
+                }
             }
-            Err(e) => {
-                log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            _ = cancel_token.cancelled() => {
+                log::info!(peer = %peer_addr, "Connection kicked by admin");
             }
         }
     }
@@ -651,6 +682,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         tls_acceptor,
         acl_engine,
         stats: stats::StatsManager::new(),
+        connections: stats::ConnectionManager::new(),
     })
 }
 

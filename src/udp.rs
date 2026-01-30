@@ -13,6 +13,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
@@ -205,6 +206,7 @@ pub struct UdpRelaySession {
     udp_associations: UdpAssociations,
     acl_engine: Option<Arc<AclEngine>>,
     user_stats: Arc<UserStats>,
+    cancel_token: CancellationToken,
 }
 
 impl UdpRelaySession {
@@ -214,6 +216,7 @@ impl UdpRelaySession {
         peer_addr: String,
         acl_engine: Option<Arc<AclEngine>>,
         user_stats: Arc<UserStats>,
+        cancel_token: CancellationToken,
     ) -> Result<Self> {
         // Generate unique socket key
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -235,6 +238,7 @@ impl UdpRelaySession {
             udp_associations,
             acl_engine,
             user_stats,
+            cancel_token,
         })
     }
 
@@ -386,6 +390,12 @@ impl UdpRelaySession {
 
         loop {
             tokio::select! {
+                // Handle cancellation (kicked by admin)
+                _ = self.cancel_token.cancelled() => {
+                    log::info!(peer = %self.peer_addr, "UDP session kicked by admin");
+                    break;
+                }
+
                 // Handle TCP -> UDP (client sending data)
                 read_result = client_read.read(&mut read_buf) => {
                     match read_result {
@@ -611,8 +621,11 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     peer_addr: String,
     acl_engine: Option<Arc<AclEngine>>,
     user_stats: Arc<UserStats>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
-    let session = UdpRelaySession::new(udp_associations, peer_addr, acl_engine, user_stats).await?;
+    let session =
+        UdpRelaySession::new(udp_associations, peer_addr, acl_engine, user_stats, cancel_token)
+            .await?;
     session.run(client_stream).await
 }
 
