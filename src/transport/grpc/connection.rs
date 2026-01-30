@@ -204,7 +204,6 @@ mod tests {
             let _guard = scopeguard::guard((), |_| {
                 counter_clone.fetch_sub(1, Ordering::Relaxed);
             });
-            return;
         });
 
         let _ = handle.await;

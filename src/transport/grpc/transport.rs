@@ -325,7 +325,8 @@ mod tests {
     #[test]
     fn test_initial_buffer_size() {
         assert_eq!(INITIAL_READ_BUFFER_SIZE, 8 * 1024);
-        assert!(INITIAL_READ_BUFFER_SIZE < MAX_READ_BUFFER_SIZE);
+        // Compile-time assertion that initial < max
+        const _: () = assert!(INITIAL_READ_BUFFER_SIZE < MAX_READ_BUFFER_SIZE);
     }
 
     #[test]
