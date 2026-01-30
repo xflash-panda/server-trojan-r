@@ -1806,6 +1806,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "server"
+version = "0.1.6"
+dependencies = [
+ "acl-engine-r",
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "dashmap",
+ "futures",
+ "futures-util",
+ "h2",
+ "hex",
+ "hostname",
+ "http",
+ "mimalloc",
+ "moka",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pemfile",
+ "scopeguard",
+ "serde",
+ "serde_yaml",
+ "server-r-client",
+ "sha2",
+ "socket2 0.5.10",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "server-r-client"
 version = "0.1.8"
 source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.8#966f97d45087c3ca506460bb9335ab8bf4a341e9"
@@ -2317,49 +2360,6 @@ dependencies = [
  "time",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "trojan-rs"
-version = "0.1.6"
-dependencies = [
- "acl-engine-r",
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "clap",
- "dashmap",
- "futures",
- "futures-util",
- "h2",
- "hex",
- "hostname",
- "http",
- "mimalloc",
- "moka",
- "pin-project-lite",
- "rustls",
- "rustls-pemfile",
- "scopeguard",
- "serde",
- "serde_yaml",
- "server-r-client",
- "sha2",
- "socket2 0.5.10",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-test",
- "tokio-tungstenite",
- "tokio-util",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

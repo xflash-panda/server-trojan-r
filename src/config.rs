@@ -62,9 +62,9 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
     pub data_dir: PathBuf,
 
-    /// Extended configuration file path (ACL config, YAML format)
-    #[arg(long, env = "X_PANDA_TROJAN_EXT_CONF_FILE")]
-    pub ext_conf_file: Option<PathBuf>,
+    /// ACL config file for ACL and Outbounds (.yaml format)
+    #[arg(long, env = "X_PANDA_TROJAN_ACL_CONF_FILE")]
+    pub acl_conf_file: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -116,8 +116,8 @@ impl CliArgs {
             return Err(anyhow!("heartbeat_interval must be greater than 0"));
         }
 
-        // Validate ext_conf_file if provided
-        if let Some(ref path) = self.ext_conf_file {
+        // Validate acl_conf_file if provided
+        if let Some(ref path) = self.acl_conf_file {
             if !path.exists() {
                 return Err(anyhow!("ACL config file not found: {}", path.display()));
             }
@@ -229,7 +229,7 @@ impl ServerConfig {
             grpc_service_name,
             cert,
             key,
-            acl_conf_file: cli.ext_conf_file.clone(),
+            acl_conf_file: cli.acl_conf_file.clone(),
             data_dir: cli.data_dir.clone(),
         })
     }
@@ -257,7 +257,7 @@ mod tests {
             heartbeat_interval: 180,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
-            ext_conf_file: None,
+            acl_conf_file: None,
         }
     }
 
@@ -281,7 +281,7 @@ mod tests {
             heartbeat_interval: 180,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
-            ext_conf_file: None,
+            acl_conf_file: None,
         };
         (cli, temp_dir)
     }
@@ -537,7 +537,7 @@ mod tests {
             grpc_config: None,
         };
         let mut cli = create_test_cli_args();
-        cli.ext_conf_file = Some(PathBuf::from("/path/to/acl.yaml"));
+        cli.acl_conf_file = Some(PathBuf::from("/path/to/acl.yaml"));
         let users = vec![];
 
         let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
