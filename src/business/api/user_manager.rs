@@ -81,17 +81,21 @@ impl UserManager {
         let removed = to_remove.len();
         let mut kicked = 0;
 
-        // Remove old users
-        for user_id in &to_remove {
-            // Find and remove from users_map
-            users_map.retain(|_, id| id != user_id);
-            user_ids.remove(user_id);
+        // Remove old users - single O(n) pass instead of O(n) per user
+        if !to_remove.is_empty() {
+            let to_remove_set: HashSet<UserId> = to_remove.iter().copied().collect();
 
-            // Kick connections
-            let k = self.connections.kick_user(*user_id);
-            kicked += k;
-            if k > 0 {
-                log::info!(user_id = user_id, kicked = k, "User removed and kicked");
+            // Single retain call - O(n) total instead of O(n²)
+            users_map.retain(|_, id| !to_remove_set.contains(id));
+
+            // Update user_ids and kick connections
+            for user_id in &to_remove {
+                user_ids.remove(user_id);
+                let k = self.connections.kick_user(*user_id);
+                kicked += k;
+                if k > 0 {
+                    log::info!(user_id = user_id, kicked = k, "User removed and kicked");
+                }
             }
         }
 
