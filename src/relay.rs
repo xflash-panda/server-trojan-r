@@ -1,15 +1,41 @@
+use crate::stats::UserStats;
 use crate::utils::TimedStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Result of bidirectional copy with traffic stats
+#[derive(Debug, Clone, Copy)]
+pub struct CopyResult {
+    /// Whether the copy completed normally (true) or timed out (false)
+    pub completed: bool,
+    /// Bytes sent from client to remote (upload)
+    pub upload_bytes: u64,
+    /// Bytes sent from remote to client (download)
+    pub download_bytes: u64,
+}
+
 /// 双向转发，支持空闲超时检测
 pub async fn copy_bidirectional_with_idle_timeout<A, B>(
     a: A,
     b: B,
     idle_timeout_secs: u64,
-) -> std::io::Result<bool>
+) -> std::io::Result<CopyResult>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    copy_bidirectional_with_stats(a, b, idle_timeout_secs, None).await
+}
+
+/// 双向转发，支持空闲超时检测和流量统计
+pub async fn copy_bidirectional_with_stats<A, B>(
+    a: A,
+    b: B,
+    idle_timeout_secs: u64,
+    user_stats: Option<Arc<UserStats>>,
+) -> std::io::Result<CopyResult>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -40,11 +66,26 @@ where
 
     tokio::select! {
         result = copy_task => {
-            result?;
-            Ok(true)
+            let (a_to_b, b_to_a) = result?;
+            // a is client, b is remote
+            // a_to_b = client -> remote = upload
+            // b_to_a = remote -> client = download
+            if let Some(ref stats) = user_stats {
+                stats.add_upload(a_to_b);
+                stats.add_download(b_to_a);
+            }
+            Ok(CopyResult {
+                completed: true,
+                upload_bytes: a_to_b,
+                download_bytes: b_to_a,
+            })
         }
         _ = timeout_check => {
-            Ok(false)
+            Ok(CopyResult {
+                completed: false,
+                upload_bytes: 0,
+                download_bytes: 0,
+            })
         }
     }
 }

@@ -1,8 +1,18 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{fs, path::Path};
+
+/// User configuration with id for tracking and uuid for authentication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    /// User ID for traffic statistics and user management
+    pub id: u64,
+    /// UUID used for authentication (this is what gets validated as the "password")
+    pub uuid: String,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server")]
@@ -15,9 +25,9 @@ pub struct ServerConfig {
     #[arg(long, default_value = "35537")]
     pub port: String,
 
-    /// Password
-    #[arg(long, default_value = "")]
-    pub password: String,
+    /// Users for authentication (loaded from config file)
+    #[arg(skip)]
+    pub users: Vec<User>,
 
     /// Enable WebSocket mode
     #[arg(long)]
@@ -87,9 +97,8 @@ impl ServerConfig {
             if config.port == "35537" {
                 config.port = file_config.port;
             }
-            if config.password.is_empty() {
-                config.password = file_config.password;
-            }
+            // Users are always loaded from config file
+            config.users = file_config.users;
             if config.enable_ws.is_none() {
                 config.enable_ws = file_config.enable_ws;
             }
@@ -110,10 +119,10 @@ impl ServerConfig {
             }
         }
 
-        // 验证密码不为空
-        if config.password.is_empty() {
+        // 验证用户列表不为空
+        if config.users.is_empty() {
             return Err(anyhow!(
-                "Password must be provided either via --password or config file"
+                "At least one user must be provided in the config file"
             ));
         }
 
@@ -134,6 +143,15 @@ impl ServerConfig {
 
         Ok(config)
     }
+
+    /// Build a HashMap from password hex to user id for fast authentication lookup
+    pub fn build_user_map(&self) -> HashMap<[u8; 56], u64> {
+        use crate::utils::password_to_hex;
+        self.users
+            .iter()
+            .map(|user| (password_to_hex(&user.uuid), user.id))
+            .collect()
+    }
 }
 
 // =============== TOML 配置部分 ==================
@@ -151,7 +169,8 @@ pub struct TomlConfig {
 pub struct ServerSettings {
     pub host: String,
     pub port: String,
-    pub password: String,
+    /// List of users for authentication
+    pub users: Vec<User>,
 
     #[serde(default)]
     pub enable_ws: bool,
@@ -198,7 +217,16 @@ impl TomlConfig {
             server: ServerSettings {
                 host: "127.0.0.1".to_string(),
                 port: "35537".to_string(),
-                password: "your_password_here".to_string(),
+                users: vec![
+                    User {
+                        id: 1,
+                        uuid: "98cb61c8-76dc-4d0e-939c-3ed9e11327b5".to_string(),
+                    },
+                    User {
+                        id: 2,
+                        uuid: "3be10bf7-5716-49a8-a76b-d5aac7b828f7".to_string(),
+                    },
+                ],
                 enable_ws: true,
                 enable_grpc: false,
                 enable_udp: true,
@@ -222,7 +250,7 @@ impl TomlConfig {
         ServerConfig {
             host: self.server.host,
             port: self.server.port,
-            password: self.server.password,
+            users: self.server.users,
             enable_ws: Some(self.server.enable_ws),
             enable_grpc: Some(self.server.enable_grpc),
             enable_udp: Some(self.server.enable_udp),
@@ -243,6 +271,19 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn make_test_users() -> Vec<User> {
+        vec![
+            User {
+                id: 1,
+                uuid: "98cb61c8-76dc-4d0e-939c-3ed9e11327b5".to_string(),
+            },
+            User {
+                id: 2,
+                uuid: "3be10bf7-5716-49a8-a76b-d5aac7b828f7".to_string(),
+            },
+        ]
+    }
+
     #[test]
     fn test_toml_config_from_file() {
         let mut file = NamedTempFile::new().unwrap();
@@ -252,7 +293,10 @@ mod tests {
 [server]
 host = "0.0.0.0"
 port = "8080"
-password = "test_password"
+users = [
+    {{ id = 1, uuid = "98cb61c8-76dc-4d0e-939c-3ed9e11327b5" }},
+    {{ id = 2, uuid = "3be10bf7-5716-49a8-a76b-d5aac7b828f7" }}
+]
 enable_ws = true
 enable_grpc = false
 enable_udp = true
@@ -263,7 +307,12 @@ enable_udp = true
         let config = TomlConfig::from_file(file.path()).unwrap();
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, "8080");
-        assert_eq!(config.server.password, "test_password");
+        assert_eq!(config.server.users.len(), 2);
+        assert_eq!(config.server.users[0].id, 1);
+        assert_eq!(
+            config.server.users[0].uuid,
+            "98cb61c8-76dc-4d0e-939c-3ed9e11327b5"
+        );
         assert!(config.server.enable_ws);
         assert!(!config.server.enable_grpc);
         assert!(config.server.enable_udp);
@@ -278,7 +327,9 @@ enable_udp = true
 [server]
 host = "127.0.0.1"
 port = "443"
-password = "secure_password"
+users = [
+    {{ id = 1, uuid = "98cb61c8-76dc-4d0e-939c-3ed9e11327b5" }}
+]
 
 [tls]
 cert = "/path/to/cert.pem"
@@ -303,7 +354,9 @@ key = "/path/to/key.pem"
 [server]
 host = "127.0.0.1"
 port = "8080"
-password = "test"
+users = [
+    {{ id = 1, uuid = "test-uuid" }}
+]
 
 [log]
 level = "debug"
@@ -335,7 +388,7 @@ level = "debug"
             server: ServerSettings {
                 host: "0.0.0.0".to_string(),
                 port: "8080".to_string(),
-                password: "test".to_string(),
+                users: make_test_users(),
                 enable_ws: true,
                 enable_grpc: false,
                 enable_udp: true,
@@ -352,7 +405,7 @@ level = "debug"
         let server_config = toml_config.to_server_config();
         assert_eq!(server_config.host, "0.0.0.0");
         assert_eq!(server_config.port, "8080");
-        assert_eq!(server_config.password, "test");
+        assert_eq!(server_config.users.len(), 2);
         assert_eq!(server_config.enable_ws, Some(true));
         assert_eq!(server_config.enable_grpc, Some(false));
         assert_eq!(server_config.enable_udp, Some(true));
@@ -372,6 +425,7 @@ level = "debug"
         let config = TomlConfig::from_file(&path).unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, "35537");
+        assert_eq!(config.server.users.len(), 2);
         assert!(config.tls.is_some());
         assert!(config.log.is_some());
 
@@ -398,7 +452,7 @@ level = "debug"
         let settings = ServerSettings {
             host: "127.0.0.1".to_string(),
             port: "8080".to_string(),
-            password: "secret".to_string(),
+            users: make_test_users(),
             enable_ws: false,
             enable_grpc: false,
             enable_udp: true,
@@ -415,7 +469,7 @@ level = "debug"
         let config = ServerConfig {
             host: "127.0.0.1".to_string(),
             port: "8080".to_string(),
-            password: "test".to_string(),
+            users: make_test_users(),
             enable_ws: None,
             enable_grpc: None,
             enable_udp: None,
@@ -445,7 +499,9 @@ level = "debug"
 [server]
 host = "0.0.0.0"
 port = "8080"
-password = "test"
+users = [
+    {{ id = 1, uuid = "test-uuid" }}
+]
 enable_udp = false
 "#
         )
@@ -464,7 +520,7 @@ enable_udp = false
         let config = ServerConfig {
             host: "127.0.0.1".to_string(),
             port: "8080".to_string(),
-            password: "test".to_string(),
+            users: make_test_users(),
             enable_ws: Some(true),
             enable_grpc: Some(false),
             enable_udp: Some(false), // Explicitly disabled
@@ -492,7 +548,9 @@ enable_udp = false
 [server]
 host = "127.0.0.1"
 port = "8080"
-password = "test"
+users = [
+    {{ id = 1, uuid = "test-uuid" }}
+]
 "#
         )
         .unwrap();
@@ -500,5 +558,45 @@ password = "test"
         let config = TomlConfig::from_file(file.path()).unwrap();
         // enable_udp should default to true when not specified
         assert!(config.server.enable_udp);
+    }
+
+    #[test]
+    fn test_build_user_map() {
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: "8080".to_string(),
+            users: make_test_users(),
+            enable_ws: None,
+            enable_grpc: None,
+            enable_udp: None,
+            cert: None,
+            key: None,
+            config_file: None,
+            generate_config: None,
+            log_level: None,
+            acl_conf_file: None,
+            data_dir: None,
+        };
+
+        let user_map = config.build_user_map();
+        assert_eq!(user_map.len(), 2);
+
+        // Verify the map contains correct mappings
+        use crate::utils::password_to_hex;
+        let hex1 = password_to_hex("98cb61c8-76dc-4d0e-939c-3ed9e11327b5");
+        let hex2 = password_to_hex("3be10bf7-5716-49a8-a76b-d5aac7b828f7");
+
+        assert_eq!(user_map.get(&hex1), Some(&1));
+        assert_eq!(user_map.get(&hex2), Some(&2));
+    }
+
+    #[test]
+    fn test_user_struct() {
+        let user = User {
+            id: 42,
+            uuid: "test-uuid-12345".to_string(),
+        };
+        assert_eq!(user.id, 42);
+        assert_eq!(user.uuid, "test-uuid-12345");
     }
 }

@@ -5,6 +5,7 @@ mod error;
 mod grpc;
 mod logger;
 mod relay;
+mod stats;
 mod tls;
 mod udp;
 mod utils;
@@ -20,6 +21,7 @@ use logger::log;
 use acl::AsyncOutbound;
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -39,12 +41,15 @@ pub enum TransportMode {
 
 pub struct Server {
     pub listener: TcpListener,
-    pub password: [u8; 56],
+    /// Map from password hex to user id for authentication
+    pub users: HashMap<[u8; 56], u64>,
     pub transport_mode: TransportMode,
     pub enable_udp: bool,
     pub udp_associations: udp::UdpAssociations,
     pub tls_acceptor: Option<TlsAcceptor>,
     pub acl_engine: Option<Arc<acl::AclEngine>>,
+    /// Stats manager for tracking user traffic
+    pub stats: stats::StatsManager,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -282,19 +287,29 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Zero-copy decode
     let request = TrojanRequest::decode_zerocopy(&mut buf)?;
 
-    // 验证密码
-    if request.password != server.password {
-        let transport = match server.transport_mode {
-            TransportMode::Tcp => "TCP",
-            TransportMode::WebSocket => "WS",
-            TransportMode::Grpc => "gRPC",
-        };
-        log::authentication(&peer_addr, false);
-        log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
-        return Err(anyhow!("Incorrect password"));
-    }
+    // 验证用户 (通过 uuid 验证)
+    let user_id = match server.users.get(&request.password) {
+        Some(&id) => id,
+        None => {
+            let transport = match server.transport_mode {
+                TransportMode::Tcp => "TCP",
+                TransportMode::WebSocket => "WS",
+                TransportMode::Grpc => "gRPC",
+            };
+            log::authentication(&peer_addr, false);
+            log::warn!(peer = %peer_addr, transport = transport, "Invalid user credentials");
+            return Err(anyhow!("Invalid user credentials"));
+        }
+    };
 
     log::authentication(&peer_addr, true);
+    log::debug!(peer = %peer_addr, user_id = user_id, "User authenticated");
+
+    // Record proxy request for this user
+    server.stats.record_request(user_id);
+
+    // Get user stats for traffic tracking
+    let user_stats = server.stats.get_or_create(user_id);
 
     match request.cmd {
         TrojanCmd::Connect => {
@@ -304,6 +319,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 request.payload,
                 peer_addr,
                 server.acl_engine.clone(),
+                user_stats,
             )
             .await
         }
@@ -318,6 +334,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 request.addr,
                 peer_addr,
                 server.acl_engine.clone(),
+                user_stats,
             )
             .await
         }
@@ -332,6 +349,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     initial_payload: Bytes,
     peer_addr: String,
     acl_engine: Option<Arc<acl::AclEngine>>,
+    user_stats: Arc<stats::UserStats>,
 ) -> Result<()> {
     // Get host and port for ACL matching
     let (host, port) = match &target_addr {
@@ -390,19 +408,21 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 
         // Write initial payload if any
         if !initial_payload.is_empty() {
+            user_stats.add_upload(initial_payload.len() as u64);
             tcp_conn.write_all(&initial_payload).await?;
         }
 
-        // Relay data
-        match relay::copy_bidirectional_with_idle_timeout(
+        // Relay data with stats tracking
+        match relay::copy_bidirectional_with_stats(
             client_stream,
             tcp_conn,
             CONNECTION_TIMEOUT_SECS,
+            Some(user_stats),
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(result) if result.completed => {}
+            Ok(_) => {
                 log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
             }
             Err(e) => {
@@ -438,18 +458,20 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server (direct)");
 
         if !initial_payload.is_empty() {
+            user_stats.add_upload(initial_payload.len() as u64);
             remote_stream.write_all(&initial_payload).await?;
         }
 
-        match relay::copy_bidirectional_with_idle_timeout(
+        match relay::copy_bidirectional_with_stats(
             client_stream,
             remote_stream,
             CONNECTION_TIMEOUT_SECS,
+            Some(user_stats),
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(result) if result.completed => {}
+            Ok(_) => {
                 log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
             }
             Err(e) => {
@@ -570,7 +592,8 @@ impl Server {
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(addr).await?;
-    let password = utils::password_to_hex(&config.password);
+    let users = config.build_user_map();
+    log::info!(user_count = users.len(), "Loaded users for authentication");
     let enable_ws = config.enable_ws.unwrap_or(false);
     let enable_grpc = config.enable_grpc.unwrap_or(false);
     let enable_udp = config.enable_udp.unwrap_or(true);
@@ -621,12 +644,13 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 
     Ok(Server {
         listener,
-        password,
+        users,
         transport_mode,
         enable_udp,
         udp_associations: udp::new_udp_associations(),
         tls_acceptor,
         acl_engine,
+        stats: stats::StatsManager::new(),
     })
 }
 

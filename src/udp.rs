@@ -1,6 +1,7 @@
 use crate::acl::{AclEngine, Protocol};
 use crate::address::{self, Address};
 use crate::logger::log;
+use crate::stats::UserStats;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
@@ -203,6 +204,7 @@ pub struct UdpRelaySession {
     peer_addr: String,
     udp_associations: UdpAssociations,
     acl_engine: Option<Arc<AclEngine>>,
+    user_stats: Arc<UserStats>,
 }
 
 impl UdpRelaySession {
@@ -211,6 +213,7 @@ impl UdpRelaySession {
         udp_associations: UdpAssociations,
         peer_addr: String,
         acl_engine: Option<Arc<AclEngine>>,
+        user_stats: Arc<UserStats>,
     ) -> Result<Self> {
         // Generate unique socket key
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -231,6 +234,7 @@ impl UdpRelaySession {
             peer_addr,
             udp_associations,
             acl_engine,
+            user_stats,
         })
     }
 
@@ -403,6 +407,8 @@ impl UdpRelaySession {
                 packet = udp_rx.recv() => {
                     match packet {
                         Some((from_addr, data)) => {
+                            // Record download bytes (remote -> client)
+                            self.user_stats.add_download(data.len() as u64);
                             if !Self::send_udp_response_reuse(&tcp_write_tx, from_addr, data, &self.peer_addr, &mut encode_buf) {
                                 break;
                             }
@@ -460,6 +466,7 @@ impl UdpRelaySession {
                     // TODO: Implement full UDP proxying through SOCKS5 if needed
                     match udp_packet.addr.to_socket_addr().await {
                         Ok(remote_addr) => {
+                            let payload_len = udp_packet.payload.len() as u64;
                             if let Err(e) = self
                                 .association
                                 .socket
@@ -467,6 +474,9 @@ impl UdpRelaySession {
                                 .await
                             {
                                 log::debug!(peer = %self.peer_addr, error = %e, "Failed to send UDP packet");
+                            } else {
+                                // Record upload bytes (client -> remote)
+                                self.user_stats.add_upload(payload_len);
                             }
                         }
                         Err(e) => {
@@ -600,8 +610,9 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     _bind_addr: Address,
     peer_addr: String,
     acl_engine: Option<Arc<AclEngine>>,
+    user_stats: Arc<UserStats>,
 ) -> Result<()> {
-    let session = UdpRelaySession::new(udp_associations, peer_addr, acl_engine).await?;
+    let session = UdpRelaySession::new(udp_associations, peer_addr, acl_engine, user_stats).await?;
     session.run(client_stream).await
 }
 
