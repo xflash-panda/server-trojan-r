@@ -1,3 +1,4 @@
+use crate::acl::{AclEngine, Protocol};
 use crate::address::{self, Address};
 use crate::logger::log;
 
@@ -201,6 +202,7 @@ pub struct UdpRelaySession {
     socket_key: String,
     peer_addr: String,
     udp_associations: UdpAssociations,
+    acl_engine: Option<Arc<AclEngine>>,
 }
 
 impl UdpRelaySession {
@@ -208,6 +210,7 @@ impl UdpRelaySession {
     pub async fn new(
         udp_associations: UdpAssociations,
         peer_addr: String,
+        acl_engine: Option<Arc<AclEngine>>,
     ) -> Result<Self> {
         // Generate unique socket key
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -227,6 +230,7 @@ impl UdpRelaySession {
             socket_key,
             peer_addr,
             udp_associations,
+            acl_engine,
         })
     }
 
@@ -420,6 +424,40 @@ impl UdpRelaySession {
                     let _ = buffer.split_to(consumed);
                     self.association.update_activity();
 
+                    // Get host and port for ACL matching
+                    let (host, port) = match &udp_packet.addr {
+                        Address::IPv4(ip, port) => {
+                            (std::net::Ipv4Addr::from(*ip).to_string(), *port)
+                        }
+                        Address::IPv6(ip, port) => {
+                            (std::net::Ipv6Addr::from(*ip).to_string(), *port)
+                        }
+                        Address::Domain(domain, port) => (domain.clone(), *port),
+                    };
+
+                    // Match against ACL rules for UDP
+                    let outbound = if let Some(ref engine) = self.acl_engine {
+                        engine.match_host(&host, port, Protocol::UDP)
+                    } else {
+                        None
+                    };
+
+                    // Check if connection should be rejected
+                    if let Some(ref handler) = outbound {
+                        if handler.is_reject() {
+                            log::debug!(peer = %self.peer_addr, target = %udp_packet.addr.to_key(), "UDP packet rejected by ACL");
+                            continue;
+                        }
+
+                        // Check if outbound supports UDP
+                        if !handler.allows_udp() {
+                            log::debug!(peer = %self.peer_addr, target = %udp_packet.addr.to_key(), "UDP not supported by outbound");
+                            continue;
+                        }
+                    }
+
+                    // For now, we use direct UDP for simplicity
+                    // TODO: Implement full UDP proxying through SOCKS5 if needed
                     match udp_packet.addr.to_socket_addr().await {
                         Ok(remote_addr) => {
                             if let Err(e) = self
@@ -561,8 +599,9 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     client_stream: S,
     _bind_addr: Address,
     peer_addr: String,
+    acl_engine: Option<Arc<AclEngine>>,
 ) -> Result<()> {
-    let session = UdpRelaySession::new(udp_associations, peer_addr).await?;
+    let session = UdpRelaySession::new(udp_associations, peer_addr, acl_engine).await?;
     session.run(client_stream).await
 }
 

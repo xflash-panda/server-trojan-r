@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::{fs, path::Path};
 
 #[derive(Parser, Debug, Clone)]
@@ -49,6 +50,14 @@ pub struct ServerConfig {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long)]
     pub log_level: Option<String>,
+
+    /// Path to the ACL config file (optional, YAML format)
+    #[arg(long = "acl_conf_file", value_name = "PATH")]
+    pub acl_conf_file: Option<PathBuf>,
+
+    /// Data directory for geo data files (GeoIP, GeoSite)
+    #[arg(long = "data_dir", value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -222,6 +231,8 @@ impl TomlConfig {
             config_file: None,
             generate_config: None,
             log_level: self.log.map(|l| l.level),
+            acl_conf_file: None,
+            data_dir: None,
         }
     }
 }
@@ -413,6 +424,8 @@ level = "debug"
             config_file: None,
             generate_config: None,
             log_level: None,
+            acl_conf_file: None,
+            data_dir: None,
         };
 
         // Verify defaults: ws=false, grpc=false, udp=true
@@ -460,6 +473,8 @@ enable_udp = false
             config_file: None,
             generate_config: None,
             log_level: None,
+            acl_conf_file: None,
+            data_dir: None,
         };
 
         assert_eq!(config.enable_ws, Some(true));

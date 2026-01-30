@@ -1,3 +1,4 @@
+mod acl;
 mod address;
 mod config;
 mod error;
@@ -16,6 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use logger::log;
 
+use acl::AsyncOutbound;
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
@@ -42,6 +44,7 @@ pub struct Server {
     pub enable_udp: bool,
     pub udp_associations: udp::UdpAssociations,
     pub tls_acceptor: Option<TlsAcceptor>,
+    pub acl_engine: Option<Arc<acl::AclEngine>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,7 +298,14 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     match request.cmd {
         TrojanCmd::Connect => {
-            handle_connect(stream, request.addr, request.payload, peer_addr).await
+            handle_connect(
+                stream,
+                request.addr,
+                request.payload,
+                peer_addr,
+                server.acl_engine.clone(),
+            )
+            .await
         }
         TrojanCmd::UdpAssociate => {
             if !server.enable_udp {
@@ -307,6 +317,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 stream,
                 request.addr,
                 peer_addr,
+                server.acl_engine.clone(),
             )
             .await
         }
@@ -320,52 +331,130 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     target_addr: address::Address,
     initial_payload: Bytes,
     peer_addr: String,
+    acl_engine: Option<Arc<acl::AclEngine>>,
 ) -> Result<()> {
-    log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
-
-    let remote_addr = target_addr.to_socket_addr().await?;
-    let mut remote_stream = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(remote_addr),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => {
-            // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
-            let _ = stream.set_nodelay(true);
-            stream
+    // Get host and port for ACL matching
+    let (host, port) = match &target_addr {
+        address::Address::IPv4(ip, port) => {
+            (std::net::Ipv4Addr::from(*ip).to_string(), *port)
         }
-        Ok(Err(e)) => {
-            log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
-            return Err(e.into());
+        address::Address::IPv6(ip, port) => {
+            (std::net::Ipv6Addr::from(*ip).to_string(), *port)
         }
-        Err(_) => {
-            log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
-            return Err(anyhow!(
-                "TCP connect timeout after {} seconds",
-                TCP_CONNECT_TIMEOUT_SECS
-            ));
-        }
+        address::Address::Domain(domain, port) => (domain.clone(), *port),
     };
-    log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
-    if !initial_payload.is_empty() {
-        remote_stream.write_all(&initial_payload).await?;
+    // Match against ACL rules
+    let outbound = if let Some(ref engine) = acl_engine {
+        engine.match_host(&host, port, acl::Protocol::TCP)
+    } else {
+        None
+    };
+
+    // Check if connection should be rejected
+    if let Some(ref handler) = outbound {
+        if handler.is_reject() {
+            log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connection rejected by ACL");
+            return Ok(());
+        }
     }
 
-    match relay::copy_bidirectional_with_idle_timeout(
-        client_stream,
-        remote_stream,
-        CONNECTION_TIMEOUT_SECS,
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+    log::info!(peer = %peer_addr, target = %target_addr.to_key(), outbound = ?outbound, "Connecting to target");
+
+    // Use ACL outbound or direct connection
+    if let Some(handler) = outbound {
+        // Use acl-engine-r's async outbound
+        let mut acl_addr = acl::Addr::new(&host, port);
+
+        let mut tcp_conn: Box<dyn acl::AsyncTcpConn> = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+            handler.dial_tcp(&mut acl_addr),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                log::warn!(peer = %peer_addr, error = %e, "ACL outbound connect failed");
+                return Err(anyhow!("ACL outbound connect failed: {}", e));
+            }
+            Err(_) => {
+                log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "ACL outbound connect timeout");
+                return Err(anyhow!(
+                    "ACL outbound connect timeout after {} seconds",
+                    TCP_CONNECT_TIMEOUT_SECS
+                ));
+            }
+        };
+
+        log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connected via ACL outbound");
+
+        // Write initial payload if any
+        if !initial_payload.is_empty() {
+            tcp_conn.write_all(&initial_payload).await?;
         }
-        Err(e) => {
-            log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+
+        // Relay data
+        match relay::copy_bidirectional_with_idle_timeout(
+            client_stream,
+            tcp_conn,
+            CONNECTION_TIMEOUT_SECS,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+            }
+            Err(e) => {
+                log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            }
+        }
+    } else {
+        // Direct connection (no ACL engine or no match)
+        let remote_addr = target_addr.to_socket_addr().await?;
+        let mut remote_stream = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(remote_addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
+                let _ = stream.set_nodelay(true);
+                stream
+            }
+            Ok(Err(e)) => {
+                log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
+                return Err(e.into());
+            }
+            Err(_) => {
+                log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
+                return Err(anyhow!(
+                    "TCP connect timeout after {} seconds",
+                    TCP_CONNECT_TIMEOUT_SECS
+                ));
+            }
+        };
+        log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server (direct)");
+
+        if !initial_payload.is_empty() {
+            remote_stream.write_all(&initial_payload).await?;
+        }
+
+        match relay::copy_bidirectional_with_idle_timeout(
+            client_stream,
+            remote_stream,
+            CONNECTION_TIMEOUT_SECS,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+            }
+            Err(e) => {
+                log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            }
         }
     }
 
@@ -495,6 +584,41 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 
     let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key, transport_mode)?;
 
+    // Load ACL engine if config file is provided
+    let acl_engine = if let Some(ref acl_path) = config.acl_conf_file {
+        if !acl_path.exists() {
+            return Err(anyhow!(
+                "ACL config file not found: {}",
+                acl_path.display()
+            ));
+        }
+
+        // Validate file extension
+        let ext = acl_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
+            return Err(anyhow!(
+                "Invalid ACL config file format: expected .yaml or .yml extension, got .{} (file: {})",
+                ext,
+                acl_path.display()
+            ));
+        }
+
+        let acl_config = acl::load_acl_config(acl_path).await?;
+        let engine = acl::AclEngine::new(acl_config, config.data_dir.as_deref()).await?;
+        log::info!(
+            acl_file = %acl_path.display(),
+            rules = engine.rule_count(),
+            "ACL engine loaded"
+        );
+        Some(Arc::new(engine))
+    } else {
+        log::info!("No ACL config file provided, using direct connection for all traffic");
+        None
+    };
+
     Ok(Server {
         listener,
         password,
@@ -502,6 +626,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         enable_udp,
         udp_associations: udp::new_udp_associations(),
         tls_acceptor,
+        acl_engine,
     })
 }
 
