@@ -874,7 +874,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1468,7 +1468,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -1505,7 +1505,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -1807,8 +1807,8 @@ dependencies = [
 
 [[package]]
 name = "server-r-client"
-version = "0.1.7"
-source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.7#ad66648e37f4f8dd766456d00aaf745b62c23080"
+version = "0.1.8"
+source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.8#966f97d45087c3ca506460bb9335ab8bf4a341e9"
 dependencies = [
  "reqwest",
  "serde",
