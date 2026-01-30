@@ -11,6 +11,23 @@ use super::user_manager::UserManager;
 use crate::business::stats::ApiStatsCollector;
 use crate::logger::log;
 
+/// Format bytes into human-readable string (KB, MB, GB)
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 /// Background task configuration
 #[derive(Debug, Clone)]
 pub struct TaskConfig {
@@ -158,8 +175,9 @@ impl BackgroundTasks {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Err(e) = api_manager.heartbeat().await {
-                            log::warn!(error = %e, "Failed to send heartbeat");
+                        match api_manager.heartbeat().await {
+                            Ok(()) => log::info!("Heartbeat sent"),
+                            Err(e) => log::warn!(error = %e, "Failed to send heartbeat"),
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -178,16 +196,16 @@ async fn fetch_users_once(
     user_manager: &UserManager,
 ) -> anyhow::Result<()> {
     let users = api_manager.fetch_users().await?;
+    let total = users.len();
     let (added, removed, kicked) = user_manager.update(&users).await;
 
-    if added > 0 || removed > 0 {
-        log::info!(
-            added = added,
-            removed = removed,
-            kicked = kicked,
-            "Users synchronized"
-        );
-    }
+    log::info!(
+        total = total,
+        added = added,
+        removed = removed,
+        kicked = kicked,
+        "Users synchronized"
+    );
 
     Ok(())
 }
@@ -221,8 +239,15 @@ async fn report_traffic_once(
     }
 
     let count = traffic_data.len();
+    let total_upload: u64 = traffic_data.iter().map(|t| t.u).sum();
+    let total_download: u64 = traffic_data.iter().map(|t| t.d).sum();
     api_manager.submit_traffic(traffic_data).await?;
-    log::debug!(users = count, "Traffic reported");
+    log::info!(
+        users = count,
+        upload = %format_bytes(total_upload),
+        download = %format_bytes(total_download),
+        "Traffic reported"
+    );
 
     Ok(())
 }

@@ -181,11 +181,11 @@ async fn handle_connect(
 
     // Check if connection should be rejected
     if matches!(outbound_type, core::hooks::OutboundType::Reject) {
-        log::info!(peer = %peer_addr, target = %target, "Connection rejected by router");
+        log::debug!(peer = %peer_addr, target = %target, "Connection rejected by router");
         return Ok(());
     }
 
-    log::info!(peer = %peer_addr, target = %target, outbound = ?outbound_type, "Connecting to target");
+    log::debug!(peer = %peer_addr, target = %target, outbound = ?outbound_type, "Connecting to target");
 
     // Connect based on outbound type
     match outbound_type {
@@ -242,7 +242,7 @@ async fn handle_direct_connect(
         }
     };
 
-    log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote (direct)");
+    log::debug!(peer = %peer_addr, remote = %remote_addr, "Connected to remote (direct)");
 
     // Write initial payload if any
     if !initial_payload.is_empty() {
@@ -274,7 +274,7 @@ async fn handle_direct_connect(
             }
         }
         _ = cancel_token.cancelled() => {
-            log::info!(peer = %peer_addr, "Connection kicked by admin");
+            log::debug!(peer = %peer_addr, "Connection kicked by admin");
         }
     }
 
@@ -356,7 +356,7 @@ where
     match transport_type {
         TransportType::Grpc => {
             let peer_addr_for_log = peer_addr.clone();
-            log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
+            log::debug!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
             let grpc_conn = GrpcConnection::with_service_name(stream, &network_settings.grpc_service_name).await?;
             let result = grpc_conn
                 .run(move |grpc_transport| {
@@ -375,7 +375,7 @@ where
 
             match &result {
                 Ok(()) => {
-                    log::info!(peer = %peer_addr_for_log, "gRPC connection closed normally");
+                    log::debug!(peer = %peer_addr_for_log, "gRPC connection closed normally");
                 }
                 Err(e) => {
                     log::warn!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
@@ -535,6 +535,12 @@ async fn run_server(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install ring as the default crypto provider for rustls
+    // This must be done before any TLS operations
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Parse CLI arguments
     let cli = config::CliArgs::parse_args();
     cli.validate()?;

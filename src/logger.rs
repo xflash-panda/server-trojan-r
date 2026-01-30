@@ -98,13 +98,13 @@ pub mod log {
 
     /// Log connection events
     pub fn connection(addr: &str, event: &str) {
-        info!(peer = addr, event = event, "Connection");
+        debug!(peer = addr, event = event, "Connection");
     }
 
     /// Log authentication events
     pub fn authentication(addr: &str, success: bool) {
         if success {
-            info!(peer = addr, "Authentication successful");
+            debug!(peer = addr, "Authentication successful");
         } else {
             warn!(peer = addr, "Authentication failed");
         }
