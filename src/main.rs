@@ -1,283 +1,51 @@
+//! Trojan proxy server with layered architecture
+//!
+//! Architecture:
+//! - `core/`: Core proxy logic with hook traits for extensibility
+//! - `transport/`: Transport layer abstraction (TCP, WebSocket, gRPC)
+//! - `business/`: Business implementations (API, auth, stats)
+
 mod acl;
-mod address;
-mod api;
+mod business;
 mod config;
+mod core;
 mod error;
-mod grpc;
 mod logger;
-mod relay;
-mod stats;
-mod tls;
-mod udp;
-mod utils;
-mod ws;
+mod transport;
 
 // Use mimalloc as the global allocator for better performance
-// (5-15% improvement in allocation-heavy workloads)
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use logger::log;
 
-use acl::AsyncOutbound;
 use anyhow::{anyhow, Result};
-use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use bytes::BytesMut;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
-use tokio_rustls::TlsAcceptor;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-const BUF_SIZE: usize = 32 * 1024;
+use crate::business::{
+    ApiAuthenticator, ApiManager, ApiStatsCollector, BackgroundTasks, TaskConfig, UserManager,
+};
+use crate::core::{
+    copy_bidirectional_with_stats, Address, ConnectionManager, DecodeResult, Server, TrojanCmd,
+    TrojanRequest,
+};
+use crate::transport::{ConnectionMeta, TransportListener, TransportStream, TransportType};
 
+const BUF_SIZE: usize = 32 * 1024;
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-#[derive(Debug, Clone, Copy)]
-pub enum TransportMode {
-    Tcp,
-    WebSocket,
-    Grpc,
-}
-
-pub struct Server {
-    pub listener: TcpListener,
-    /// Shared users map (updated by UserManager)
-    pub users: Arc<RwLock<HashMap<[u8; 56], i64>>>,
-    pub transport_mode: TransportMode,
-    pub enable_udp: bool,
-    pub udp_associations: udp::UdpAssociations,
-    pub tls_acceptor: Option<TlsAcceptor>,
-    pub acl_engine: Option<Arc<acl::AclEngine>>,
-    /// Stats manager for tracking user traffic
-    pub stats: stats::StatsManager,
-    /// Connection manager for tracking active connections and kick-off capability
-    pub connections: stats::ConnectionManager,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ErrorCode {
-    Ok = 0,
-    ErrRead = 1,
-    ErrWrite = 2,
-    ErrResolve = 3,
-    MoreData = 4,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TrojanCmd {
-    Connect = 1,
-    UdpAssociate = 3,
-}
-
-#[derive(Debug)]
-pub struct TrojanRequest {
-    pub password: [u8; 56],
-    pub cmd: TrojanCmd,
-    pub addr: address::Address,
-    pub payload: Bytes,
-}
-
-impl TrojanRequest {
-    /// Decode Trojan request from buffer (legacy version with copy)
-    #[allow(dead_code)]
-    pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
-        if buf.len() < 59 {
-            return Err(anyhow!("Buffer too small"));
-        }
-
-        let mut cursor = 0;
-
-        let mut password = [0u8; 56];
-        password.copy_from_slice(&buf[cursor..cursor + 56]);
-        cursor += 56;
-
-        if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
-            return Err(anyhow!("Invalid CRLF after password"));
-        }
-        cursor += 2;
-
-        let cmd = match buf[cursor] {
-            1 => TrojanCmd::Connect,
-            3 => TrojanCmd::UdpAssociate,
-            _ => return Err(anyhow!("Invalid command")),
-        };
-        cursor += 1;
-
-        let atyp = buf[cursor];
-        cursor += 1;
-
-        let addr = match atyp {
-            1 => {
-                if buf.len() < cursor + 6 {
-                    return Err(anyhow!("Buffer too small for IPv4"));
-                }
-                let mut ip = [0u8; 4];
-                ip.copy_from_slice(&buf[cursor..cursor + 4]);
-                cursor += 4;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                address::Address::IPv4(ip, port)
-            }
-            3 => {
-                if buf.len() <= cursor {
-                    return Err(anyhow!("Buffer too small for domain length"));
-                }
-                let domain_len = buf[cursor] as usize;
-                cursor += 1;
-                if buf.len() < cursor + domain_len + 2 {
-                    return Err(anyhow!("Buffer too small for domain"));
-                }
-                let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
-                    .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
-                    .to_string();
-                cursor += domain_len;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                address::Address::Domain(domain, port)
-            }
-            4 => {
-                if buf.len() < cursor + 18 {
-                    return Err(anyhow!("Buffer too small for IPv6"));
-                }
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&buf[cursor..cursor + 16]);
-                cursor += 16;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                address::Address::IPv6(ip, port)
-            }
-            _ => return Err(anyhow!("Invalid address type")),
-        };
-
-        if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
-            return Err(anyhow!("Invalid CRLF after address"));
-        }
-        cursor += 2;
-
-        let payload = Bytes::copy_from_slice(&buf[cursor..]);
-
-        Ok((
-            TrojanRequest {
-                password,
-                cmd,
-                addr,
-                payload,
-            },
-            cursor,
-        ))
-    }
-
-    /// Decode Trojan request from BytesMut with zero-copy payload extraction
-    ///
-    /// This version avoids copying the payload data by using BytesMut::split_off()
-    /// which shares the underlying allocation.
-    pub fn decode_zerocopy(buf: &mut BytesMut) -> Result<Self> {
-        if buf.len() < 59 {
-            return Err(anyhow!("Buffer too small"));
-        }
-
-        let mut cursor = 0;
-
-        let mut password = [0u8; 56];
-        password.copy_from_slice(&buf[cursor..cursor + 56]);
-        cursor += 56;
-
-        if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
-            return Err(anyhow!("Invalid CRLF after password"));
-        }
-        cursor += 2;
-
-        let cmd = match buf[cursor] {
-            1 => TrojanCmd::Connect,
-            3 => TrojanCmd::UdpAssociate,
-            _ => return Err(anyhow!("Invalid command")),
-        };
-        cursor += 1;
-
-        let atyp = buf[cursor];
-        cursor += 1;
-
-        let addr = match atyp {
-            1 => {
-                if buf.len() < cursor + 6 {
-                    return Err(anyhow!("Buffer too small for IPv4"));
-                }
-                let mut ip = [0u8; 4];
-                ip.copy_from_slice(&buf[cursor..cursor + 4]);
-                cursor += 4;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                address::Address::IPv4(ip, port)
-            }
-            3 => {
-                if buf.len() <= cursor {
-                    return Err(anyhow!("Buffer too small for domain length"));
-                }
-                let domain_len = buf[cursor] as usize;
-                cursor += 1;
-                if buf.len() < cursor + domain_len + 2 {
-                    return Err(anyhow!("Buffer too small for domain"));
-                }
-                let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
-                    .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
-                    .to_string();
-                cursor += domain_len;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                address::Address::Domain(domain, port)
-            }
-            4 => {
-                if buf.len() < cursor + 18 {
-                    return Err(anyhow!("Buffer too small for IPv6"));
-                }
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&buf[cursor..cursor + 16]);
-                cursor += 16;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                address::Address::IPv6(ip, port)
-            }
-            _ => return Err(anyhow!("Invalid address type")),
-        };
-
-        if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
-            return Err(anyhow!("Invalid CRLF after address"));
-        }
-        cursor += 2;
-
-        // Zero-copy: split_off returns a new BytesMut sharing the allocation
-        // freeze() converts it to Bytes without copying
-        let payload = buf.split_off(cursor).freeze();
-
-        // Clear the header portion (we've consumed it)
-        buf.clear();
-
-        Ok(TrojanRequest {
-            password,
-            cmd,
-            addr,
-            payload,
-        })
-    }
-}
-
-async fn handle_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // 只需要一套 Trojan 协议处理逻辑
-    process_trojan(server, stream, peer_addr).await
-}
-
-async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    server: Arc<Server>,
-    mut stream: S,
-    peer_addr: String,
+/// Process a single connection
+async fn process_connection(
+    server: &Server,
+    mut stream: TransportStream,
+    meta: ConnectionMeta,
 ) -> Result<()> {
-    // 读取 Trojan 请求 - 使用 BytesMut 实现零拷贝
+    // Read Trojan request
     let mut buf = BytesMut::with_capacity(BUF_SIZE);
     buf.resize(BUF_SIZE, 0);
     let n = stream.read(&mut buf).await?;
@@ -286,27 +54,32 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         return Err(anyhow!("Connection closed before receiving request"));
     }
 
-    // Truncate to actual read size
     buf.truncate(n);
 
-    // Zero-copy decode
-    let request = TrojanRequest::decode_zerocopy(&mut buf)?;
+    // Decode request (zero-copy)
+    let request = match TrojanRequest::decode_zerocopy(&mut buf) {
+        DecodeResult::Ok(req, _) => req,
+        DecodeResult::NeedMoreData => {
+            return Err(anyhow!("Incomplete request"));
+        }
+        DecodeResult::Invalid(e) => {
+            return Err(anyhow!("Invalid request: {}", e));
+        }
+    };
 
-    // 验证用户 (通过 uuid 验证) - 需要获取读锁
-    let user_id = {
-        let users = server.users.read().await;
-        match users.get(&request.password) {
-            Some(&id) => id,
-            None => {
-                let transport = match server.transport_mode {
-                    TransportMode::Tcp => "TCP",
-                    TransportMode::WebSocket => "WS",
-                    TransportMode::Grpc => "gRPC",
-                };
-                log::authentication(&peer_addr, false);
-                log::warn!(peer = %peer_addr, transport = transport, "Invalid user credentials");
-                return Err(anyhow!("Invalid user credentials"));
-            }
+    let peer_addr = meta.peer_addr.to_string();
+
+    // Authenticate user
+    let user_id = match server.authenticator.authenticate(&request.password).await {
+        Some(id) => id,
+        None => {
+            log::authentication(&peer_addr, false);
+            log::warn!(
+                peer = %peer_addr,
+                transport = %meta.transport_type,
+                "Invalid user credentials"
+            );
+            return Err(anyhow!("Invalid user credentials"));
         }
     };
 
@@ -314,340 +87,199 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     log::debug!(peer = %peer_addr, user_id = user_id, "User authenticated");
 
     // Register connection for tracking and kick-off capability
-    let (conn_id, cancel_token) = server
-        .connections
-        .register(user_id as u64, peer_addr.clone());
+    let (conn_id, cancel_token) = server.conn_manager.register(user_id, peer_addr.clone());
     log::debug!(peer = %peer_addr, user_id = user_id, conn_id = conn_id, "Connection registered");
 
     // Ensure connection is unregistered when done
     let _guard = scopeguard::guard((), |_| {
-        server.connections.unregister(conn_id);
+        server.conn_manager.unregister(conn_id);
         log::debug!(conn_id = conn_id, "Connection unregistered");
     });
 
-    // Record proxy request for this user
-    server.stats.record_request(user_id as u64);
-
-    // Get user stats for traffic tracking
-    let user_stats = server.stats.get_or_create(user_id as u64);
+    // Record proxy request
+    server.stats.record_request(user_id);
 
     match request.cmd {
         TrojanCmd::Connect => {
             handle_connect(
+                server,
                 stream,
                 request.addr,
                 request.payload,
                 peer_addr,
-                server.acl_engine.clone(),
-                user_stats,
+                user_id,
                 cancel_token,
             )
             .await
         }
         TrojanCmd::UdpAssociate => {
-            if !server.enable_udp {
-                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
-                return Err(anyhow!("UDP support is disabled"));
-            }
-            udp::handle_udp_associate(
-                Arc::clone(&server.udp_associations),
-                stream,
-                request.addr,
-                peer_addr,
-                server.acl_engine.clone(),
-                user_stats,
-                cancel_token,
-            )
-            .await
+            // UDP support would be implemented here
+            log::warn!(peer = %peer_addr, "UDP associate not implemented in new architecture");
+            Err(anyhow!("UDP associate not implemented"))
         }
     }
 }
 
-// 统一的 CONNECT 处理
-
-async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
-    client_stream: S,
-    target_addr: address::Address,
-    initial_payload: Bytes,
+/// Handle TCP CONNECT command
+async fn handle_connect(
+    server: &Server,
+    client_stream: TransportStream,
+    target: Address,
+    initial_payload: bytes::Bytes,
     peer_addr: String,
-    acl_engine: Option<Arc<acl::AclEngine>>,
-    user_stats: Arc<stats::UserStats>,
+    user_id: u64,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    // Get host and port for ACL matching
-    let (host, port) = match &target_addr {
-        address::Address::IPv4(ip, port) => (std::net::Ipv4Addr::from(*ip).to_string(), *port),
-        address::Address::IPv6(ip, port) => (std::net::Ipv6Addr::from(*ip).to_string(), *port),
-        address::Address::Domain(domain, port) => (domain.clone(), *port),
+    // Get host and port for routing
+    let (host, port) = match &target {
+        Address::IPv4(ip, port) => (std::net::Ipv4Addr::from(*ip).to_string(), *port),
+        Address::IPv6(ip, port) => (std::net::Ipv6Addr::from(*ip).to_string(), *port),
+        Address::Domain(domain, port) => (domain.clone(), *port),
     };
 
-    // Match against ACL rules
-    let outbound = if let Some(ref engine) = acl_engine {
-        engine.match_host(&host, port, acl::Protocol::TCP)
-    } else {
-        None
-    };
+    // Route the connection
+    let outbound_type = server.router.route(&host, port).await;
 
     // Check if connection should be rejected
-    if let Some(ref handler) = outbound {
-        if handler.is_reject() {
-            log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connection rejected by ACL");
-            return Ok(());
-        }
+    if matches!(outbound_type, core::hooks::OutboundType::Reject) {
+        log::info!(peer = %peer_addr, target = %target, "Connection rejected by router");
+        return Ok(());
     }
 
-    log::info!(peer = %peer_addr, target = %target_addr.to_key(), outbound = ?outbound, "Connecting to target");
+    log::info!(peer = %peer_addr, target = %target, outbound = ?outbound_type, "Connecting to target");
 
-    // Use ACL outbound or direct connection
-    if let Some(handler) = outbound {
-        // Use acl-engine-r's async outbound
-        let mut acl_addr = acl::Addr::new(&host, port);
-
-        let mut tcp_conn: Box<dyn acl::AsyncTcpConn> = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-            handler.dial_tcp(&mut acl_addr),
-        )
-        .await
-        {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => {
-                log::warn!(peer = %peer_addr, error = %e, "ACL outbound connect failed");
-                return Err(anyhow!("ACL outbound connect failed: {}", e));
-            }
-            Err(_) => {
-                log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "ACL outbound connect timeout");
-                return Err(anyhow!(
-                    "ACL outbound connect timeout after {} seconds",
-                    TCP_CONNECT_TIMEOUT_SECS
-                ));
-            }
-        };
-
-        log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connected via ACL outbound");
-
-        // Write initial payload if any
-        if !initial_payload.is_empty() {
-            user_stats.add_upload(initial_payload.len() as u64);
-            tcp_conn.write_all(&initial_payload).await?;
+    // Connect based on outbound type
+    match outbound_type {
+        core::hooks::OutboundType::Direct => {
+            handle_direct_connect(
+                server,
+                client_stream,
+                &target,
+                initial_payload,
+                &peer_addr,
+                user_id,
+                cancel_token,
+            )
+            .await
         }
+        core::hooks::OutboundType::Reject => {
+            // Already handled above
+            Ok(())
+        }
+    }
+}
 
-        // Relay data with stats tracking and cancellation support
-        let relay_fut = relay::copy_bidirectional_with_stats(
-            client_stream,
-            tcp_conn,
-            CONNECTION_TIMEOUT_SECS,
-            Some(user_stats),
-        );
+/// Handle direct connection
+async fn handle_direct_connect(
+    server: &Server,
+    client_stream: TransportStream,
+    target: &Address,
+    initial_payload: bytes::Bytes,
+    peer_addr: &str,
+    user_id: u64,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    // Resolve target address
+    let remote_addr = target.to_socket_addr().await?;
 
-        tokio::select! {
-            result = relay_fut => {
-                match result {
-                    Ok(r) if r.completed => {}
-                    Ok(_) => {
-                        log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
-                    }
-                    Err(e) => {
-                        log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
-                    }
+    // Connect with timeout
+    let mut remote_stream = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(remote_addr),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
+            return Err(e.into());
+        }
+        Err(_) => {
+            log::warn!(peer = %peer_addr, "TCP connect timeout");
+            return Err(anyhow!("TCP connect timeout"));
+        }
+    };
+
+    log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote (direct)");
+
+    // Write initial payload if any
+    if !initial_payload.is_empty() {
+        server
+            .stats
+            .record_upload(user_id, initial_payload.len() as u64);
+        remote_stream.write_all(&initial_payload).await?;
+    }
+
+    // Relay data with stats tracking and cancellation support
+    let stats = Arc::clone(&server.stats);
+    let relay_fut = copy_bidirectional_with_stats(
+        client_stream,
+        remote_stream,
+        CONNECTION_TIMEOUT_SECS,
+        Some((user_id, stats)),
+    );
+
+    tokio::select! {
+        result = relay_fut => {
+            match result {
+                Ok(r) if r.completed => {}
+                Ok(_) => {
+                    log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+                }
+                Err(e) => {
+                    log::debug!(peer = %peer_addr, error = %e, "Relay error");
                 }
             }
-            _ = cancel_token.cancelled() => {
-                log::info!(peer = %peer_addr, "Connection kicked by admin");
-            }
         }
-    } else {
-        // Direct connection (no ACL engine or no match)
-        let remote_addr = target_addr.to_socket_addr().await?;
-        let mut remote_stream = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-            TcpStream::connect(remote_addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
-                let _ = stream.set_nodelay(true);
-                stream
-            }
-            Ok(Err(e)) => {
-                log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
-                return Err(e.into());
-            }
-            Err(_) => {
-                log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
-                return Err(anyhow!(
-                    "TCP connect timeout after {} seconds",
-                    TCP_CONNECT_TIMEOUT_SECS
-                ));
-            }
-        };
-        log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server (direct)");
-
-        if !initial_payload.is_empty() {
-            user_stats.add_upload(initial_payload.len() as u64);
-            remote_stream.write_all(&initial_payload).await?;
-        }
-
-        // Relay data with stats tracking and cancellation support
-        let relay_fut = relay::copy_bidirectional_with_stats(
-            client_stream,
-            remote_stream,
-            CONNECTION_TIMEOUT_SECS,
-            Some(user_stats),
-        );
-
-        tokio::select! {
-            result = relay_fut => {
-                match result {
-                    Ok(r) if r.completed => {}
-                    Ok(_) => {
-                        log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
-                    }
-                    Err(e) => {
-                        log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
-                    }
-                }
-            }
-            _ = cancel_token.cancelled() => {
-                log::info!(peer = %peer_addr, "Connection kicked by admin");
-            }
+        _ = cancel_token.cancelled() => {
+            log::info!(peer = %peer_addr, "Connection kicked by admin");
         }
     }
 
     Ok(())
 }
 
-// 连接检测与分发
-pub async fn accept_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match server.transport_mode {
-        TransportMode::Grpc => {
-            let peer_addr_for_log = peer_addr.clone();
-            log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
-            let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
-            let result = grpc_conn
-                .run(move |transport| {
-                    let server = Arc::clone(&server);
-                    let peer_addr = peer_addr.clone();
-                    async move { handle_connection(server, transport, peer_addr).await }
-                })
-                .await;
-
-            match &result {
-                Ok(()) => {
-                    log::info!(peer = %peer_addr_for_log, "gRPC connection closed normally");
-                }
-                Err(e) => {
-                    log::warn!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
-                }
-            }
-            result
-        }
-        TransportMode::WebSocket => {
-            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-            let ws_transport = ws::WebSocketTransport::new(ws_stream);
-            handle_connection(server, ws_transport, peer_addr).await
-        }
-        TransportMode::Tcp => handle_connection(server, stream, peer_addr).await,
-    }
-}
-
-impl Server {
-    pub async fn run(self) -> Result<()> {
-        let server = Arc::new(self);
-        let addr = server.listener.local_addr()?;
-        let mode = match server.transport_mode {
-            TransportMode::Tcp => "TCP",
-            TransportMode::WebSocket => "WebSocket",
-            TransportMode::Grpc => "gRPC",
-        };
-        let tls_enabled = server.tls_acceptor.is_some();
-
-        log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
-
-        // UDP清理任务
-        udp::start_cleanup_task(Arc::clone(&server.udp_associations));
-
-        loop {
-            match server.listener.accept().await {
-                Ok((stream, addr)) => {
-                    // Set TCP_NODELAY on accepted connection for lower latency
-                    let _ = stream.set_nodelay(true);
-                    log::connection(&addr.to_string(), "new");
-                    let server_clone = Arc::clone(&server);
-
-                    tokio::spawn(async move {
-                        let peer_addr = addr.to_string();
-                        let result = async {
-                            if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
-                                const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30; // TLS握手超时30秒
-                                match tokio::time::timeout(
-                                    tokio::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
-                                    tls_acceptor.accept(stream)
-                                ).await {
-                                    Ok(Ok(tls_stream)) => {
-                                        log::info!(peer = %peer_addr, "TLS handshake successful");
-                                        accept_connection(server_clone, tls_stream, peer_addr.clone()).await
-                                    }
-                                    Ok(Err(e)) => {
-                                        log::error!(peer = %peer_addr, error = %e, "TLS handshake failed");
-                                        Err(anyhow!("TLS handshake failed: {}", e))
-                                    }
-                                    Err(_) => {
-                                        log::warn!(peer = %peer_addr, timeout_secs = TLS_HANDSHAKE_TIMEOUT_SECS, "TLS handshake timeout");
-                                        Err(anyhow!("TLS handshake timeout after {} seconds", TLS_HANDSHAKE_TIMEOUT_SECS))
-                                    }
-                                }
-                            } else {
-                                accept_connection(server_clone, stream, peer_addr.clone()).await
-                            }
-                        }.await;
-
-                        if let Err(e) = result {
-                            log::error!(peer = %peer_addr, error = %e, "Connection error");
-                        } else {
-                            log::connection(&peer_addr, "closed");
-                        }
-                    });
-                }
-                Err(e) => {
-                    log::error!(error = %e, "Failed to accept connection");
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-pub async fn build_server(
+/// Build transport listener based on configuration
+async fn build_transport_listener(
     config: &config::ServerConfig,
-    users: Arc<RwLock<HashMap<[u8; 56], i64>>>,
-    stats: stats::StatsManager,
-    connections: stats::ConnectionManager,
-) -> Result<Server> {
-    let addr: String = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
+) -> Result<Box<dyn TransportListener>> {
+    use crate::transport::TcpTransportListener;
 
-    let user_count = users.read().await.len();
-    log::info!(user_count = user_count, "Loaded users for authentication");
+    let addr = format!("{}:{}", config.host, config.port);
 
-    let transport_mode = if config.enable_grpc {
-        TransportMode::Grpc
+    // Determine transport type
+    let transport_type = if config.enable_grpc {
+        TransportType::Grpc
     } else if config.enable_ws {
-        TransportMode::WebSocket
+        TransportType::WebSocket
     } else {
-        TransportMode::Tcp
+        TransportType::Tcp
     };
 
-    let tls_acceptor =
-        tls::get_tls_acceptor(config.cert.clone(), config.key.clone(), transport_mode)?;
+    // For now, just use TCP listener
+    // Full transport layer integration will be done in a future iteration
+    let tcp_listener = TcpTransportListener::bind(&addr).await?;
 
-    // Load ACL engine if config file is provided
-    let acl_engine = if let Some(ref acl_path) = config.acl_conf_file {
+    log::info!(
+        address = %addr,
+        transport = %transport_type,
+        tls = config.cert.is_some(),
+        "Transport listener created"
+    );
+
+    Ok(Box::new(tcp_listener))
+}
+
+/// Build outbound router from ACL configuration
+async fn build_router(
+    config: &config::ServerConfig,
+) -> Result<Arc<dyn core::hooks::OutboundRouter>> {
+    use crate::acl::AclRouter;
+
+    if let Some(ref acl_path) = config.acl_conf_file {
         if !acl_path.exists() {
             return Err(anyhow!("ACL config file not found: {}", acl_path.display()));
         }
@@ -656,36 +288,61 @@ pub async fn build_server(
         let ext = acl_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
             return Err(anyhow!(
-                "Invalid ACL config file format: expected .yaml or .yml extension, got .{} (file: {})",
-                ext,
-                acl_path.display()
+                "Invalid ACL config file format: expected .yaml or .yml"
             ));
         }
 
         let acl_config = acl::load_acl_config(acl_path).await?;
         let engine = acl::AclEngine::new(acl_config, Some(config.data_dir.as_path())).await?;
+
         log::info!(
             acl_file = %acl_path.display(),
             rules = engine.rule_count(),
-            "ACL engine loaded"
+            "ACL router loaded"
         );
-        Some(Arc::new(engine))
-    } else {
-        log::info!("No ACL config file provided, using direct connection for all traffic");
-        None
-    };
 
-    Ok(Server {
-        listener,
-        users,
-        transport_mode,
-        enable_udp: config.enable_udp,
-        udp_associations: udp::new_udp_associations(),
-        tls_acceptor,
-        acl_engine,
-        stats,
-        connections,
-    })
+        Ok(Arc::new(AclRouter::new(engine)) as Arc<dyn core::hooks::OutboundRouter>)
+    } else {
+        log::info!("No ACL config, using direct connection for all traffic");
+        Ok(Arc::new(core::hooks::DirectRouter) as Arc<dyn core::hooks::OutboundRouter>)
+    }
+}
+
+/// Run the server accept loop
+async fn run_server(
+    server: Arc<Server>,
+    listener: Box<dyn TransportListener>,
+    transport_type: TransportType,
+) -> Result<()> {
+    let addr = listener.local_addr()?;
+    log::info!(address = %addr, transport = %transport_type, "Server started");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, meta)) => {
+                let peer_addr = meta.peer_addr.to_string();
+                log::connection(&peer_addr, "new");
+
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let result = process_connection(&server, stream, meta).await;
+                    if let Err(e) = result {
+                        log::debug!(peer = %peer_addr, error = %e, "Connection error");
+                    }
+                    log::connection(&peer_addr, "closed");
+                });
+            }
+            Err(e) => {
+                log::error!(error = %e, "Failed to accept connection");
+                // Continue accepting unless it's a fatal error
+                if e.kind() == std::io::ErrorKind::Other {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -700,20 +357,19 @@ async fn main() -> Result<()> {
     log::info!(
         api = %cli.api,
         node = cli.node,
-        "Starting Trojan server with remote panel integration"
+        "Starting Trojan server with layered architecture"
     );
 
-    // Create stats and connection managers
-    let stats = stats::StatsManager::new();
-    let connections = stats::ConnectionManager::new();
+    // Create connection manager (shared between core and business layers)
+    let conn_manager = ConnectionManager::new();
 
     // Create API manager
-    let api_manager = Arc::new(api::ApiManager::new(&cli)?);
+    let api_manager = Arc::new(ApiManager::new(&cli)?);
 
     // Create user manager
-    let user_manager = Arc::new(api::UserManager::new(connections.clone()));
+    let user_manager = Arc::new(UserManager::new(conn_manager.clone()));
 
-    // Initialize node (register or verify existing registration)
+    // Initialize node
     let register_id = api_manager.initialize().await?;
     log::info!(register_id = %register_id, "Node initialized");
 
@@ -724,41 +380,66 @@ async fn main() -> Result<()> {
     let users = api_manager.fetch_users().await?;
     user_manager.init(&users).await;
 
-    // Build server config from remote + CLI
+    // Build server config
     let server_config = config::ServerConfig::from_remote(&remote_config, &cli, users)?;
 
-    // Build server with shared users reference
-    let server = build_server(
-        &server_config,
-        user_manager.get_users_arc(),
-        stats.clone(),
-        connections.clone(),
-    )
-    .await?;
+    // Create authenticator using shared user map
+    let authenticator = Arc::new(ApiAuthenticator::new(user_manager.get_users_arc()));
+
+    // Create stats collector
+    let stats_collector = Arc::new(ApiStatsCollector::new());
+
+    // Build router from ACL config
+    let router = build_router(&server_config).await?;
+
+    // Determine transport type for logging
+    let transport_type = if server_config.enable_grpc {
+        TransportType::Grpc
+    } else if server_config.enable_ws {
+        TransportType::WebSocket
+    } else {
+        TransportType::Tcp
+    };
+
+    // Build server using the builder pattern
+    let server = Arc::new(
+        Server::builder()
+            .authenticator(authenticator)
+            .stats(Arc::clone(&stats_collector) as Arc<dyn core::hooks::StatsCollector>)
+            .router(router)
+            .conn_manager(conn_manager)
+            .build(),
+    );
+
+    // Build transport listener
+    let listener = build_transport_listener(&server_config).await?;
 
     // Start background tasks
-    let background_tasks = api::BackgroundTasks::new(
+    let task_config = TaskConfig::new(
+        cli.fetch_users_interval,
+        cli.report_traffics_interval,
+        cli.heartbeat_interval,
+    );
+    let background_tasks = BackgroundTasks::new(
+        task_config,
         Arc::clone(&api_manager),
         Arc::clone(&user_manager),
-        stats,
-        cli.clone(),
+        Arc::clone(&stats_collector),
     );
-    let _background_handle = background_tasks.start();
+    background_tasks.start();
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
     let cancel_token_clone = cancel_token.clone();
 
-    // Setup shutdown handler for SIGINT (Ctrl+C) and SIGTERM
+    // Setup shutdown handler
     let api_for_shutdown = Arc::clone(&api_manager);
     tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sigint =
-                signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT");
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM");
 
             tokio::select! {
                 _ = sigint.recv() => {
@@ -784,213 +465,11 @@ async fn main() -> Result<()> {
             log::info!("Node unregistered successfully");
         }
 
-        // Signal cancellation
         cancel_token_clone.cancel();
-
-        // Give a moment for cleanup, then exit
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         std::process::exit(0);
     });
 
     // Run server
-    server.run().await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_trojan_request(password: &[u8; 56], cmd: u8, addr_type: u8) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(password);
-        buf.extend_from_slice(b"\r\n");
-        buf.push(cmd);
-        buf.push(addr_type);
-
-        match addr_type {
-            1 => {
-                // IPv4
-                buf.extend_from_slice(&[127, 0, 0, 1]);
-                buf.extend_from_slice(&8080u16.to_be_bytes());
-            }
-            3 => {
-                // Domain
-                let domain = b"example.com";
-                buf.push(domain.len() as u8);
-                buf.extend_from_slice(domain);
-                buf.extend_from_slice(&80u16.to_be_bytes());
-            }
-            4 => {
-                // IPv6
-                buf.extend_from_slice(&[0u8; 16]);
-                buf.extend_from_slice(&443u16.to_be_bytes());
-            }
-            _ => {}
-        }
-
-        buf.extend_from_slice(b"\r\n");
-        buf
-    }
-
-    #[test]
-    fn test_trojan_request_decode_ipv4() {
-        let password = [b'a'; 56];
-        let mut request_bytes = make_trojan_request(&password, 1, 1);
-        request_bytes.extend_from_slice(b"payload data");
-
-        let (request, consumed) = TrojanRequest::decode(&request_bytes).unwrap();
-
-        assert_eq!(request.password, password);
-        assert_eq!(request.cmd, TrojanCmd::Connect);
-        assert!(matches!(
-            request.addr,
-            address::Address::IPv4([127, 0, 0, 1], 8080)
-        ));
-        assert_eq!(request.payload.as_ref(), b"payload data");
-        assert!(consumed > 0);
-    }
-
-    #[test]
-    fn test_trojan_request_decode_domain() {
-        let password = [b'b'; 56];
-        let mut request_bytes = make_trojan_request(&password, 3, 3);
-        request_bytes.extend_from_slice(b"hello");
-
-        let (request, _) = TrojanRequest::decode(&request_bytes).unwrap();
-
-        assert_eq!(request.cmd, TrojanCmd::UdpAssociate);
-        assert!(matches!(request.addr, address::Address::Domain(ref d, 80) if d == "example.com"));
-        assert_eq!(request.payload.as_ref(), b"hello");
-    }
-
-    #[test]
-    fn test_trojan_request_decode_ipv6() {
-        let password = [b'c'; 56];
-        let mut request_bytes = make_trojan_request(&password, 1, 4);
-        request_bytes.extend_from_slice(b"ipv6 payload");
-
-        let (request, _) = TrojanRequest::decode(&request_bytes).unwrap();
-
-        assert!(matches!(request.addr, address::Address::IPv6(_, 443)));
-        assert_eq!(request.payload.as_ref(), b"ipv6 payload");
-    }
-
-    #[test]
-    fn test_trojan_request_decode_zerocopy_ipv4() {
-        let password = [b'a'; 56];
-        let mut request_bytes = make_trojan_request(&password, 1, 1);
-        request_bytes.extend_from_slice(b"payload data");
-
-        let mut buf = BytesMut::from(&request_bytes[..]);
-        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
-
-        assert_eq!(request.password, password);
-        assert_eq!(request.cmd, TrojanCmd::Connect);
-        assert!(matches!(
-            request.addr,
-            address::Address::IPv4([127, 0, 0, 1], 8080)
-        ));
-        assert_eq!(request.payload.as_ref(), b"payload data");
-
-        // Buffer should be cleared after zerocopy decode
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn test_trojan_request_decode_zerocopy_domain() {
-        let password = [b'b'; 56];
-        let mut request_bytes = make_trojan_request(&password, 3, 3);
-        request_bytes.extend_from_slice(b"hello world!");
-
-        let mut buf = BytesMut::from(&request_bytes[..]);
-        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
-
-        assert_eq!(request.cmd, TrojanCmd::UdpAssociate);
-        assert!(matches!(request.addr, address::Address::Domain(ref d, 80) if d == "example.com"));
-        assert_eq!(request.payload.as_ref(), b"hello world!");
-    }
-
-    #[test]
-    fn test_trojan_request_decode_zerocopy_empty_payload() {
-        let password = [b'd'; 56];
-        let request_bytes = make_trojan_request(&password, 1, 1);
-
-        let mut buf = BytesMut::from(&request_bytes[..]);
-        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
-
-        assert!(request.payload.is_empty());
-    }
-
-    #[test]
-    fn test_trojan_request_decode_zerocopy_large_payload() {
-        let password = [b'e'; 56];
-        let mut request_bytes = make_trojan_request(&password, 1, 1);
-        let large_payload = vec![0xAB; 10000];
-        request_bytes.extend_from_slice(&large_payload);
-
-        let mut buf = BytesMut::from(&request_bytes[..]);
-        let request = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
-
-        assert_eq!(request.payload.len(), 10000);
-        assert!(request.payload.iter().all(|&b| b == 0xAB));
-    }
-
-    #[test]
-    fn test_trojan_request_decode_vs_zerocopy_equivalence() {
-        let password = [b'f'; 56];
-        let mut request_bytes = make_trojan_request(&password, 1, 1);
-        request_bytes.extend_from_slice(b"test payload for equivalence check");
-
-        // Decode with copy version
-        let (request_copy, _) = TrojanRequest::decode(&request_bytes).unwrap();
-
-        // Decode with zerocopy version
-        let mut buf = BytesMut::from(&request_bytes[..]);
-        let request_zerocopy = TrojanRequest::decode_zerocopy(&mut buf).unwrap();
-
-        // Both should produce identical results
-        assert_eq!(request_copy.password, request_zerocopy.password);
-        assert_eq!(request_copy.cmd, request_zerocopy.cmd);
-        assert_eq!(request_copy.addr, request_zerocopy.addr);
-        assert_eq!(request_copy.payload, request_zerocopy.payload);
-    }
-
-    #[test]
-    fn test_trojan_request_decode_buffer_too_small() {
-        let buf = vec![0u8; 50]; // Less than minimum 59 bytes
-        let result = TrojanRequest::decode(&buf);
-        assert!(result.is_err());
-
-        let mut buf_mut = BytesMut::from(&buf[..]);
-        let result_zerocopy = TrojanRequest::decode_zerocopy(&mut buf_mut);
-        assert!(result_zerocopy.is_err());
-    }
-
-    #[test]
-    fn test_trojan_request_decode_invalid_crlf() {
-        let mut buf = vec![b'a'; 56];
-        buf.extend_from_slice(b"\n\r"); // Wrong order
-        buf.push(1);
-        buf.push(1);
-        buf.extend_from_slice(&[127, 0, 0, 1]);
-        buf.extend_from_slice(&8080u16.to_be_bytes());
-        buf.extend_from_slice(b"\r\n");
-
-        let result = TrojanRequest::decode(&buf);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_trojan_request_decode_invalid_command() {
-        let mut buf = vec![b'a'; 56];
-        buf.extend_from_slice(b"\r\n");
-        buf.push(99); // Invalid command
-        buf.push(1);
-        buf.extend_from_slice(&[127, 0, 0, 1]);
-        buf.extend_from_slice(&8080u16.to_be_bytes());
-        buf.extend_from_slice(b"\r\n");
-
-        let result = TrojanRequest::decode(&buf);
-        assert!(result.is_err());
-    }
+    run_server(server, listener, transport_type).await
 }
