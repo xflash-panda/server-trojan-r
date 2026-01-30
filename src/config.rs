@@ -20,6 +20,7 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-node";
 /// Supports environment variables with X_PANDA_TROJAN_ prefix
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server with Remote Panel Integration")]
+#[command(rename_all = "snake_case")]
 pub struct CliArgs {
     /// API endpoint URL (required)
     #[arg(long, env = "X_PANDA_TROJAN_API")]
