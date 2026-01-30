@@ -11,6 +11,10 @@
   - WebSocket 模式（支持 WebSocket over TLS）
   - gRPC 模式（兼容 v2ray， 支持多路复用）
 - 📦 **UDP 代理**：完整支持 UDP 流量转发
+- 🛡️ **ACL 规则引擎**：支持基于规则的流量路由
+  - 支持 Direct、SOCKS5、HTTP、Reject 出站类型
+  - 支持 GeoIP (Mmdb) 和 GeoSite (Sing) 规则
+  - 支持端口、协议、域名后缀等匹配条件
 
 ## 安装
 
@@ -56,6 +60,9 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 | `--key <FILE>` | TLS 私钥文件路径 (PEM 格式) | String | - | 否 |
 | `--enable-ws` | 启用 WebSocket 模式 | Flag | 禁用 | 否 |
 | `--enable-grpc` | 启用 gRPC 模式 | Flag | 禁用 | 否 |
+| `--enable-udp` | 启用 UDP 代理支持 | Flag | 启用 | 否 |
+| `--acl_conf_file <PATH>` | ACL 配置文件路径 (YAML 格式) | String | - | 否 |
+| `--data_dir <PATH>` | GeoIP/GeoSite 数据文件目录 | String | - | 否 |
 | `-c, --config-file <FILE>` | 从 TOML 文件加载配置 | String | - | 否 |
 | `--generate-config <FILE>` | 生成示例配置文件 | String | - | 否 |
 | `--log-level <LEVEL>` | 日志级别 (trace/debug/info/warn/error) | String | `info` | 否 |
@@ -88,6 +95,69 @@ key = "/path/to/key.pem"
 
 [log]
 level = "info"
+```
+
+### ACL 配置
+
+ACL 配置使用 YAML 格式，支持基于规则的流量路由：
+
+```yaml
+# acl.yaml
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:40000
+      allow_udp: true
+  - name: http-proxy
+    type: http
+    http:
+      addr: 127.0.0.1:8080
+      username: user      # 可选
+      password: pass      # 可选
+      https: false
+      insecure: false
+
+acl:
+  inline:
+    # 拒绝 UDP 443 端口 (QUIC)
+    - reject(all, udp/443)
+    # 特定端口走代理
+    - warp(all, tcp/22)
+    - warp(all, tcp/25)
+    # 域名后缀匹配
+    - warp(suffix:google.com)
+    - warp(suffix:openai.com)
+    # GeoSite 规则 (需要 data_dir)
+    - warp(geosite:netflix)
+    - warp(geosite:category-porn)
+    # 默认直连
+    - direct(all)
+```
+
+#### 出站类型
+
+| 类型 | 描述 | 支持 UDP |
+|------|------|----------|
+| `direct` | 直接连接 | ✅ |
+| `socks5` | SOCKS5 代理 | 可配置 |
+| `http` | HTTP/HTTPS 代理 | ❌ |
+| `reject` | 拒绝连接 | ❌ |
+
+#### 规则语法
+
+```
+outbound(matcher, protocol/port)
+```
+
+- **matcher**: `all`, `suffix:domain`, `geosite:category`, `geoip:country`
+- **protocol/port**: `tcp/80`, `udp/443`, 省略则匹配所有
+
+#### 启动示例
+
+```bash
+# 使用 ACL 配置启动
+./trojan-rs --password mypassword --acl_conf_file acl.yaml --data_dir ./data
 ```
 
 ## 协议支持
