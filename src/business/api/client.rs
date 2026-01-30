@@ -130,7 +130,9 @@ impl ApiManager {
     }
 
     /// Initialize node - try to verify existing registration or register new
-    pub async fn initialize(&self) -> Result<String> {
+    ///
+    /// `port` is the server port from remote config, used for registration
+    pub async fn initialize(&self, port: u16) -> Result<String> {
         if let Some(state) = self.load_state() {
             log::info!(
                 register_id = %state.register_id,
@@ -158,11 +160,11 @@ impl ApiManager {
             }
         }
 
-        self.register().await
+        self.register(port).await
     }
 
     /// Register the node with the panel
-    async fn register(&self) -> Result<String> {
+    async fn register(&self, port: u16) -> Result<String> {
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -170,10 +172,11 @@ impl ApiManager {
         log::info!(
             node_id = self.node_id,
             hostname = %hostname,
+            port = port,
             "Registering node"
         );
 
-        let request = RegisterRequest::new(hostname, 0);
+        let request = RegisterRequest::new(hostname, port);
 
         let register_id = self
             .client

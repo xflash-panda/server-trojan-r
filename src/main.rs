@@ -557,12 +557,12 @@ async fn main() -> Result<()> {
     // Create user manager
     let user_manager = Arc::new(UserManager::new(conn_manager.clone()));
 
-    // Initialize node
-    let register_id = api_manager.initialize().await?;
-    log::info!(register_id = %register_id, "Node initialized");
-
-    // Fetch configuration from remote panel
+    // Fetch configuration from remote panel (needed for port before registration)
     let remote_config = api_manager.fetch_config().await?;
+
+    // Initialize node with port from config
+    let register_id = api_manager.initialize(remote_config.server_port).await?;
+    log::info!(register_id = %register_id, "Node initialized");
 
     // Fetch initial users
     let users = api_manager.fetch_users().await?;
