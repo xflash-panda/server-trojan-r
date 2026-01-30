@@ -37,6 +37,7 @@ pub struct GrpcH2cConnection<S> {
 ///
 /// This ensures the counter is decremented even if the task panics
 #[inline]
+#[allow(dead_code)]
 fn spawn_with_counter<F, Fut>(counter: Arc<AtomicUsize>, task: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -65,7 +66,7 @@ where
             .max_send_buffer_size(MAX_SEND_QUEUE_BYTES)
             .handshake(stream)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("h2 handshake: {}", e)))?;
 
         Ok(Self {
             h2_conn,

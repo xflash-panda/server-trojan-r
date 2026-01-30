@@ -67,7 +67,8 @@ impl GrpcH2cTransport {
             let new_capacity = needed
                 .max(self.read_pending.capacity() * 2)
                 .min(MAX_READ_BUFFER_SIZE);
-            self.read_pending.reserve(new_capacity - self.read_pending.len());
+            self.read_pending
+                .reserve(new_capacity - self.read_pending.len());
         }
     }
 
@@ -121,10 +122,10 @@ impl GrpcH2cTransport {
                     Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
                     Poll::Ready(Some(Ok(_))) => return Poll::Pending,
                     Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("gRPC capacity error: {}", e),
-                        )));
+                        return Poll::Ready(Err(io::Error::other(format!(
+                            "gRPC capacity error: {}",
+                            e
+                        ))));
                     }
                     Poll::Ready(None) => {
                         return Poll::Ready(Err(io::Error::new(
@@ -238,10 +239,7 @@ impl AsyncRead for GrpcH2cTransport {
                     if is_normal_stream_close(&e) {
                         return Poll::Ready(Ok(()));
                     }
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("gRPC recv error: {}", e),
-                    )));
+                    return Poll::Ready(Err(io::Error::other(format!("gRPC recv error: {}", e))));
                 }
                 Poll::Ready(None) => {
                     self.closed = true;
@@ -304,10 +302,10 @@ impl AsyncWrite for GrpcH2cTransport {
                         if e.is_remote() || e.is_io() {
                             Poll::Ready(Ok(()))
                         } else {
-                            Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("gRPC send trailers error: {}", e),
-                            )))
+                            Poll::Ready(Err(io::Error::other(format!(
+                                "gRPC send trailers error: {}",
+                                e
+                            ))))
                         }
                     }
                 }

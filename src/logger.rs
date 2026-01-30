@@ -1,30 +1,35 @@
+use std::str::FromStr;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{fmt::time::LocalTime, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Log level
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogLevel {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
 }
 
-impl LogLevel {
-    /// Parse log level from string
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for LogLevel {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "trace" => Some(LogLevel::Trace),
-            "debug" => Some(LogLevel::Debug),
-            "info" => Some(LogLevel::Info),
-            "warn" => Some(LogLevel::Warn),
-            "error" => Some(LogLevel::Error),
-            _ => None,
+            "trace" => Ok(LogLevel::Trace),
+            "debug" => Ok(LogLevel::Debug),
+            "info" => Ok(LogLevel::Info),
+            "warn" => Ok(LogLevel::Warn),
+            "error" => Ok(LogLevel::Error),
+            _ => Err(()),
         }
     }
+}
 
-    pub fn to_level_filter(&self) -> LevelFilter {
+impl LogLevel {
+    pub fn to_level_filter(self) -> LevelFilter {
         match self {
             LogLevel::Trace => LevelFilter::TRACE,
             LogLevel::Debug => LevelFilter::DEBUG,
@@ -35,20 +40,15 @@ impl LogLevel {
     }
 }
 
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Info
-    }
-}
-
-pub fn get_log_level_from_args() -> Option<LogLevel> {
+#[allow(dead_code)]
+fn get_log_level_from_args() -> Option<LogLevel> {
     let args: Vec<String> = std::env::args().collect();
 
     let log_level_from_cli = args
         .iter()
         .position(|a| a == "--log-level")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| LogLevel::from_str(s));
+        .and_then(|s| LogLevel::from_str(s).ok());
 
     if log_level_from_cli.is_some() {
         return log_level_from_cli;
@@ -64,7 +64,7 @@ pub fn get_log_level_from_args() -> Option<LogLevel> {
                     toml::from_str::<toml::Value>(&content)
                         .ok()
                         .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
-                        .and_then(|s| LogLevel::from_str(&s))
+                        .and_then(|s| LogLevel::from_str(&s).ok())
                 })
         })
 }
@@ -74,8 +74,9 @@ const LOG_TIME_FORMAT: &[time::format_description::FormatItem<'static>] = time::
     "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]"
 );
 
-pub fn init_logger(log_level: Option<LogLevel>) {
-    let level = log_level.unwrap_or_default();
+/// Initialize logger with log level string
+pub fn init_logger(log_level_str: &str) {
+    let level = LogLevel::from_str(log_level_str).unwrap_or_default();
 
     let filter = tracing_subscriber::filter::Targets::new()
         .with_targets(vec![("trojan_rs", level.to_level_filter())])
@@ -141,27 +142,27 @@ mod tests {
 
     #[test]
     fn test_log_level_from_str_valid() {
-        assert_eq!(LogLevel::from_str("trace"), Some(LogLevel::Trace));
-        assert_eq!(LogLevel::from_str("debug"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::from_str("info"), Some(LogLevel::Info));
-        assert_eq!(LogLevel::from_str("warn"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::from_str("error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::from_str("trace"), Ok(LogLevel::Trace));
+        assert_eq!(LogLevel::from_str("debug"), Ok(LogLevel::Debug));
+        assert_eq!(LogLevel::from_str("info"), Ok(LogLevel::Info));
+        assert_eq!(LogLevel::from_str("warn"), Ok(LogLevel::Warn));
+        assert_eq!(LogLevel::from_str("error"), Ok(LogLevel::Error));
     }
 
     #[test]
     fn test_log_level_from_str_case_insensitive() {
-        assert_eq!(LogLevel::from_str("TRACE"), Some(LogLevel::Trace));
-        assert_eq!(LogLevel::from_str("Debug"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::from_str("INFO"), Some(LogLevel::Info));
-        assert_eq!(LogLevel::from_str("WARN"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::from_str("Error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::from_str("TRACE"), Ok(LogLevel::Trace));
+        assert_eq!(LogLevel::from_str("Debug"), Ok(LogLevel::Debug));
+        assert_eq!(LogLevel::from_str("INFO"), Ok(LogLevel::Info));
+        assert_eq!(LogLevel::from_str("WARN"), Ok(LogLevel::Warn));
+        assert_eq!(LogLevel::from_str("Error"), Ok(LogLevel::Error));
     }
 
     #[test]
     fn test_log_level_from_str_invalid() {
-        assert_eq!(LogLevel::from_str("invalid"), None);
-        assert_eq!(LogLevel::from_str(""), None);
-        assert_eq!(LogLevel::from_str("warning"), None);
+        assert!(LogLevel::from_str("invalid").is_err());
+        assert!(LogLevel::from_str("").is_err());
+        assert!(LogLevel::from_str("warning").is_err());
     }
 
     #[test]

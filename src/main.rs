@@ -1,5 +1,6 @@
 mod acl;
 mod address;
+mod api;
 mod config;
 mod error;
 mod grpc;
@@ -25,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
@@ -42,8 +44,8 @@ pub enum TransportMode {
 
 pub struct Server {
     pub listener: TcpListener,
-    /// Map from password hex to user id for authentication
-    pub users: HashMap<[u8; 56], u64>,
+    /// Shared users map (updated by UserManager)
+    pub users: Arc<RwLock<HashMap<[u8; 56], i64>>>,
     pub transport_mode: TransportMode,
     pub enable_udp: bool,
     pub udp_associations: udp::UdpAssociations,
@@ -290,18 +292,21 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Zero-copy decode
     let request = TrojanRequest::decode_zerocopy(&mut buf)?;
 
-    // 验证用户 (通过 uuid 验证)
-    let user_id = match server.users.get(&request.password) {
-        Some(&id) => id,
-        None => {
-            let transport = match server.transport_mode {
-                TransportMode::Tcp => "TCP",
-                TransportMode::WebSocket => "WS",
-                TransportMode::Grpc => "gRPC",
-            };
-            log::authentication(&peer_addr, false);
-            log::warn!(peer = %peer_addr, transport = transport, "Invalid user credentials");
-            return Err(anyhow!("Invalid user credentials"));
+    // 验证用户 (通过 uuid 验证) - 需要获取读锁
+    let user_id = {
+        let users = server.users.read().await;
+        match users.get(&request.password) {
+            Some(&id) => id,
+            None => {
+                let transport = match server.transport_mode {
+                    TransportMode::Tcp => "TCP",
+                    TransportMode::WebSocket => "WS",
+                    TransportMode::Grpc => "gRPC",
+                };
+                log::authentication(&peer_addr, false);
+                log::warn!(peer = %peer_addr, transport = transport, "Invalid user credentials");
+                return Err(anyhow!("Invalid user credentials"));
+            }
         }
     };
 
@@ -309,7 +314,9 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     log::debug!(peer = %peer_addr, user_id = user_id, "User authenticated");
 
     // Register connection for tracking and kick-off capability
-    let (conn_id, cancel_token) = server.connections.register(user_id, peer_addr.clone());
+    let (conn_id, cancel_token) = server
+        .connections
+        .register(user_id as u64, peer_addr.clone());
     log::debug!(peer = %peer_addr, user_id = user_id, conn_id = conn_id, "Connection registered");
 
     // Ensure connection is unregistered when done
@@ -319,10 +326,10 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     });
 
     // Record proxy request for this user
-    server.stats.record_request(user_id);
+    server.stats.record_request(user_id as u64);
 
     // Get user stats for traffic tracking
-    let user_stats = server.stats.get_or_create(user_id);
+    let user_stats = server.stats.get_or_create(user_id as u64);
 
     match request.cmd {
         TrojanCmd::Connect => {
@@ -369,12 +376,8 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     // Get host and port for ACL matching
     let (host, port) = match &target_addr {
-        address::Address::IPv4(ip, port) => {
-            (std::net::Ipv4Addr::from(*ip).to_string(), *port)
-        }
-        address::Address::IPv6(ip, port) => {
-            (std::net::Ipv6Addr::from(*ip).to_string(), *port)
-        }
+        address::Address::IPv4(ip, port) => (std::net::Ipv4Addr::from(*ip).to_string(), *port),
+        address::Address::IPv6(ip, port) => (std::net::Ipv6Addr::from(*ip).to_string(), *port),
         address::Address::Domain(domain, port) => (domain.clone(), *port),
     };
 
@@ -620,38 +623,37 @@ impl Server {
     }
 }
 
-pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
+pub async fn build_server(
+    config: &config::ServerConfig,
+    users: Arc<RwLock<HashMap<[u8; 56], i64>>>,
+    stats: stats::StatsManager,
+    connections: stats::ConnectionManager,
+) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(addr).await?;
-    let users = config.build_user_map();
-    log::info!(user_count = users.len(), "Loaded users for authentication");
-    let enable_ws = config.enable_ws.unwrap_or(false);
-    let enable_grpc = config.enable_grpc.unwrap_or(false);
-    let enable_udp = config.enable_udp.unwrap_or(true);
-    let transport_mode = if enable_grpc {
+    let listener = TcpListener::bind(&addr).await?;
+
+    let user_count = users.read().await.len();
+    log::info!(user_count = user_count, "Loaded users for authentication");
+
+    let transport_mode = if config.enable_grpc {
         TransportMode::Grpc
-    } else if enable_ws {
+    } else if config.enable_ws {
         TransportMode::WebSocket
     } else {
         TransportMode::Tcp
     };
 
-    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key, transport_mode)?;
+    let tls_acceptor =
+        tls::get_tls_acceptor(config.cert.clone(), config.key.clone(), transport_mode)?;
 
     // Load ACL engine if config file is provided
     let acl_engine = if let Some(ref acl_path) = config.acl_conf_file {
         if !acl_path.exists() {
-            return Err(anyhow!(
-                "ACL config file not found: {}",
-                acl_path.display()
-            ));
+            return Err(anyhow!("ACL config file not found: {}", acl_path.display()));
         }
 
         // Validate file extension
-        let ext = acl_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = acl_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
             return Err(anyhow!(
                 "Invalid ACL config file format: expected .yaml or .yml extension, got .{} (file: {})",
@@ -661,7 +663,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         }
 
         let acl_config = acl::load_acl_config(acl_path).await?;
-        let engine = acl::AclEngine::new(acl_config, config.data_dir.as_deref()).await?;
+        let engine = acl::AclEngine::new(acl_config, Some(config.data_dir.as_path())).await?;
         log::info!(
             acl_file = %acl_path.display(),
             rules = engine.rule_count(),
@@ -677,23 +679,120 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         listener,
         users,
         transport_mode,
-        enable_udp,
+        enable_udp: config.enable_udp,
         udp_associations: udp::new_udp_associations(),
         tls_acceptor,
         acl_engine,
-        stats: stats::StatsManager::new(),
-        connections: stats::ConnectionManager::new(),
+        stats,
+        connections,
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let log_level = logger::get_log_level_from_args();
-    logger::init_logger(log_level);
+    // Parse CLI arguments
+    let cli = config::CliArgs::parse_args();
+    cli.validate()?;
 
-    let config = config::ServerConfig::load()?;
+    // Initialize logger
+    logger::init_logger(&cli.log_mode);
 
-    let server = build_server(config).await?;
+    log::info!(
+        api = %cli.api,
+        node = cli.node,
+        "Starting Trojan server with remote panel integration"
+    );
+
+    // Create stats and connection managers
+    let stats = stats::StatsManager::new();
+    let connections = stats::ConnectionManager::new();
+
+    // Create API manager
+    let api_manager = Arc::new(api::ApiManager::new(&cli)?);
+
+    // Create user manager
+    let user_manager = Arc::new(api::UserManager::new(connections.clone()));
+
+    // Initialize node (register or verify existing registration)
+    let register_id = api_manager.initialize().await?;
+    log::info!(register_id = %register_id, "Node initialized");
+
+    // Fetch configuration from remote panel
+    let remote_config = api_manager.fetch_config().await?;
+
+    // Fetch initial users
+    let users = api_manager.fetch_users().await?;
+    user_manager.init(&users).await;
+
+    // Build server config from remote + CLI
+    let server_config = config::ServerConfig::from_remote(&remote_config, &cli, users)?;
+
+    // Build server with shared users reference
+    let server = build_server(
+        &server_config,
+        user_manager.get_users_arc(),
+        stats.clone(),
+        connections.clone(),
+    )
+    .await?;
+
+    // Start background tasks
+    let background_tasks = api::BackgroundTasks::new(
+        Arc::clone(&api_manager),
+        Arc::clone(&user_manager),
+        stats,
+        cli.clone(),
+    );
+    let _background_handle = background_tasks.start();
+
+    // Create cancellation token for graceful shutdown
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    // Setup shutdown handler for SIGINT (Ctrl+C) and SIGTERM
+    let api_for_shutdown = Arc::clone(&api_manager);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
+
+            tokio::select! {
+                _ = sigint.recv() => {
+                    log::info!("SIGINT received, shutting down...");
+                }
+                _ = sigterm.recv() => {
+                    log::info!("SIGTERM received, shutting down...");
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            log::info!("Shutdown signal received...");
+        }
+
+        // Unregister node
+        log::info!("Unregistering node...");
+        if let Err(e) = api_for_shutdown.unregister().await {
+            log::warn!(error = %e, "Failed to unregister node");
+        } else {
+            log::info!("Node unregistered successfully");
+        }
+
+        // Signal cancellation
+        cancel_token_clone.cancel();
+
+        // Give a moment for cleanup, then exit
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        std::process::exit(0);
+    });
+
+    // Run server
     server.run().await
 }
 
@@ -743,7 +842,10 @@ mod tests {
 
         assert_eq!(request.password, password);
         assert_eq!(request.cmd, TrojanCmd::Connect);
-        assert!(matches!(request.addr, address::Address::IPv4([127, 0, 0, 1], 8080)));
+        assert!(matches!(
+            request.addr,
+            address::Address::IPv4([127, 0, 0, 1], 8080)
+        ));
         assert_eq!(request.payload.as_ref(), b"payload data");
         assert!(consumed > 0);
     }
@@ -784,7 +886,10 @@ mod tests {
 
         assert_eq!(request.password, password);
         assert_eq!(request.cmd, TrojanCmd::Connect);
-        assert!(matches!(request.addr, address::Address::IPv4([127, 0, 0, 1], 8080)));
+        assert!(matches!(
+            request.addr,
+            address::Address::IPv4([127, 0, 0, 1], 8080)
+        ));
         assert_eq!(request.payload.as_ref(), b"payload data");
 
         // Buffer should be cleared after zerocopy decode

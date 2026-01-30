@@ -1,4 +1,3 @@
-use hex;
 use pin_project_lite::pin_project;
 use sha2::{Digest, Sha224};
 use std::pin::Pin;
@@ -33,16 +32,19 @@ impl<S> TimedStream<S> {
     }
 
     /// Get a reference to the inner stream
+    #[allow(dead_code)]
     pub fn inner(&self) -> &S {
         &self.inner
     }
 
     /// Get a mutable reference to the inner stream
+    #[allow(dead_code)]
     pub fn inner_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 
     /// Consume this wrapper and return the inner stream
+    #[allow(dead_code)]
     pub fn into_inner(self) -> S {
         self.inner
     }
@@ -130,7 +132,9 @@ mod tests {
         let mut stream = TimedStream::new(cursor, start_time, Arc::clone(&last_activity));
 
         let mut buf = [0u8; 5];
-        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .unwrap();
 
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
@@ -145,7 +149,9 @@ mod tests {
 
         let mut stream = TimedStream::new(cursor, start_time, Arc::clone(&last_activity));
 
-        let n = tokio::io::AsyncWriteExt::write(&mut stream, b"test").await.unwrap();
+        let n = tokio::io::AsyncWriteExt::write(&mut stream, b"test")
+            .await
+            .unwrap();
         assert_eq!(n, 4);
     }
 
@@ -262,7 +268,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         let mut buf = [0u8; 5];
-        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .unwrap();
 
         // Activity should be updated to >= 1
         assert!(last_activity.load(Ordering::Acquire) >= 1);
@@ -279,7 +287,9 @@ mod tests {
         // Wait a bit and then write
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        let _ = tokio::io::AsyncWriteExt::write(&mut stream, b"test").await.unwrap();
+        let _ = tokio::io::AsyncWriteExt::write(&mut stream, b"test")
+            .await
+            .unwrap();
 
         // Activity should be updated to >= 1
         assert!(last_activity.load(Ordering::Acquire) >= 1);
@@ -303,13 +313,17 @@ mod tests {
 
         // Read from stream1
         let mut buf = [0u8; 5];
-        let _ = tokio::io::AsyncReadExt::read(&mut stream1, &mut buf).await.unwrap();
+        let _ = tokio::io::AsyncReadExt::read(&mut stream1, &mut buf)
+            .await
+            .unwrap();
 
         let activity_after_stream1 = last_activity.load(Ordering::Acquire);
         assert!(activity_after_stream1 >= 1);
 
         // Read from stream2 should also update shared activity
-        let _ = tokio::io::AsyncReadExt::read(&mut stream2, &mut buf).await.unwrap();
+        let _ = tokio::io::AsyncReadExt::read(&mut stream2, &mut buf)
+            .await
+            .unwrap();
 
         let activity_after_stream2 = last_activity.load(Ordering::Acquire);
         assert!(activity_after_stream2 >= activity_after_stream1);

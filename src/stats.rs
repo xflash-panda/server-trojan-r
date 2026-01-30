@@ -347,12 +347,14 @@ impl ConnectionManager {
         conn_ids
             .iter()
             .filter_map(|&conn_id| {
-                self.connections.get(&conn_id).map(|conn| ConnectionSnapshot {
-                    conn_id: conn.info.conn_id,
-                    user_id: conn.info.user_id,
-                    peer_addr: conn.info.peer_addr.clone(),
-                    duration_secs: conn.info.connected_at.elapsed().as_secs(),
-                })
+                self.connections
+                    .get(&conn_id)
+                    .map(|conn| ConnectionSnapshot {
+                        conn_id: conn.info.conn_id,
+                        user_id: conn.info.user_id,
+                        peer_addr: conn.info.peer_addr.clone(),
+                        duration_secs: conn.info.connected_at.elapsed().as_secs(),
+                    })
             })
             .collect()
     }

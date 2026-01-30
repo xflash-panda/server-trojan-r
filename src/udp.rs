@@ -149,12 +149,14 @@ impl UdpPacket {
 
     /// Get payload length
     #[inline]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.payload.len()
     }
 
     /// Check if payload is empty
     #[inline]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.payload.is_empty()
     }
@@ -253,20 +255,16 @@ impl UdpRelaySession {
 
         // Create channels
         let (udp_tx, udp_rx) = mpsc::channel::<(SocketAddr, Bytes)>(UDP_CHANNEL_BUFFER_SIZE);
-        let (tcp_write_tx, tcp_write_rx) =
-            mpsc::channel::<Vec<u8>>(TCP_WRITE_CHANNEL_BUFFER_SIZE);
+        let (tcp_write_tx, tcp_write_rx) = mpsc::channel::<Vec<u8>>(TCP_WRITE_CHANNEL_BUFFER_SIZE);
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
         // Spawn background tasks
-        let udp_recv_handle =
-            self.spawn_udp_receiver(cancel_rx, udp_tx);
+        let udp_recv_handle = self.spawn_udp_receiver(cancel_rx, udp_tx);
         let tcp_write_handle =
             Self::spawn_tcp_writer(client_write, tcp_write_rx, self.peer_addr.clone());
 
         // Run main relay loop
-        let result = self
-            .run_relay_loop(client_read, udp_rx, tcp_write_tx)
-            .await;
+        let result = self.run_relay_loop(client_read, udp_rx, tcp_write_tx).await;
 
         // Cleanup
         self.cleanup(cancel_tx, tcp_write_handle, udp_recv_handle)
@@ -353,10 +351,7 @@ impl UdpRelaySession {
     }
 
     /// Write all data to writer
-    async fn write_all<W: AsyncWrite + Unpin>(
-        writer: &mut W,
-        data: &[u8],
-    ) -> std::io::Result<()> {
+    async fn write_all<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
         let mut written = 0;
         while written < data.len() {
             match writer.write(&data[written..]).await {
@@ -623,9 +618,14 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     user_stats: Arc<UserStats>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    let session =
-        UdpRelaySession::new(udp_associations, peer_addr, acl_engine, user_stats, cancel_token)
-            .await?;
+    let session = UdpRelaySession::new(
+        udp_associations,
+        peer_addr,
+        acl_engine,
+        user_stats,
+        cancel_token,
+    )
+    .await?;
     session.run(client_stream).await
 }
 
@@ -920,10 +920,7 @@ mod tests {
         assert_eq!(packet_v4.encoded_size(), packet_v4.encode().len());
 
         // IPv6
-        let packet_v6 = UdpPacket::new(
-            Address::IPv6([0; 16], 443),
-            Bytes::from_static(b"test"),
-        );
+        let packet_v6 = UdpPacket::new(Address::IPv6([0; 16], 443), Bytes::from_static(b"test"));
         assert_eq!(packet_v6.encoded_size(), packet_v6.encode().len());
 
         // Domain

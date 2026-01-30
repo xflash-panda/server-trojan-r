@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 // Re-export types from acl-engine-r
 pub use acl_engine_r::{
     geo::{AutoGeoLoader, GeoIpFormat, GeoSiteFormat, NilGeoLoader},
-    outbound::{Addr, AsyncOutbound, AsyncTcpConn, AsyncUdpConn, Direct, DirectMode, Http, Reject, Socks5},
+    outbound::{
+        Addr, AsyncOutbound, AsyncTcpConn, AsyncUdpConn, Direct, DirectMode, Http, Reject, Socks5,
+    },
     HostInfo, Protocol,
 };
 
@@ -186,10 +188,9 @@ impl OutboundHandler {
                 ))))
             }
             "socks5" => {
-                let config = entry
-                    .socks5
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("socks5 config required for outbound '{}'", entry.name))?;
+                let config = entry.socks5.as_ref().ok_or_else(|| {
+                    anyhow!("socks5 config required for outbound '{}'", entry.name)
+                })?;
 
                 let socks5 = if let (Some(username), Some(password)) =
                     (&config.username, &config.password)
@@ -335,7 +336,10 @@ impl AclEngine {
             "ACL engine initialized"
         );
 
-        Ok(Self { compiled, outbounds })
+        Ok(Self {
+            compiled,
+            outbounds,
+        })
     }
 
     /// Create a default ACL engine (direct all traffic)
@@ -356,7 +360,10 @@ impl AclEngine {
         let compiled = acl_engine_r::compile(&text_rules, &outbounds, 1024, &NilGeoLoader)
             .map_err(|e| anyhow!("Failed to compile default rules: {}", e))?;
 
-        Ok(Self { compiled, outbounds })
+        Ok(Self {
+            compiled,
+            outbounds,
+        })
     }
 
     /// Match a host against ACL rules and return the appropriate outbound handler
@@ -394,8 +401,13 @@ pub async fn load_acl_config(path: &Path) -> Result<AclConfig> {
         .await
         .map_err(|e| anyhow!("Failed to read ACL config file '{}': {}", path.display(), e))?;
 
-    let config: AclConfig = serde_yaml::from_str(&content)
-        .map_err(|e| anyhow!("Failed to parse ACL config file '{}': {}", path.display(), e))?;
+    let config: AclConfig = serde_yaml::from_str(&content).map_err(|e| {
+        anyhow!(
+            "Failed to parse ACL config file '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
 
     Ok(config)
 }
@@ -557,8 +569,14 @@ acl:
         assert_eq!(config.outbounds.len(), 2);
 
         let socks5 = &config.outbounds[0];
-        assert_eq!(socks5.socks5.as_ref().unwrap().username, Some("user".to_string()));
-        assert_eq!(socks5.socks5.as_ref().unwrap().password, Some("pass".to_string()));
+        assert_eq!(
+            socks5.socks5.as_ref().unwrap().username,
+            Some("user".to_string())
+        );
+        assert_eq!(
+            socks5.socks5.as_ref().unwrap().password,
+            Some("pass".to_string())
+        );
 
         let http = &config.outbounds[1];
         assert!(http.http.as_ref().unwrap().https);
@@ -627,7 +645,10 @@ acl:
 
         let result = OutboundHandler::from_entry(&entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown outbound type"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown outbound type"));
     }
 
     #[test]
@@ -642,7 +663,10 @@ acl:
 
         let result = OutboundHandler::from_entry(&entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("socks5 config required"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("socks5 config required"));
     }
 
     #[test]
@@ -657,7 +681,10 @@ acl:
 
         let result = OutboundHandler::from_entry(&entry);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("http config required"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("http config required"));
     }
 
     #[test]
@@ -857,7 +884,10 @@ acl:
         let config = load_acl_config(acl_path).await.unwrap();
 
         // Verify basic structure
-        assert!(!config.outbounds.is_empty(), "Should have at least one outbound");
+        assert!(
+            !config.outbounds.is_empty(),
+            "Should have at least one outbound"
+        );
         assert!(!config.acl.inline.is_empty(), "Should have ACL rules");
 
         // Verify warp outbound exists and is socks5 type
@@ -883,22 +913,34 @@ acl:
             // Test port-based rule: tcp/22 should go through warp
             let handler = engine.match_host("any.com", 22, Protocol::TCP);
             if let Some(h) = handler {
-                assert!(matches!(*h, OutboundHandler::Socks5 { .. }), "TCP/22 should use warp (socks5)");
+                assert!(
+                    matches!(*h, OutboundHandler::Socks5 { .. }),
+                    "TCP/22 should use warp (socks5)"
+                );
             }
 
             // Test suffix rule: google.com should go through warp
             let handler = engine.match_host("www.google.com", 443, Protocol::TCP);
             if let Some(h) = handler {
-                assert!(matches!(*h, OutboundHandler::Socks5 { .. }), "google.com should use warp");
+                assert!(
+                    matches!(*h, OutboundHandler::Socks5 { .. }),
+                    "google.com should use warp"
+                );
             }
 
             // Test default rule: random domain should be direct
             let handler = engine.match_host("random-unknown-site.xyz", 80, Protocol::TCP);
             if let Some(h) = handler {
-                assert!(matches!(*h, OutboundHandler::Direct(_)), "Unknown domain should be direct");
+                assert!(
+                    matches!(*h, OutboundHandler::Direct(_)),
+                    "Unknown domain should be direct"
+                );
             }
         } else {
-            println!("Note: ACL engine creation failed (likely due to missing geo data): {:?}", engine_result.err());
+            println!(
+                "Note: ACL engine creation failed (likely due to missing geo data): {:?}",
+                engine_result.err()
+            );
         }
     }
 
@@ -925,7 +967,10 @@ acl:
 
         match engine {
             Ok(engine) => {
-                println!("ACL engine created with geo data, {} rules", engine.rule_count());
+                println!(
+                    "ACL engine created with geo data, {} rules",
+                    engine.rule_count()
+                );
 
                 // Test geosite:openai rule (if data is available)
                 let handler = engine.match_host("chat.openai.com", 443, Protocol::TCP);

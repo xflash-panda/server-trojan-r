@@ -70,8 +70,8 @@ where
                 buf.put_slice(&data[..to_copy]);
 
                 if to_copy < data.len() {
-                    // Zero-copy: convert Vec to Bytes and slice, avoiding copy_from_slice
-                    self.read_buffer = Bytes::from(data).slice(to_copy..);
+                    // Zero-copy slice, avoiding copy_from_slice
+                    self.read_buffer = data.slice(to_copy..);
                     self.read_pos = 0;
                 }
 
@@ -122,18 +122,15 @@ where
                             self.write_pending = false;
                         }
                         Err(e) => {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("WebSocket send error: {}", e),
-                            )));
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "WebSocket send error: {}",
+                                e
+                            ))));
                         }
                     }
                 }
                 Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("WebSocket error: {}", e),
-                    )));
+                    return Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))));
                 }
                 Poll::Pending => {
                     return Poll::Pending;
@@ -150,16 +147,15 @@ where
                 let data = std::mem::take(&mut self.write_buffer);
                 match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
                     Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("WebSocket send error: {}", e),
-                    ))),
+                    Err(e) => Poll::Ready(Err(io::Error::other(format!(
+                        "WebSocket send error: {}",
+                        e
+                    )))),
                 }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("WebSocket error: {}", e),
-            ))),
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))))
+            }
             Poll::Pending => {
                 self.write_pending = true;
                 Poll::Ready(Ok(buf.len()))
@@ -182,19 +178,16 @@ where
                                 self.write_pending = false;
                             }
                             Err(e) => {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("WebSocket send error: {}", e),
-                                )));
+                                return Poll::Ready(Err(io::Error::other(format!(
+                                    "WebSocket send error: {}",
+                                    e
+                                ))));
                             }
                         }
                     }
                 }
                 Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("WebSocket error: {}", e),
-                    )));
+                    return Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))));
                 }
                 Poll::Pending => {
                     return Poll::Pending;
@@ -202,12 +195,8 @@ where
             }
         }
 
-        Sink::poll_flush(self.ws_stream.as_mut(), cx).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("WebSocket flush error: {}", e),
-            )
-        })
+        Sink::poll_flush(self.ws_stream.as_mut(), cx)
+            .map_err(|e| io::Error::other(format!("WebSocket flush error: {}", e)))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

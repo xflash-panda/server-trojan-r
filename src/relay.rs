@@ -10,23 +10,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub struct CopyResult {
     /// Whether the copy completed normally (true) or timed out (false)
     pub completed: bool,
-    /// Bytes sent from client to remote (upload)
-    pub upload_bytes: u64,
-    /// Bytes sent from remote to client (download)
-    pub download_bytes: u64,
-}
-
-/// 双向转发，支持空闲超时检测
-pub async fn copy_bidirectional_with_idle_timeout<A, B>(
-    a: A,
-    b: B,
-    idle_timeout_secs: u64,
-) -> std::io::Result<CopyResult>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    copy_bidirectional_with_stats(a, b, idle_timeout_secs, None).await
 }
 
 /// 双向转发，支持空闲超时检测和流量统计
@@ -74,18 +57,10 @@ where
                 stats.add_upload(a_to_b);
                 stats.add_download(b_to_a);
             }
-            Ok(CopyResult {
-                completed: true,
-                upload_bytes: a_to_b,
-                download_bytes: b_to_a,
-            })
+            Ok(CopyResult { completed: true })
         }
         _ = timeout_check => {
-            Ok(CopyResult {
-                completed: false,
-                upload_bytes: 0,
-                download_bytes: 0,
-            })
+            Ok(CopyResult { completed: false })
         }
     }
 }

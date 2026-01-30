@@ -10,6 +10,7 @@ const DNS_RESOLVE_TIMEOUT_SECS: u64 = 10;
 const DNS_CACHE_TTL_SECS: u64 = 120;
 
 /// DNS negative cache TTL in seconds (for failed lookups)
+#[allow(dead_code)]
 const DNS_NEGATIVE_CACHE_TTL_SECS: u64 = 30;
 
 /// Maximum number of DNS cache entries
@@ -26,13 +27,13 @@ fn is_private_ip(addr: &IpAddr) -> bool {
                 || ip.is_unspecified()          // 0.0.0.0
                 || is_shared_address(ip)        // 100.64.0.0/10 (CGNAT)
                 || is_benchmarking(ip)          // 198.18.0.0/15
-                || is_reserved(ip)              // 240.0.0.0/4
+                || is_reserved(ip) // 240.0.0.0/4
         }
         IpAddr::V6(ip) => {
             ip.is_loopback()                    // ::1
                 || ip.is_unspecified()          // ::
                 || is_ipv6_unique_local(ip)     // fc00::/7
-                || is_ipv6_link_local(ip)       // fe80::/10
+                || is_ipv6_link_local(ip) // fe80::/10
         }
     }
 }
@@ -244,9 +245,7 @@ impl Address {
                 let addr = IpAddr::V6(std::net::Ipv6Addr::from(*ip));
                 Ok(SocketAddr::new(addr, *port))
             }
-            Address::Domain(domain, port) => {
-                Self::resolve_domain_cached(domain, *port).await
-            }
+            Address::Domain(domain, port) => Self::resolve_domain_cached(domain, *port).await,
         }
     }
 

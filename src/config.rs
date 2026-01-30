@@ -1,151 +1,227 @@
+//! Configuration module for Trojan server
+//!
+//! This module handles CLI argument parsing with environment variable support.
+//! Configuration is fetched from remote panel API, not from local files.
+
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::{fs, path::Path};
+
+/// Default intervals in seconds
+const DEFAULT_FETCH_USERS_INTERVAL: u64 = 60;
+const DEFAULT_REPORT_TRAFFICS_INTERVAL: u64 = 80;
+const DEFAULT_HEARTBEAT_INTERVAL: u64 = 180;
+
+/// Default data directory for state persistence (same as server-trojan Go version)
+const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-node";
+
+/// CLI arguments for the Trojan server
+///
+/// Supports environment variables with X_PANDA_TROJAN_ prefix
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "Trojan Server with Remote Panel Integration")]
+pub struct CliArgs {
+    /// API endpoint URL (required)
+    #[arg(long, env = "X_PANDA_TROJAN_API")]
+    pub api: String,
+
+    /// API authentication token (required)
+    #[arg(long, env = "X_PANDA_TROJAN_TOKEN")]
+    pub token: String,
+
+    /// Node ID from the panel (required)
+    #[arg(long, env = "X_PANDA_TROJAN_NODE")]
+    pub node: i64,
+
+    /// TLS certificate file path (optional, uses panel config if not specified)
+    #[arg(long, env = "X_PANDA_TROJAN_CERT_FILE")]
+    pub cert_file: Option<String>,
+
+    /// TLS private key file path (optional, uses panel config if not specified)
+    #[arg(long, env = "X_PANDA_TROJAN_KEY_FILE")]
+    pub key_file: Option<String>,
+
+    /// Interval for fetching users in seconds (default: 60)
+    #[arg(long, env = "X_PANDA_TROJAN_FETCH_USERS_INTERVAL", default_value_t = DEFAULT_FETCH_USERS_INTERVAL)]
+    pub fetch_users_interval: u64,
+
+    /// Interval for reporting traffic in seconds (default: 80)
+    #[arg(long, env = "X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL", default_value_t = DEFAULT_REPORT_TRAFFICS_INTERVAL)]
+    pub report_traffics_interval: u64,
+
+    /// Interval for sending heartbeat in seconds (default: 180)
+    #[arg(long, env = "X_PANDA_TROJAN_HEARTBEAT_INTERVAL", default_value_t = DEFAULT_HEARTBEAT_INTERVAL)]
+    pub heartbeat_interval: u64,
+
+    /// Log mode: debug, info, warn, error (default: info)
+    #[arg(long, env = "X_PANDA_TROJAN_LOG_MODE", default_value = "info")]
+    pub log_mode: String,
+
+    /// Data directory for state persistence (default: /var/lib/trojan-node)
+    #[arg(long, env = "X_PANDA_TROJAN_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
+    pub data_dir: PathBuf,
+
+    /// Extended configuration file path (ACL config, YAML format)
+    #[arg(long, env = "X_PANDA_TROJAN_EXT_CONF_FILE")]
+    pub ext_conf_file: Option<PathBuf>,
+}
+
+impl CliArgs {
+    /// Parse CLI arguments
+    pub fn parse_args() -> Self {
+        Self::parse()
+    }
+
+    /// Validate the CLI arguments
+    pub fn validate(&self) -> Result<()> {
+        if self.api.is_empty() {
+            return Err(anyhow!("API endpoint URL is required"));
+        }
+        if self.token.is_empty() {
+            return Err(anyhow!("API token is required"));
+        }
+        if self.node <= 0 {
+            return Err(anyhow!("Node ID must be a positive integer"));
+        }
+
+        // Validate cert/key pair - both must be provided or neither
+        match (&self.cert_file, &self.key_file) {
+            (Some(_), None) => {
+                return Err(anyhow!(
+                    "Both cert_file and key_file must be provided together"
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(anyhow!(
+                    "Both cert_file and key_file must be provided together"
+                ))
+            }
+            _ => {}
+        }
+
+        // Validate intervals
+        if self.fetch_users_interval == 0 {
+            return Err(anyhow!("fetch_users_interval must be greater than 0"));
+        }
+        if self.report_traffics_interval == 0 {
+            return Err(anyhow!("report_traffics_interval must be greater than 0"));
+        }
+        if self.heartbeat_interval == 0 {
+            return Err(anyhow!("heartbeat_interval must be greater than 0"));
+        }
+
+        // Validate ext_conf_file if provided
+        if let Some(ref path) = self.ext_conf_file {
+            if !path.exists() {
+                return Err(anyhow!("ACL config file not found: {}", path.display()));
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
+                return Err(anyhow!(
+                    "Invalid ACL config file format: expected .yaml or .yml extension"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the data directory path (default: /var/lib/trojan-node)
+    pub fn get_data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
+    /// Get the state file path for register_id persistence
+    pub fn get_state_file_path(&self) -> PathBuf {
+        self.data_dir.join(".trojan_state")
+    }
+}
 
 /// User configuration with id for tracking and uuid for authentication
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct User {
     /// User ID for traffic statistics and user management
-    pub id: u64,
+    pub id: i64,
     /// UUID used for authentication (this is what gets validated as the "password")
     pub uuid: String,
 }
 
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Trojan Server")]
+impl From<server_r_client::User> for User {
+    fn from(u: server_r_client::User) -> Self {
+        Self {
+            id: u.id,
+            uuid: u.uuid,
+        }
+    }
+}
+
+/// Runtime server configuration (built from remote panel config + CLI args)
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Host address
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Host address to bind
     pub host: String,
-
     /// Port number
-    #[arg(long, default_value = "35537")]
-    pub port: String,
-
-    /// Users for authentication (loaded from config file)
-    #[arg(skip)]
+    pub port: u16,
+    /// Users for authentication
     pub users: Vec<User>,
-
     /// Enable WebSocket mode
-    #[arg(long)]
-    pub enable_ws: Option<bool>,
-
+    pub enable_ws: bool,
     /// Enable gRPC mode
-    #[arg(long)]
-    pub enable_grpc: Option<bool>,
-
+    pub enable_grpc: bool,
     /// Enable UDP support
-    #[arg(long)]
-    pub enable_udp: Option<bool>,
-
-    /// TLS certificate file path (optional)
-    #[arg(long)]
+    pub enable_udp: bool,
+    /// TLS certificate file path
     pub cert: Option<String>,
-
-    /// TLS private key file path (optional)
-    #[arg(long)]
+    /// TLS private key file path
     pub key: Option<String>,
-
-    /// Load configuration from TOML file
-    #[arg(short = 'c', long)]
-    pub config_file: Option<String>,
-
-    /// Generate example configuration file
-    #[arg(long)]
-    pub generate_config: Option<String>,
-
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long)]
-    pub log_level: Option<String>,
-
-    /// Path to the ACL config file (optional, YAML format)
-    #[arg(long = "acl_conf_file", value_name = "PATH")]
+    /// Log level
+    pub log_level: String,
+    /// ACL config file path
     pub acl_conf_file: Option<PathBuf>,
-
-    /// Data directory for geo data files (GeoIP, GeoSite)
-    #[arg(long = "data_dir", value_name = "PATH")]
-    pub data_dir: Option<PathBuf>,
+    /// Data directory for geo data files (default: /var/lib/trojan-node)
+    pub data_dir: PathBuf,
 }
 
 impl ServerConfig {
-    /// 从 TOML 文件或命令行参数加载配置
-    pub fn load() -> Result<Self> {
-        let mut config = Self::parse();
+    /// Build ServerConfig from remote TrojanConfig and CLI args
+    pub fn from_remote(
+        remote: &server_r_client::TrojanConfig,
+        cli: &CliArgs,
+        users: Vec<User>,
+    ) -> Result<Self> {
+        // Determine transport mode from remote config
+        let network = remote.network.as_deref().unwrap_or("tcp");
+        let (enable_ws, enable_grpc) = match network.to_lowercase().as_str() {
+            "ws" | "websocket" => (true, false),
+            "grpc" => (false, true),
+            _ => (false, false),
+        };
 
-        // 如果指定了生成配置文件，生成后退出
-        if let Some(ref path) = config.generate_config {
-            TomlConfig::generate_example(path)?;
-            println!("Example configuration file generated at: {}", path);
-            std::process::exit(0);
-        }
+        // Use CLI cert/key if provided, otherwise rely on remote config
+        // Note: remote config may have allow_insecure=true for self-signed certs
+        let (cert, key) = match (&cli.cert_file, &cli.key_file) {
+            (Some(c), Some(k)) => (Some(c.clone()), Some(k.clone())),
+            _ => (None, None),
+        };
 
-        // 如果指定了配置文件，从文件加载
-        if let Some(ref config_path) = config.config_file {
-            println!("Loading configuration from: {}", config_path);
-            let toml_config = TomlConfig::from_file(config_path)?;
-
-            // 转换成 ServerConfig
-            let file_config = toml_config.to_server_config();
-
-            // 只有命令行参数为默认值时才使用文件配置
-            if config.host == "127.0.0.1" {
-                config.host = file_config.host;
-            }
-            if config.port == "35537" {
-                config.port = file_config.port;
-            }
-            // Users are always loaded from config file
-            config.users = file_config.users;
-            if config.enable_ws.is_none() {
-                config.enable_ws = file_config.enable_ws;
-            }
-            if config.enable_grpc.is_none() {
-                config.enable_grpc = file_config.enable_grpc;
-            }
-            if config.enable_udp.is_none() {
-                config.enable_udp = file_config.enable_udp;
-            }
-            if config.cert.is_none() {
-                config.cert = file_config.cert;
-            }
-            if config.key.is_none() {
-                config.key = file_config.key;
-            }
-            if config.log_level.is_none() {
-                config.log_level = file_config.log_level;
-            }
-        }
-
-        // 验证用户列表不为空
-        if config.users.is_empty() {
-            return Err(anyhow!(
-                "At least one user must be provided in the config file"
-            ));
-        }
-
-        // Apply defaults for Option<bool> fields
-        let enable_ws = config.enable_ws.unwrap_or(false);
-        let enable_grpc = config.enable_grpc.unwrap_or(false);
-        let enable_udp = config.enable_udp.unwrap_or(true);
-
-        if enable_ws && enable_grpc {
-            return Err(anyhow!(
-                "WebSocket mode and gRPC mode cannot be enabled simultaneously"
-            ));
-        }
-
-        config.enable_ws = Some(enable_ws);
-        config.enable_grpc = Some(enable_grpc);
-        config.enable_udp = Some(enable_udp);
-
-        Ok(config)
+        Ok(Self {
+            host: "0.0.0.0".to_string(), // Always bind to all interfaces
+            port: remote.server_port,
+            users,
+            enable_ws,
+            enable_grpc,
+            enable_udp: true, // Always enable UDP by default
+            cert,
+            key,
+            log_level: cli.log_mode.clone(),
+            acl_conf_file: cli.ext_conf_file.clone(),
+            data_dir: cli.data_dir.clone(),
+        })
     }
 
     /// Build a HashMap from password hex to user id for fast authentication lookup
-    pub fn build_user_map(&self) -> HashMap<[u8; 56], u64> {
+    pub fn build_user_map(&self) -> HashMap<[u8; 56], i64> {
         use crate::utils::password_to_hex;
         self.users
             .iter()
@@ -154,449 +230,435 @@ impl ServerConfig {
     }
 }
 
-// =============== TOML 配置部分 ==================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TomlConfig {
-    pub server: ServerSettings,
-    #[serde(default)]
-    pub tls: Option<TlsSettings>,
-    #[serde(default)]
-    pub log: Option<LogSettings>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerSettings {
-    pub host: String,
-    pub port: String,
-    /// List of users for authentication
-    pub users: Vec<User>,
-
-    #[serde(default)]
-    pub enable_ws: bool,
-
-    #[serde(default)]
-    pub enable_grpc: bool,
-
-    #[serde(default = "default_enable_udp")]
-    pub enable_udp: bool,
-}
-
-const fn default_enable_udp() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TlsSettings {
-    pub cert: String,
-    pub key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogSettings {
-    /// Log level: trace, debug, info, warn, error
-    #[serde(default = "default_log_level")]
-    pub level: String,
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-impl TomlConfig {
-    /// 从文件加载配置
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = fs::read_to_string(path)?;
-        let config: TomlConfig = toml::from_str(&content)?;
-        Ok(config)
-    }
-
-    /// 生成示例配置文件
-    pub fn generate_example<P: AsRef<Path>>(path: P) -> Result<()> {
-        let example = TomlConfig {
-            server: ServerSettings {
-                host: "127.0.0.1".to_string(),
-                port: "35537".to_string(),
-                users: vec![
-                    User {
-                        id: 1,
-                        uuid: "98cb61c8-76dc-4d0e-939c-3ed9e11327b5".to_string(),
-                    },
-                    User {
-                        id: 2,
-                        uuid: "3be10bf7-5716-49a8-a76b-d5aac7b828f7".to_string(),
-                    },
-                ],
-                enable_ws: true,
-                enable_grpc: false,
-                enable_udp: true,
-            },
-            tls: Some(TlsSettings {
-                cert: "/path/to/cert.pem".to_string(),
-                key: "/path/to/key.pem".to_string(),
-            }),
-            log: Some(LogSettings {
-                level: "info".to_string(),
-            }),
-        };
-
-        let toml_str = toml::to_string_pretty(&example)?;
-        fs::write(path, toml_str)?;
-        Ok(())
-    }
-
-    /// 转换为 ServerConfig
-    pub fn to_server_config(self) -> ServerConfig {
-        ServerConfig {
-            host: self.server.host,
-            port: self.server.port,
-            users: self.server.users,
-            enable_ws: Some(self.server.enable_ws),
-            enable_grpc: Some(self.server.enable_grpc),
-            enable_udp: Some(self.server.enable_udp),
-            cert: self.tls.as_ref().map(|t| t.cert.clone()),
-            key: self.tls.as_ref().map(|t| t.key.clone()),
-            config_file: None,
-            generate_config: None,
-            log_level: self.log.map(|l| l.level),
-            acl_conf_file: None,
-            data_dir: None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
-    fn make_test_users() -> Vec<User> {
-        vec![
-            User {
-                id: 1,
-                uuid: "98cb61c8-76dc-4d0e-939c-3ed9e11327b5".to_string(),
-            },
-            User {
-                id: 2,
-                uuid: "3be10bf7-5716-49a8-a76b-d5aac7b828f7".to_string(),
-            },
-        ]
+    fn create_test_cli_args() -> CliArgs {
+        CliArgs {
+            api: "https://api.example.com".to_string(),
+            token: "test-token".to_string(),
+            node: 1,
+            cert_file: None,
+            key_file: None,
+            fetch_users_interval: 60,
+            report_traffics_interval: 80,
+            heartbeat_interval: 180,
+            log_mode: "info".to_string(),
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
+            ext_conf_file: None,
+        }
     }
 
     #[test]
-    fn test_toml_config_from_file() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-[server]
-host = "0.0.0.0"
-port = "8080"
-users = [
-    {{ id = 1, uuid = "98cb61c8-76dc-4d0e-939c-3ed9e11327b5" }},
-    {{ id = 2, uuid = "3be10bf7-5716-49a8-a76b-d5aac7b828f7" }}
-]
-enable_ws = true
-enable_grpc = false
-enable_udp = true
-"#
-        )
-        .unwrap();
+    fn test_cli_args_defaults() {
+        // Test that default values are correct
+        assert_eq!(DEFAULT_FETCH_USERS_INTERVAL, 60);
+        assert_eq!(DEFAULT_REPORT_TRAFFICS_INTERVAL, 80);
+        assert_eq!(DEFAULT_HEARTBEAT_INTERVAL, 180);
+    }
 
-        let config = TomlConfig::from_file(file.path()).unwrap();
-        assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.server.port, "8080");
-        assert_eq!(config.server.users.len(), 2);
-        assert_eq!(config.server.users[0].id, 1);
+    #[test]
+    fn test_cli_args_validate_success() {
+        let cli = create_test_cli_args();
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cli_args_validate_empty_api() {
+        let mut cli = create_test_cli_args();
+        cli.api = "".to_string();
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_empty_token() {
+        let mut cli = create_test_cli_args();
+        cli.token = "".to_string();
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_invalid_node_id() {
+        let mut cli = create_test_cli_args();
+        cli.node = 0;
+        assert!(cli.validate().is_err());
+
+        cli.node = -1;
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_cert_without_key() {
+        let mut cli = create_test_cli_args();
+        cli.cert_file = Some("/path/to/cert.pem".to_string());
+        cli.key_file = None;
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_key_without_cert() {
+        let mut cli = create_test_cli_args();
+        cli.cert_file = None;
+        cli.key_file = Some("/path/to/key.pem".to_string());
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_validate_both_cert_and_key() {
+        let mut cli = create_test_cli_args();
+        cli.cert_file = Some("/path/to/cert.pem".to_string());
+        cli.key_file = Some("/path/to/key.pem".to_string());
+        // Should pass validation (file existence is not checked here for non-existent files)
+        assert!(cli.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cli_args_validate_zero_interval() {
+        let mut cli = create_test_cli_args();
+        cli.fetch_users_interval = 0;
+        assert!(cli.validate().is_err());
+
+        cli = create_test_cli_args();
+        cli.report_traffics_interval = 0;
+        assert!(cli.validate().is_err());
+
+        cli = create_test_cli_args();
+        cli.heartbeat_interval = 0;
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_get_data_dir_default() {
+        let cli = create_test_cli_args();
+        let data_dir = cli.get_data_dir();
+        // Should return default /var/lib/trojan-node
+        assert_eq!(data_dir, &PathBuf::from(DEFAULT_DATA_DIR));
+    }
+
+    #[test]
+    fn test_cli_args_get_data_dir_custom() {
+        let mut cli = create_test_cli_args();
+        cli.data_dir = PathBuf::from("/tmp/test-data");
+        let data_dir = cli.get_data_dir();
+        assert_eq!(data_dir, &PathBuf::from("/tmp/test-data"));
+    }
+
+    #[test]
+    fn test_cli_args_get_state_file_path() {
+        let mut cli = create_test_cli_args();
+        cli.data_dir = PathBuf::from("/tmp/test-data");
+        let state_file = cli.get_state_file_path();
+        assert_eq!(state_file, PathBuf::from("/tmp/test-data/.trojan_state"));
+    }
+
+    #[test]
+    fn test_default_data_dir_value() {
+        assert_eq!(DEFAULT_DATA_DIR, "/var/lib/trojan-node");
+    }
+
+    #[test]
+    fn test_user_from_remote() {
+        let remote_user = server_r_client::User {
+            id: 42,
+            uuid: "test-uuid-123".to_string(),
+        };
+        let user: User = remote_user.into();
+        assert_eq!(user.id, 42);
+        assert_eq!(user.uuid, "test-uuid-123");
+    }
+
+    #[test]
+    fn test_user_clone() {
+        let user = User {
+            id: 1,
+            uuid: "test-uuid".to_string(),
+        };
+        let cloned = user.clone();
+        assert_eq!(cloned.id, user.id);
+        assert_eq!(cloned.uuid, user.uuid);
+    }
+
+    #[test]
+    fn test_server_config_from_remote_tcp() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: None, // TCP by default
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![User {
+            id: 1,
+            uuid: "uuid-1".to_string(),
+        }];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert_eq!(config.port, 443);
+        assert!(!config.enable_ws);
+        assert!(!config.enable_grpc);
+        assert!(config.enable_udp);
+    }
+
+    #[test]
+    fn test_server_config_from_remote_websocket() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("ws".to_string()),
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert!(config.enable_ws);
+        assert!(!config.enable_grpc);
+    }
+
+    #[test]
+    fn test_server_config_from_remote_websocket_full() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("websocket".to_string()),
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert!(config.enable_ws);
+        assert!(!config.enable_grpc);
+    }
+
+    #[test]
+    fn test_server_config_from_remote_grpc() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("grpc".to_string()),
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert!(!config.enable_ws);
+        assert!(config.enable_grpc);
+    }
+
+    #[test]
+    fn test_server_config_from_remote_network_case_insensitive() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: Some("GRPC".to_string()),
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert!(config.enable_grpc);
+    }
+
+    #[test]
+    fn test_server_config_from_remote_with_cert() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: None,
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let mut cli = create_test_cli_args();
+        cli.cert_file = Some("/path/to/cert.pem".to_string());
+        cli.key_file = Some("/path/to/key.pem".to_string());
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert_eq!(config.cert, Some("/path/to/cert.pem".to_string()));
+        assert_eq!(config.key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_server_config_from_remote_with_acl_config() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: None,
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let mut cli = create_test_cli_args();
+        cli.ext_conf_file = Some(PathBuf::from("/path/to/acl.yaml"));
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
         assert_eq!(
-            config.server.users[0].uuid,
-            "98cb61c8-76dc-4d0e-939c-3ed9e11327b5"
+            config.acl_conf_file,
+            Some(PathBuf::from("/path/to/acl.yaml"))
         );
-        assert!(config.server.enable_ws);
-        assert!(!config.server.enable_grpc);
-        assert!(config.server.enable_udp);
     }
 
     #[test]
-    fn test_toml_config_with_tls() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-[server]
-host = "127.0.0.1"
-port = "443"
-users = [
-    {{ id = 1, uuid = "98cb61c8-76dc-4d0e-939c-3ed9e11327b5" }}
-]
-
-[tls]
-cert = "/path/to/cert.pem"
-key = "/path/to/key.pem"
-"#
-        )
-        .unwrap();
-
-        let config = TomlConfig::from_file(file.path()).unwrap();
-        assert!(config.tls.is_some());
-        let tls = config.tls.unwrap();
-        assert_eq!(tls.cert, "/path/to/cert.pem");
-        assert_eq!(tls.key, "/path/to/key.pem");
-    }
-
-    #[test]
-    fn test_toml_config_with_log() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-[server]
-host = "127.0.0.1"
-port = "8080"
-users = [
-    {{ id = 1, uuid = "test-uuid" }}
-]
-
-[log]
-level = "debug"
-"#
-        )
-        .unwrap();
-
-        let config = TomlConfig::from_file(file.path()).unwrap();
-        assert!(config.log.is_some());
-        assert_eq!(config.log.unwrap().level, "debug");
-    }
-
-    #[test]
-    fn test_toml_config_default_log_level() {
-        let log = LogSettings {
-            level: default_log_level(),
-        };
-        assert_eq!(log.level, "info");
-    }
-
-    #[test]
-    fn test_toml_config_default_enable_udp() {
-        assert!(default_enable_udp());
-    }
-
-    #[test]
-    fn test_toml_config_to_server_config() {
-        let toml_config = TomlConfig {
-            server: ServerSettings {
-                host: "0.0.0.0".to_string(),
-                port: "8080".to_string(),
-                users: make_test_users(),
-                enable_ws: true,
-                enable_grpc: false,
-                enable_udp: true,
-            },
-            tls: Some(TlsSettings {
-                cert: "/cert.pem".to_string(),
-                key: "/key.pem".to_string(),
-            }),
-            log: Some(LogSettings {
-                level: "debug".to_string(),
-            }),
-        };
-
-        let server_config = toml_config.to_server_config();
-        assert_eq!(server_config.host, "0.0.0.0");
-        assert_eq!(server_config.port, "8080");
-        assert_eq!(server_config.users.len(), 2);
-        assert_eq!(server_config.enable_ws, Some(true));
-        assert_eq!(server_config.enable_grpc, Some(false));
-        assert_eq!(server_config.enable_udp, Some(true));
-        assert_eq!(server_config.cert, Some("/cert.pem".to_string()));
-        assert_eq!(server_config.key, Some("/key.pem".to_string()));
-        assert_eq!(server_config.log_level, Some("debug".to_string()));
-    }
-
-    #[test]
-    fn test_toml_config_generate_example() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_path_buf();
-        drop(file);
-
-        TomlConfig::generate_example(&path).unwrap();
-
-        let config = TomlConfig::from_file(&path).unwrap();
-        assert_eq!(config.server.host, "127.0.0.1");
-        assert_eq!(config.server.port, "35537");
-        assert_eq!(config.server.users.len(), 2);
-        assert!(config.tls.is_some());
-        assert!(config.log.is_some());
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_toml_config_invalid_file() {
-        let result = TomlConfig::from_file("/nonexistent/path/config.toml");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_toml_config_invalid_toml() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "this is not valid toml {{{{").unwrap();
-
-        let result = TomlConfig::from_file(file.path());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_server_settings_debug() {
-        let settings = ServerSettings {
-            host: "127.0.0.1".to_string(),
-            port: "8080".to_string(),
-            users: make_test_users(),
+    fn test_server_config_build_user_map() {
+        let config = ServerConfig {
+            host: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![
+                User {
+                    id: 1,
+                    uuid: "uuid-1".to_string(),
+                },
+                User {
+                    id: 2,
+                    uuid: "uuid-2".to_string(),
+                },
+            ],
             enable_ws: false,
             enable_grpc: false,
             enable_udp: true,
-        };
-        let debug_str = format!("{:?}", settings);
-        assert!(debug_str.contains("127.0.0.1"));
-        assert!(debug_str.contains("8080"));
-    }
-
-    // Tests for Option<bool> config merge behavior
-    #[test]
-    fn test_server_config_enable_flags_defaults() {
-        // Test that Option<bool> fields properly apply defaults
-        let config = ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: "8080".to_string(),
-            users: make_test_users(),
-            enable_ws: None,
-            enable_grpc: None,
-            enable_udp: None,
             cert: None,
             key: None,
-            config_file: None,
-            generate_config: None,
-            log_level: None,
+            log_level: "info".to_string(),
             acl_conf_file: None,
-            data_dir: None,
-        };
-
-        // Verify defaults: ws=false, grpc=false, udp=true
-        assert_eq!(config.enable_ws.unwrap_or(false), false);
-        assert_eq!(config.enable_grpc.unwrap_or(false), false);
-        assert_eq!(config.enable_udp.unwrap_or(true), true);
-    }
-
-    #[test]
-    fn test_server_config_enable_udp_can_be_disabled_from_file() {
-        // This tests the fix for the enable_udp merge logic bug
-        // Previously, enable_udp=false in config file would be ignored
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-[server]
-host = "0.0.0.0"
-port = "8080"
-users = [
-    {{ id = 1, uuid = "test-uuid" }}
-]
-enable_udp = false
-"#
-        )
-        .unwrap();
-
-        let toml_config = TomlConfig::from_file(file.path()).unwrap();
-        let server_config = toml_config.to_server_config();
-
-        // Verify enable_udp=false is correctly preserved from file
-        assert_eq!(server_config.enable_udp, Some(false));
-    }
-
-    #[test]
-    fn test_server_config_option_bool_explicit_values() {
-        // Test that explicit true/false values are properly wrapped in Some()
-        let config = ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: "8080".to_string(),
-            users: make_test_users(),
-            enable_ws: Some(true),
-            enable_grpc: Some(false),
-            enable_udp: Some(false), // Explicitly disabled
-            cert: None,
-            key: None,
-            config_file: None,
-            generate_config: None,
-            log_level: None,
-            acl_conf_file: None,
-            data_dir: None,
-        };
-
-        assert_eq!(config.enable_ws, Some(true));
-        assert_eq!(config.enable_grpc, Some(false));
-        assert_eq!(config.enable_udp, Some(false));
-    }
-
-    #[test]
-    fn test_toml_config_enable_udp_default_is_true() {
-        // Test that TOML config defaults enable_udp to true when not specified
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-[server]
-host = "127.0.0.1"
-port = "8080"
-users = [
-    {{ id = 1, uuid = "test-uuid" }}
-]
-"#
-        )
-        .unwrap();
-
-        let config = TomlConfig::from_file(file.path()).unwrap();
-        // enable_udp should default to true when not specified
-        assert!(config.server.enable_udp);
-    }
-
-    #[test]
-    fn test_build_user_map() {
-        let config = ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: "8080".to_string(),
-            users: make_test_users(),
-            enable_ws: None,
-            enable_grpc: None,
-            enable_udp: None,
-            cert: None,
-            key: None,
-            config_file: None,
-            generate_config: None,
-            log_level: None,
-            acl_conf_file: None,
-            data_dir: None,
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
         };
 
         let user_map = config.build_user_map();
         assert_eq!(user_map.len(), 2);
-
-        // Verify the map contains correct mappings
-        use crate::utils::password_to_hex;
-        let hex1 = password_to_hex("98cb61c8-76dc-4d0e-939c-3ed9e11327b5");
-        let hex2 = password_to_hex("3be10bf7-5716-49a8-a76b-d5aac7b828f7");
-
-        assert_eq!(user_map.get(&hex1), Some(&1));
-        assert_eq!(user_map.get(&hex2), Some(&2));
     }
 
     #[test]
-    fn test_user_struct() {
-        let user = User {
-            id: 42,
-            uuid: "test-uuid-12345".to_string(),
+    fn test_server_config_build_user_map_empty() {
+        let config = ServerConfig {
+            host: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![],
+            enable_ws: false,
+            enable_grpc: false,
+            enable_udp: true,
+            cert: None,
+            key: None,
+            log_level: "info".to_string(),
+            acl_conf_file: None,
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
         };
-        assert_eq!(user.id, 42);
-        assert_eq!(user.uuid, "test-uuid-12345");
+
+        let user_map = config.build_user_map();
+        assert!(user_map.is_empty());
+    }
+
+    #[test]
+    fn test_server_config_build_user_map_lookup() {
+        use crate::utils::password_to_hex;
+
+        let config = ServerConfig {
+            host: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![User {
+                id: 42,
+                uuid: "my-secret-uuid".to_string(),
+            }],
+            enable_ws: false,
+            enable_grpc: false,
+            enable_udp: true,
+            cert: None,
+            key: None,
+            log_level: "info".to_string(),
+            acl_conf_file: None,
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
+        };
+
+        let user_map = config.build_user_map();
+        let hex = password_to_hex("my-secret-uuid");
+
+        assert_eq!(user_map.get(&hex), Some(&42i64));
+    }
+
+    #[test]
+    fn test_server_config_host_always_binds_all() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 8080,
+            allow_insecure: false,
+            server_name: None,
+            network: None,
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert_eq!(config.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_server_config_udp_always_enabled() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: None,
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let cli = create_test_cli_args();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert!(config.enable_udp);
+    }
+
+    #[test]
+    fn test_server_config_log_level_from_cli() {
+        let remote = server_r_client::TrojanConfig {
+            id: 1,
+            server_port: 443,
+            allow_insecure: false,
+            server_name: None,
+            network: None,
+            websocket_config: None,
+            grpc_config: None,
+        };
+        let mut cli = create_test_cli_args();
+        cli.log_mode = "debug".to_string();
+        let users = vec![];
+
+        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+
+        assert_eq!(config.log_level, "debug");
     }
 }
