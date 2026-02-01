@@ -75,7 +75,8 @@ impl<S: AsyncRead> AsyncRead for TimedStream<S> {
             if bytes_read > 0 {
                 this.last_activity
                     .store(this.start_time.elapsed().as_secs(), Ordering::Release);
-                this.read_bytes.fetch_add(bytes_read as u64, Ordering::Relaxed);
+                this.read_bytes
+                    .fetch_add(bytes_read as u64, Ordering::Relaxed);
             }
         }
         result
@@ -148,8 +149,8 @@ where
         a,
         start_time,
         Arc::clone(&last_activity),
-        Arc::clone(&counters.a_to_b),  // reads from A = upload
-        Arc::clone(&counters.b_to_a),  // writes to A = download (not used by copy_bidirectional for counting)
+        Arc::clone(&counters.a_to_b), // reads from A = upload
+        Arc::clone(&counters.b_to_a), // writes to A = download (not used by copy_bidirectional for counting)
     );
 
     // stream_b reads from remote, writes to remote
@@ -159,8 +160,8 @@ where
         b,
         start_time,
         Arc::clone(&last_activity),
-        Arc::clone(&counters.b_to_a),  // reads from B = download
-        Arc::clone(&counters.a_to_b),  // writes to B = upload (not used by copy_bidirectional for counting)
+        Arc::clone(&counters.b_to_a), // reads from B = download
+        Arc::clone(&counters.a_to_b), // writes to B = upload (not used by copy_bidirectional for counting)
     );
 
     let copy_task = tokio::io::copy_bidirectional(&mut stream_a, &mut stream_b);
@@ -321,7 +322,8 @@ mod tests {
         let read_bytes = Arc::new(AtomicU64::new(0));
         let write_bytes = Arc::new(AtomicU64::new(0));
 
-        let mut stream = TimedStream::new(cursor, start_time, last_activity, read_bytes, write_bytes);
+        let mut stream =
+            TimedStream::new(cursor, start_time, last_activity, read_bytes, write_bytes);
 
         // Flush should not panic
         tokio::io::AsyncWriteExt::flush(&mut stream).await.unwrap();
@@ -335,7 +337,8 @@ mod tests {
         let read_bytes = Arc::new(AtomicU64::new(0));
         let write_bytes = Arc::new(AtomicU64::new(0));
 
-        let mut stream = TimedStream::new(cursor, start_time, last_activity, read_bytes, write_bytes);
+        let mut stream =
+            TimedStream::new(cursor, start_time, last_activity, read_bytes, write_bytes);
 
         // Shutdown should not panic
         tokio::io::AsyncWriteExt::shutdown(&mut stream)

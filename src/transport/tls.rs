@@ -13,7 +13,10 @@ pub struct TlsTransportListener;
 
 impl TlsTransportListener {
     /// Create TLS config from certificate and key files
-    pub fn load_tls_config(cert_path: &Path, key_path: &Path) -> std::io::Result<Arc<ServerConfig>> {
+    pub fn load_tls_config(
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> std::io::Result<Arc<ServerConfig>> {
         // Load certificates
         let cert_file = File::open(cert_path)?;
         let mut cert_reader = BufReader::new(cert_file);

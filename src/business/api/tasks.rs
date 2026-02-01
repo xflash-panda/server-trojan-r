@@ -225,12 +225,7 @@ async fn report_traffic_once(
         .into_iter()
         .filter(|s| s.upload_bytes > 0 || s.download_bytes > 0)
         .map(|s| {
-            UserTraffic::with_count(
-                s.user_id,
-                s.upload_bytes,
-                s.download_bytes,
-                s.request_count,
-            )
+            UserTraffic::with_count(s.user_id, s.upload_bytes, s.download_bytes, s.request_count)
         })
         .collect();
 

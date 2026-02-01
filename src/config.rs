@@ -65,6 +65,10 @@ pub struct CliArgs {
     /// ACL config file for ACL and Outbounds (.yaml format)
     #[arg(long, env = "X_PANDA_TROJAN_ACL_CONF_FILE")]
     pub acl_conf_file: Option<PathBuf>,
+
+    /// Block connections to private/loopback IP addresses (SSRF protection)
+    #[arg(long, env = "X_PANDA_TROJAN_BLOCK_PRIVATE_IP", default_value_t = true)]
+    pub block_private_ip: bool,
 }
 
 impl CliArgs {
@@ -87,16 +91,23 @@ impl CliArgs {
 
         // Validate TLS cert/key - both are required for Trojan protocol
         if self.cert_file.is_empty() {
-            return Err(anyhow!("TLS certificate file path is required (--cert-file)"));
+            return Err(anyhow!(
+                "TLS certificate file path is required (--cert-file)"
+            ));
         }
         if self.key_file.is_empty() {
-            return Err(anyhow!("TLS private key file path is required (--key-file)"));
+            return Err(anyhow!(
+                "TLS private key file path is required (--key-file)"
+            ));
         }
 
         // Validate cert file exists
         let cert_path = std::path::Path::new(&self.cert_file);
         if !cert_path.exists() {
-            return Err(anyhow!("TLS certificate file not found: {}", self.cert_file));
+            return Err(anyhow!(
+                "TLS certificate file not found: {}",
+                self.cert_file
+            ));
         }
 
         // Validate key file exists
@@ -185,6 +196,8 @@ pub struct ServerConfig {
     pub acl_conf_file: Option<PathBuf>,
     /// Data directory for geo data files (default: /var/lib/trojan-node)
     pub data_dir: PathBuf,
+    /// Block connections to private/loopback IP addresses (SSRF protection)
+    pub block_private_ip: bool,
 }
 
 impl ServerConfig {
@@ -231,6 +244,7 @@ impl ServerConfig {
             key,
             acl_conf_file: cli.acl_conf_file.clone(),
             data_dir: cli.data_dir.clone(),
+            block_private_ip: cli.block_private_ip,
         })
     }
 
@@ -258,6 +272,7 @@ mod tests {
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
+            block_private_ip: true,
         }
     }
 
@@ -282,6 +297,7 @@ mod tests {
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
+            block_private_ip: true,
         };
         (cli, temp_dir)
     }

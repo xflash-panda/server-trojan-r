@@ -321,13 +321,22 @@ async fn build_router(
         log::info!(
             acl_file = %acl_path.display(),
             rules = engine.rule_count(),
+            block_private_ip = config.block_private_ip,
             "ACL router loaded"
         );
 
-        Ok(Arc::new(AclRouter::new(engine)) as Arc<dyn core::hooks::OutboundRouter>)
+        Ok(Arc::new(AclRouter::with_block_private_ip(
+            engine,
+            config.block_private_ip,
+        )) as Arc<dyn core::hooks::OutboundRouter>)
     } else {
-        log::info!("No ACL config, using direct connection for all traffic");
-        Ok(Arc::new(core::hooks::DirectRouter) as Arc<dyn core::hooks::OutboundRouter>)
+        log::info!(
+            block_private_ip = config.block_private_ip,
+            "No ACL config, using direct connection for all traffic"
+        );
+        Ok(Arc::new(core::hooks::DirectRouter::with_block_private_ip(
+            config.block_private_ip,
+        )) as Arc<dyn core::hooks::OutboundRouter>)
     }
 }
 
@@ -357,7 +366,9 @@ where
         TransportType::Grpc => {
             let peer_addr_for_log = peer_addr.clone();
             log::debug!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
-            let grpc_conn = GrpcConnection::with_service_name(stream, &network_settings.grpc_service_name).await?;
+            let grpc_conn =
+                GrpcConnection::with_service_name(stream, &network_settings.grpc_service_name)
+                    .await?;
             let result = grpc_conn
                 .run(move |grpc_transport| {
                     let server = Arc::clone(&server);
@@ -365,7 +376,9 @@ where
                     async move {
                         let stream: TransportStream = Box::pin(grpc_transport);
                         let meta = ConnectionMeta {
-                            peer_addr: peer_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                            peer_addr: peer_addr
+                                .parse()
+                                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                             transport_type: TransportType::Grpc,
                         };
                         process_connection(&server, stream, meta).await
@@ -388,18 +401,22 @@ where
 
             // WebSocket handshake with path validation
             let ws_path = network_settings.ws_path.clone();
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, response: Response| {
-                let path = req.uri().path();
-                if path != ws_path && !ws_path.is_empty() && ws_path != "/" {
-                    log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
-                    // For "/" or empty path, accept any path (Xray behavior)
-                }
-                Ok(response)
-            }).await?;
+            let ws_stream =
+                tokio_tungstenite::accept_hdr_async(stream, |req: &Request, response: Response| {
+                    let path = req.uri().path();
+                    if path != ws_path && !ws_path.is_empty() && ws_path != "/" {
+                        log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
+                        // For "/" or empty path, accept any path (Xray behavior)
+                    }
+                    Ok(response)
+                })
+                .await?;
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
-                peer_addr: peer_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                peer_addr: peer_addr
+                    .parse()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                 transport_type: TransportType::WebSocket,
             };
             process_connection(&server, stream, meta).await
@@ -407,7 +424,9 @@ where
         TransportType::Tcp => {
             let stream: TransportStream = Box::pin(stream);
             let meta = ConnectionMeta {
-                peer_addr: peer_addr.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                peer_addr: peer_addr
+                    .parse()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                 transport_type: TransportType::Tcp,
             };
             process_connection(&server, stream, meta).await
@@ -416,10 +435,7 @@ where
 }
 
 /// Run the server accept loop
-async fn run_server(
-    server: Arc<Server>,
-    config: &config::ServerConfig,
-) -> Result<()> {
+async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
     use crate::transport::TlsTransportListener;
 
     let addr = format!("{}:{}", config.host, config.port);

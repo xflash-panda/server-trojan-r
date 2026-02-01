@@ -82,7 +82,7 @@ impl ServerBuilder {
         Server {
             authenticator: self.authenticator.expect("authenticator is required"),
             stats: self.stats.expect("stats collector is required"),
-            router: self.router.unwrap_or_else(|| Arc::new(DirectRouter)),
+            router: self.router.unwrap_or_else(|| Arc::new(DirectRouter::new())),
             conn_manager: self.conn_manager.unwrap_or_default(),
         }
     }

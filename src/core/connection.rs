@@ -58,7 +58,11 @@ impl ConnectionManager {
     }
 
     /// Register a new connection and return its ID and cancellation token
-    pub fn register(&self, user_id: UserId, peer_addr: String) -> (ConnectionId, CancellationToken) {
+    pub fn register(
+        &self,
+        user_id: UserId,
+        peer_addr: String,
+    ) -> (ConnectionId, CancellationToken) {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let cancel_token = CancellationToken::new();
 

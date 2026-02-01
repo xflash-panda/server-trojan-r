@@ -8,6 +8,7 @@
 
 mod connection;
 pub mod hooks;
+pub mod ip_filter;
 mod protocol;
 mod relay;
 mod server;

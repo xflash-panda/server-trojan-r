@@ -421,12 +421,17 @@ pub async fn load_acl_config(path: &Path) -> Result<AclConfig> {
 /// for integration with the core proxy layer.
 pub struct AclRouter {
     engine: AclEngine,
+    /// Block connections to private/loopback IP addresses (SSRF protection)
+    block_private_ip: bool,
 }
 
 impl AclRouter {
-    /// Create a new ACL router from an ACL engine
-    pub fn new(engine: AclEngine) -> Self {
-        Self { engine }
+    /// Create a new ACL router with custom private IP blocking setting
+    pub fn with_block_private_ip(engine: AclEngine, block_private_ip: bool) -> Self {
+        Self {
+            engine,
+            block_private_ip,
+        }
     }
 }
 
@@ -435,14 +440,36 @@ impl crate::core::hooks::OutboundRouter for AclRouter {
     async fn route(&self, addr: &crate::core::Address) -> crate::core::hooks::OutboundType {
         use std::net::{Ipv4Addr, Ipv6Addr};
 
+        // Check for private IP if blocking is enabled
+        if self.block_private_ip {
+            match addr {
+                crate::core::Address::IPv4(ip, _) => {
+                    let ipv4 = Ipv4Addr::from(*ip);
+                    if is_private_ipv4(&ipv4) {
+                        log::debug!(target = %addr, "Blocked private IPv4 address");
+                        return crate::core::hooks::OutboundType::Reject;
+                    }
+                }
+                crate::core::Address::IPv6(ip, _) => {
+                    let ipv6 = Ipv6Addr::from(*ip);
+                    if is_private_ipv6(&ipv6) {
+                        log::debug!(target = %addr, "Blocked private IPv6 address");
+                        return crate::core::hooks::OutboundType::Reject;
+                    }
+                }
+                crate::core::Address::Domain(domain, _) => {
+                    // Resolve domain and check if it resolves to private IP
+                    if let Some(reject) = self.check_domain_resolves_to_private(domain).await {
+                        return reject;
+                    }
+                }
+            }
+        }
+
         // Extract host and port without allocating strings for IPs
         let (host, port) = match addr {
-            crate::core::Address::IPv4(ip, port) => {
-                (Ipv4Addr::from(*ip).to_string(), *port)
-            }
-            crate::core::Address::IPv6(ip, port) => {
-                (Ipv6Addr::from(*ip).to_string(), *port)
-            }
+            crate::core::Address::IPv4(ip, port) => (Ipv4Addr::from(*ip).to_string(), *port),
+            crate::core::Address::IPv6(ip, port) => (Ipv6Addr::from(*ip).to_string(), *port),
             crate::core::Address::Domain(domain, port) => {
                 // Domain already a String, just borrow it
                 return self.route_host(domain, *port);
@@ -453,7 +480,47 @@ impl crate::core::hooks::OutboundRouter for AclRouter {
     }
 }
 
+// Re-export from core module
+use crate::core::ip_filter::{is_private_ipv4, is_private_ipv6};
+
 impl AclRouter {
+    /// Check if a domain resolves to a private IP address
+    async fn check_domain_resolves_to_private(
+        &self,
+        domain: &str,
+    ) -> Option<crate::core::hooks::OutboundType> {
+        use tokio::net::lookup_host;
+
+        let lookup = format!("{}:0", domain);
+        if let Ok(addrs) = lookup_host(&lookup).await {
+            for addr in addrs {
+                match addr.ip() {
+                    std::net::IpAddr::V4(ipv4) => {
+                        if is_private_ipv4(&ipv4) {
+                            log::debug!(
+                                domain = %domain,
+                                resolved_ip = %ipv4,
+                                "Blocked domain resolving to private IPv4"
+                            );
+                            return Some(crate::core::hooks::OutboundType::Reject);
+                        }
+                    }
+                    std::net::IpAddr::V6(ipv6) => {
+                        if is_private_ipv6(&ipv6) {
+                            log::debug!(
+                                domain = %domain,
+                                resolved_ip = %ipv6,
+                                "Blocked domain resolving to private IPv6"
+                            );
+                            return Some(crate::core::hooks::OutboundType::Reject);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn route_host(&self, host: &str, port: u16) -> crate::core::hooks::OutboundType {
         match self.engine.match_host(host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
@@ -1076,5 +1143,81 @@ acl:
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
         // direct config is None, should use default "auto" mode
         assert!(config.outbounds[0].direct.is_none());
+    }
+
+    #[test]
+    fn test_acl_router_blocks_private_ip_by_default() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, true);
+        assert!(router.block_private_ip);
+    }
+
+    #[test]
+    fn test_acl_router_with_custom_block_setting() {
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+        assert!(!router.block_private_ip);
+    }
+
+    #[tokio::test]
+    async fn test_acl_router_rejects_private_ipv4() {
+        use crate::core::hooks::OutboundRouter;
+        use crate::core::Address;
+
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, true);
+
+        // Test loopback
+        let addr = Address::IPv4([127, 0, 0, 1], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Reject));
+
+        // Test private Class A
+        let addr = Address::IPv4([10, 0, 0, 1], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Reject));
+
+        // Test private Class C
+        let addr = Address::IPv4([192, 168, 1, 1], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Reject));
+
+        // Test public IP should not be rejected
+        let addr = Address::IPv4([8, 8, 8, 8], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Direct));
+    }
+
+    #[tokio::test]
+    async fn test_acl_router_rejects_private_ipv6() {
+        use crate::core::hooks::OutboundRouter;
+        use crate::core::Address;
+
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, true);
+
+        // Test loopback ::1
+        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Reject));
+
+        // Test ULA (fd00::1)
+        let addr = Address::IPv6([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Reject));
+    }
+
+    #[tokio::test]
+    async fn test_acl_router_allows_private_when_disabled() {
+        use crate::core::hooks::OutboundRouter;
+        use crate::core::Address;
+
+        let engine = AclEngine::new_default().unwrap();
+        let router = AclRouter::with_block_private_ip(engine, false);
+
+        // Private IP should be allowed when blocking is disabled
+        let addr = Address::IPv4([127, 0, 0, 1], 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, crate::core::hooks::OutboundType::Direct));
     }
 }
