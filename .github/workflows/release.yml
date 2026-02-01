@@ -17,19 +17,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            artifact: server-linux-amd64
+            artifact: server-trojan-linux-amd64
             use_cross: false
 
           - target: x86_64-unknown-linux-musl
-            artifact: server-linux-amd64-musl
+            artifact: server-trojan-linux-amd64-musl
             use_cross: false
 
           - target: aarch64-unknown-linux-gnu
-            artifact: server-linux-arm64
+            artifact: server-trojan-linux-arm64
             use_cross: true
 
           - target: aarch64-unknown-linux-musl
-            artifact: server-linux-arm64-musl
+            artifact: server-trojan-linux-arm64-musl
             use_cross: true
 
     steps:
@@ -74,8 +74,8 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p ${{ matrix.artifact }}
-          cp target/${{ matrix.target }}/release/server ${{ matrix.artifact }}/
-          chmod +x ${{ matrix.artifact }}/server
+          cp target/${{ matrix.target }}/release/server-trojan ${{ matrix.artifact }}/
+          chmod +x ${{ matrix.artifact }}/server-trojan
           tar -czvf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
       - name: Upload artifact
