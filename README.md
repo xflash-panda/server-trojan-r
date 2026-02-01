@@ -1,6 +1,6 @@
 # Server Trojan-R
 
-高性能 Rust 实现的 Trojan 代理服务器节点，专为 V2Board 面板设计。
+高性能 Rust 实现的 Trojan 代理服务器节点，
 
 ## 特性
 
@@ -9,7 +9,7 @@
 - **ACL 规则引擎**: 支持 Direct、SOCKS5、HTTP、Reject 出站
 - **GeoIP/GeoSite**: 支持 MaxMind MMDB 和 Sing-box 规则格式
 - **SSRF 防护**: 默认阻止访问私有/回环地址
-- **V2Board 集成**: 自动同步用户、上报流量、心跳保活
+- **API 集成**: 自动同步用户、上报流量、心跳保活
 
 ## 安装
 
