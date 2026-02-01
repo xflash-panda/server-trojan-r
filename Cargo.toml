@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -12,6 +12,7 @@ anyhow = "1.0"
 bytes = "1.11"
 hex = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
+humantime = "2.1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-rustls = "0.26.4"
 rustls = { version = "0.23.36", features = ["ring"] }
@@ -45,7 +46,7 @@ hostname = "0.4"
 socket2 = "0.6"
 
 [[bin]]
-name = "server"
+name = "server-trojan"
 path = "src/main.rs"
 
 [dev-dependencies]

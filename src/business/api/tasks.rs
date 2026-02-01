@@ -50,12 +50,12 @@ impl Default for TaskConfig {
 }
 
 impl TaskConfig {
-    /// Create task config from durations in seconds
-    pub fn new(fetch_users: u64, report_traffic: u64, heartbeat: u64) -> Self {
+    /// Create task config from durations
+    pub fn new(fetch_users: Duration, report_traffic: Duration, heartbeat: Duration) -> Self {
         Self {
-            fetch_users_interval: Duration::from_secs(fetch_users),
-            report_traffic_interval: Duration::from_secs(report_traffic),
-            heartbeat_interval: Duration::from_secs(heartbeat),
+            fetch_users_interval: fetch_users,
+            report_traffic_interval: report_traffic,
+            heartbeat_interval: heartbeat,
         }
     }
 }
@@ -261,7 +261,11 @@ mod tests {
 
     #[test]
     fn test_task_config_new() {
-        let config = TaskConfig::new(30, 45, 120);
+        let config = TaskConfig::new(
+            Duration::from_secs(30),
+            Duration::from_secs(45),
+            Duration::from_secs(120),
+        );
         assert_eq!(config.fetch_users_interval, Duration::from_secs(30));
         assert_eq!(config.report_traffic_interval, Duration::from_secs(45));
         assert_eq!(config.heartbeat_interval, Duration::from_secs(120));
@@ -269,7 +273,11 @@ mod tests {
 
     #[test]
     fn test_task_config_clone() {
-        let config = TaskConfig::new(10, 20, 30);
+        let config = TaskConfig::new(
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Duration::from_secs(30),
+        );
         let cloned = config.clone();
         assert_eq!(cloned.fetch_users_interval, config.fetch_users_interval);
         assert_eq!(

@@ -5,7 +5,6 @@ use server_r_client::{
     ApiClient, ApiError, Config as ApiConfig, NodeType, RegisterRequest, TrojanConfig, UserTraffic,
 };
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::config::{CliArgs, User};
@@ -50,7 +49,7 @@ impl ApiManager {
     /// Create a new API manager
     pub fn new(cli: &CliArgs) -> Result<Self> {
         let config = ApiConfig::new(&cli.api, &cli.token)
-            .with_timeout(Duration::from_secs(30))
+            .with_timeout(cli.api_timeout)
             .with_debug(cli.log_mode == "debug");
 
         let client = ApiClient::new(config)?;

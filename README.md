@@ -32,19 +32,32 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 | `--node` | `X_PANDA_TROJAN_NODE` | 节点 ID (必需) | - |
 | `--cert_file` | `X_PANDA_TROJAN_CERT_FILE` | TLS 证书路径 (必需) | - |
 | `--key_file` | `X_PANDA_TROJAN_KEY_FILE` | TLS 私钥路径 (必需) | - |
-| `--fetch_users_interval` | `X_PANDA_TROJAN_FETCH_USERS_INTERVAL` | 用户同步间隔(秒) | 60 |
-| `--report_traffics_interval` | `X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL` | 流量上报间隔(秒) | 80 |
-| `--heartbeat_interval` | `X_PANDA_TROJAN_HEARTBEAT_INTERVAL` | 心跳间隔(秒) | 180 |
+| `--fetch_users_interval` | `X_PANDA_TROJAN_FETCH_USERS_INTERVAL` | 用户同步间隔 | 60s |
+| `--report_traffics_interval` | `X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL` | 流量上报间隔 | 80s |
+| `--heartbeat_interval` | `X_PANDA_TROJAN_HEARTBEAT_INTERVAL` | 心跳间隔 | 180s |
+| `--api_timeout` | `X_PANDA_TROJAN_API_TIMEOUT` | API 请求超时 | 30s |
 | `--log_mode` | `X_PANDA_TROJAN_LOG_MODE` | 日志级别 | info |
 | `--data_dir` | `X_PANDA_TROJAN_DATA_DIR` | 数据目录 | /var/lib/trojan-node |
 | `--acl_conf_file` | `X_PANDA_TROJAN_ACL_CONF_FILE` | ACL 配置文件 | - |
 | `--block_private_ip` | `X_PANDA_TROJAN_BLOCK_PRIVATE_IP` | 阻止私有IP访问 | true |
 
+#### 性能调优参数
+
+| 参数 | 环境变量 | 说明 | 默认值 |
+|------|----------|------|--------|
+| `--conn_idle_timeout` | `X_PANDA_TROJAN_CONN_IDLE_TIMEOUT` | 连接空闲超时 | 5m |
+| `--tcp_connect_timeout` | `X_PANDA_TROJAN_TCP_CONNECT_TIMEOUT` | TCP 连接超时 | 5s |
+| `--request_timeout` | `X_PANDA_TROJAN_REQUEST_TIMEOUT` | 请求读取超时 | 5s |
+| `--tls_handshake_timeout` | `X_PANDA_TROJAN_TLS_HANDSHAKE_TIMEOUT` | TLS 握手超时 | 10s |
+| `--buffer_size` | `X_PANDA_TROJAN_BUFFER_SIZE` | 数据传输缓冲区大小 (字节) | 32768 |
+| `--tcp_backlog` | `X_PANDA_TROJAN_TCP_BACKLOG` | TCP 监听积压队列大小 | 1024 |
+| `--tcp_nodelay` | `X_PANDA_TROJAN_TCP_NODELAY` | 启用 TCP_NODELAY 降低延迟 | true |
+
 ### 启动示例
 
 ```bash
 # 基本启动
-server \
+server-trojan \
   --api https://panel.example.com/api \
   --token your_api_token \
   --node 1 \
@@ -57,7 +70,7 @@ export X_PANDA_TROJAN_TOKEN=your_api_token
 export X_PANDA_TROJAN_NODE=1
 export X_PANDA_TROJAN_CERT_FILE=/etc/ssl/cert.pem
 export X_PANDA_TROJAN_KEY_FILE=/etc/ssl/key.pem
-server
+server-trojan
 ```
 
 ## ACL 配置

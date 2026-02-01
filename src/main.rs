@@ -35,11 +35,6 @@ use crate::core::{
 };
 use crate::transport::{ConnectionMeta, TransportStream, TransportType};
 
-const BUF_SIZE: usize = 32 * 1024;
-const CONNECTION_TIMEOUT_SECS: u64 = 300;
-const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
-const REQUEST_READ_TIMEOUT_SECS: u64 = 10;
-
 /// Read and decode a complete Trojan request from the stream
 ///
 /// This function handles partial reads by continuing to read until
@@ -47,8 +42,9 @@ const REQUEST_READ_TIMEOUT_SECS: u64 = 10;
 async fn read_trojan_request(
     stream: &mut TransportStream,
     buf: &mut BytesMut,
+    buffer_size: usize,
 ) -> Result<TrojanRequest> {
-    let mut temp_buf = [0u8; BUF_SIZE];
+    let mut temp_buf = vec![0u8; buffer_size];
 
     loop {
         // Try to decode with current buffer (check completeness first to avoid clone)
@@ -91,7 +87,7 @@ async fn read_trojan_request(
         buf.extend_from_slice(&temp_buf[..n]);
 
         // Prevent buffer from growing too large (protection against malicious clients)
-        if buf.len() > BUF_SIZE * 2 {
+        if buf.len() > buffer_size * 2 {
             return Err(anyhow!("Request too large"));
         }
     }
@@ -104,11 +100,12 @@ async fn process_connection(
     meta: ConnectionMeta,
 ) -> Result<()> {
     // Read Trojan request with timeout and retry for incomplete data
-    let mut buf = BytesMut::with_capacity(BUF_SIZE);
+    let buffer_size = server.conn_config.buffer_size;
+    let mut buf = BytesMut::with_capacity(buffer_size);
 
     let request = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REQUEST_READ_TIMEOUT_SECS),
-        read_trojan_request(&mut stream, &mut buf),
+        server.conn_config.request_timeout,
+        read_trojan_request(&mut stream, &mut buf, buffer_size),
     )
     .await
     .map_err(|_| anyhow!("Request read timeout"))??;
@@ -223,13 +220,15 @@ async fn handle_direct_connect(
 
     // Connect with timeout
     let mut remote_stream = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+        server.conn_config.connect_timeout,
         TcpStream::connect(remote_addr),
     )
     .await
     {
         Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
+            if server.conn_config.tcp_nodelay {
+                let _ = stream.set_nodelay(true);
+            }
             stream
         }
         Ok(Err(e)) => {
@@ -257,7 +256,7 @@ async fn handle_direct_connect(
     let relay_fut = copy_bidirectional_with_stats(
         client_stream,
         remote_stream,
-        CONNECTION_TIMEOUT_SECS,
+        server.conn_config.idle_timeout_secs(),
         Some((user_id, stats)),
     );
 
@@ -466,7 +465,7 @@ async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Resul
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&socket_addr.into())?;
-    socket.listen(1024)?; // Increase backlog for high concurrency
+    socket.listen(server.conn_config.tcp_backlog)?;
 
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
     let local_addr = listener.local_addr()?;
@@ -486,8 +485,6 @@ async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Resul
         "Server started"
     );
 
-    const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
-
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
@@ -501,12 +498,14 @@ async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Resul
                 tokio::spawn(async move {
                     let result = async {
                         // Set TCP_NODELAY for lower latency
-                        let _ = stream.set_nodelay(true);
+                        if server.conn_config.tcp_nodelay {
+                            let _ = stream.set_nodelay(true);
+                        }
 
                         if let Some(tls_acceptor) = tls_acceptor {
                             // TLS handshake with timeout
                             match tokio::time::timeout(
-                                tokio::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                                server.conn_config.tls_handshake_timeout,
                                 tls_acceptor.accept(stream),
                             )
                             .await
@@ -602,6 +601,9 @@ async fn main() -> Result<()> {
     // Build router from ACL config
     let router = build_router(&server_config).await?;
 
+    // Build connection config from CLI args
+    let conn_config = config::ConnConfig::from_cli(&cli);
+
     // Build server using the builder pattern
     let server = Arc::new(
         Server::builder()
@@ -609,6 +611,7 @@ async fn main() -> Result<()> {
             .stats(Arc::clone(&stats_collector) as Arc<dyn core::hooks::StatsCollector>)
             .router(router)
             .conn_manager(conn_manager)
+            .conn_config(conn_config)
             .build(),
     );
 

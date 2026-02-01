@@ -6,11 +6,22 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// Default intervals in seconds
-const DEFAULT_FETCH_USERS_INTERVAL: u64 = 60;
-const DEFAULT_REPORT_TRAFFICS_INTERVAL: u64 = 80;
-const DEFAULT_HEARTBEAT_INTERVAL: u64 = 180;
+/// Parse duration string (e.g., "60s", "2m", "1h") or plain seconds
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    // Try parsing as humantime duration first (e.g., "60s", "2m", "1h30m")
+    if let Ok(d) = humantime::parse_duration(s) {
+        return Ok(d);
+    }
+    // Fall back to parsing as plain seconds for backwards compatibility
+    s.parse::<u64>().map(Duration::from_secs).map_err(|_| {
+        format!(
+            "Invalid duration '{}'. Use formats like '60s', '2m', '1h' or plain seconds",
+            s
+        )
+    })
+}
 
 /// Default data directory for state persistence (same as server-trojan Go version)
 const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-node";
@@ -42,17 +53,21 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_KEY_FILE")]
     pub key_file: String,
 
-    /// Interval for fetching users in seconds (default: 60)
-    #[arg(long, env = "X_PANDA_TROJAN_FETCH_USERS_INTERVAL", default_value_t = DEFAULT_FETCH_USERS_INTERVAL)]
-    pub fetch_users_interval: u64,
+    /// Interval for fetching users (e.g., "60s", "2m", default: 60s)
+    #[arg(long, env = "X_PANDA_TROJAN_FETCH_USERS_INTERVAL", default_value = "60s", value_parser = parse_duration)]
+    pub fetch_users_interval: Duration,
 
-    /// Interval for reporting traffic in seconds (default: 80)
-    #[arg(long, env = "X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL", default_value_t = DEFAULT_REPORT_TRAFFICS_INTERVAL)]
-    pub report_traffics_interval: u64,
+    /// Interval for reporting traffic (e.g., "80s", "2m", default: 80s)
+    #[arg(long, env = "X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL", default_value = "80s", value_parser = parse_duration)]
+    pub report_traffics_interval: Duration,
 
-    /// Interval for sending heartbeat in seconds (default: 180)
-    #[arg(long, env = "X_PANDA_TROJAN_HEARTBEAT_INTERVAL", default_value_t = DEFAULT_HEARTBEAT_INTERVAL)]
-    pub heartbeat_interval: u64,
+    /// Interval for sending heartbeat (e.g., "3m", "180s", default: 180s)
+    #[arg(long, env = "X_PANDA_TROJAN_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
+    pub heartbeat_interval: Duration,
+
+    /// API request timeout (e.g., "30s", "1m", default: 30s)
+    #[arg(long, env = "X_PANDA_TROJAN_API_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
+    pub api_timeout: Duration,
 
     /// Log mode: debug, info, warn, error (default: info)
     #[arg(long, env = "X_PANDA_TROJAN_LOG_MODE", default_value = "info")]
@@ -69,6 +84,45 @@ pub struct CliArgs {
     /// Block connections to private/loopback IP addresses (SSRF protection)
     #[arg(long, env = "X_PANDA_TROJAN_BLOCK_PRIVATE_IP", default_value_t = true)]
     pub block_private_ip: bool,
+
+    // ==================== Performance Tuning ====================
+    /// Connection idle timeout - disconnect if no data transferred (default: 5m)
+    #[arg(long, env = "X_PANDA_TROJAN_CONN_IDLE_TIMEOUT", default_value = "5m", value_parser = parse_duration, help_heading = "Performance")]
+    pub conn_idle_timeout: Duration,
+
+    /// TCP connect timeout to target server (default: 5s)
+    #[arg(long, env = "X_PANDA_TROJAN_TCP_CONNECT_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
+    pub tcp_connect_timeout: Duration,
+
+    /// Timeout for reading Trojan request header (default: 5s)
+    #[arg(long, env = "X_PANDA_TROJAN_REQUEST_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
+    pub request_timeout: Duration,
+
+    /// TLS handshake timeout (default: 10s)
+    #[arg(long, env = "X_PANDA_TROJAN_TLS_HANDSHAKE_TIMEOUT", default_value = "10s", value_parser = parse_duration, help_heading = "Performance")]
+    pub tls_handshake_timeout: Duration,
+
+    /// Buffer size for data transfer in bytes (default: 32KB)
+    #[arg(long, env = "X_PANDA_TROJAN_BUFFER_SIZE", default_value_t = 32 * 1024, help_heading = "Performance")]
+    pub buffer_size: usize,
+
+    /// TCP listen backlog for pending connections (default: 1024)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_TCP_BACKLOG",
+        default_value_t = 1024,
+        help_heading = "Performance"
+    )]
+    pub tcp_backlog: i32,
+
+    /// Enable TCP_NODELAY for lower latency (default: true)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_TCP_NODELAY",
+        default_value_t = true,
+        help_heading = "Performance"
+    )]
+    pub tcp_nodelay: bool,
 }
 
 impl CliArgs {
@@ -117,13 +171,13 @@ impl CliArgs {
         }
 
         // Validate intervals
-        if self.fetch_users_interval == 0 {
+        if self.fetch_users_interval.is_zero() {
             return Err(anyhow!("fetch_users_interval must be greater than 0"));
         }
-        if self.report_traffics_interval == 0 {
+        if self.report_traffics_interval.is_zero() {
             return Err(anyhow!("report_traffics_interval must be greater than 0"));
         }
-        if self.heartbeat_interval == 0 {
+        if self.heartbeat_interval.is_zero() {
             return Err(anyhow!("heartbeat_interval must be greater than 0"));
         }
 
@@ -172,6 +226,45 @@ pub const DEFAULT_GRPC_SERVICE_NAME: &str = "GunService";
 
 /// Default WebSocket path (Xray compatible)
 pub const DEFAULT_WS_PATH: &str = "/";
+
+/// Connection performance configuration
+#[derive(Debug, Clone, Copy)]
+pub struct ConnConfig {
+    /// Connection idle timeout
+    pub idle_timeout: Duration,
+    /// TCP connect timeout
+    pub connect_timeout: Duration,
+    /// Request read timeout
+    pub request_timeout: Duration,
+    /// TLS handshake timeout
+    pub tls_handshake_timeout: Duration,
+    /// Buffer size for data transfer
+    pub buffer_size: usize,
+    /// TCP listen backlog
+    pub tcp_backlog: i32,
+    /// Enable TCP_NODELAY
+    pub tcp_nodelay: bool,
+}
+
+impl ConnConfig {
+    /// Create from CLI args
+    pub fn from_cli(cli: &CliArgs) -> Self {
+        Self {
+            idle_timeout: cli.conn_idle_timeout,
+            connect_timeout: cli.tcp_connect_timeout,
+            request_timeout: cli.request_timeout,
+            tls_handshake_timeout: cli.tls_handshake_timeout,
+            buffer_size: cli.buffer_size,
+            tcp_backlog: cli.tcp_backlog,
+            tcp_nodelay: cli.tcp_nodelay,
+        }
+    }
+
+    /// Get connection idle timeout in seconds (for relay function)
+    pub fn idle_timeout_secs(&self) -> u64 {
+        self.idle_timeout.as_secs()
+    }
+}
 
 /// Runtime server configuration (built from remote panel config + CLI args)
 #[derive(Debug, Clone)]
@@ -266,12 +359,20 @@ mod tests {
             node: 1,
             cert_file: "/path/to/cert.pem".to_string(),
             key_file: "/path/to/key.pem".to_string(),
-            fetch_users_interval: 60,
-            report_traffics_interval: 80,
-            heartbeat_interval: 180,
+            fetch_users_interval: Duration::from_secs(60),
+            report_traffics_interval: Duration::from_secs(80),
+            heartbeat_interval: Duration::from_secs(180),
+            api_timeout: Duration::from_secs(30),
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
+            conn_idle_timeout: Duration::from_secs(300),
+            tcp_connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            tls_handshake_timeout: Duration::from_secs(10),
+            buffer_size: 32 * 1024,
+            tcp_backlog: 1024,
+            tcp_nodelay: true,
             block_private_ip: true,
         }
     }
@@ -291,23 +392,32 @@ mod tests {
             node: 1,
             cert_file: cert_path.to_string_lossy().to_string(),
             key_file: key_path.to_string_lossy().to_string(),
-            fetch_users_interval: 60,
-            report_traffics_interval: 80,
-            heartbeat_interval: 180,
+            fetch_users_interval: Duration::from_secs(60),
+            report_traffics_interval: Duration::from_secs(80),
+            heartbeat_interval: Duration::from_secs(180),
+            api_timeout: Duration::from_secs(30),
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
             block_private_ip: true,
+            conn_idle_timeout: Duration::from_secs(300),
+            tcp_connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            tls_handshake_timeout: Duration::from_secs(10),
+            buffer_size: 32 * 1024,
+            tcp_backlog: 1024,
+            tcp_nodelay: true,
         };
         (cli, temp_dir)
     }
 
     #[test]
     fn test_cli_args_defaults() {
-        // Test that default values are correct
-        assert_eq!(DEFAULT_FETCH_USERS_INTERVAL, 60);
-        assert_eq!(DEFAULT_REPORT_TRAFFICS_INTERVAL, 80);
-        assert_eq!(DEFAULT_HEARTBEAT_INTERVAL, 180);
+        // Test that test helper creates valid default values
+        let cli = create_test_cli_args();
+        assert_eq!(cli.fetch_users_interval, Duration::from_secs(60));
+        assert_eq!(cli.report_traffics_interval, Duration::from_secs(80));
+        assert_eq!(cli.heartbeat_interval, Duration::from_secs(180));
     }
 
     #[test]
@@ -371,16 +481,33 @@ mod tests {
     #[test]
     fn test_cli_args_validate_zero_interval() {
         let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
-        cli.fetch_users_interval = 0;
+        cli.fetch_users_interval = Duration::ZERO;
         assert!(cli.validate().is_err());
 
         let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
-        cli.report_traffics_interval = 0;
+        cli.report_traffics_interval = Duration::ZERO;
         assert!(cli.validate().is_err());
 
         let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
-        cli.heartbeat_interval = 0;
+        cli.heartbeat_interval = Duration::ZERO;
         assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        // Test humantime format
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+
+        // Test plain seconds (backwards compatibility)
+        assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("120").unwrap(), Duration::from_secs(120));
+
+        // Test invalid input
+        assert!(parse_duration("invalid").is_err());
+        assert!(parse_duration("").is_err());
     }
 
     #[test]
