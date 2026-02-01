@@ -18,15 +18,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             artifact: server-linux-amd64
+            use_cross: false
 
           - target: x86_64-unknown-linux-musl
             artifact: server-linux-amd64-musl
+            use_cross: false
 
           - target: aarch64-unknown-linux-gnu
             artifact: server-linux-arm64
+            use_cross: true
 
           - target: aarch64-unknown-linux-musl
             artifact: server-linux-arm64-musl
+            use_cross: true
 
     steps:
       - name: Checkout source
@@ -40,35 +44,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (ARM64)
-        if: contains(matrix.target, 'aarch64')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools musl-dev
 
-      - name: Install aarch64 musl cross compiler
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar -xzf aarch64-linux-musl-cross.tgz
-          echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-
-      - name: Configure linker
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-musl-gcc"
-          EOF
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -79,8 +63,13 @@ jobs:
             target
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release
+      - name: Build release (cargo)
+        if: ${{ !matrix.use_cross }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         run: |
