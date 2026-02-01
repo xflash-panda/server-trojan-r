@@ -38,6 +38,18 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
