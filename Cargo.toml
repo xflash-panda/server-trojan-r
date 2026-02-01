@@ -51,3 +51,7 @@ path = "src/main.rs"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.15"
+
+[profile.release]
+lto = "thin"
+strip = true
