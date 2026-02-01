@@ -30,8 +30,8 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 | `--api` | `X_PANDA_TROJAN_API` | API 地址 (必需) | - |
 | `--token` | `X_PANDA_TROJAN_TOKEN` | API 令牌 (必需) | - |
 | `--node` | `X_PANDA_TROJAN_NODE` | 节点 ID (必需) | - |
-| `--cert_file` | `X_PANDA_TROJAN_CERT_FILE` | TLS 证书路径 (必需) | - |
-| `--key_file` | `X_PANDA_TROJAN_KEY_FILE` | TLS 私钥路径 (必需) | - |
+| `--cert_file` | `X_PANDA_TROJAN_CERT_FILE` | TLS 证书路径 | /root/.cert/server.crt |
+| `--key_file` | `X_PANDA_TROJAN_KEY_FILE` | TLS 私钥路径 | /root/.cert/server.key |
 | `--fetch_users_interval` | `X_PANDA_TROJAN_FETCH_USERS_INTERVAL` | 用户同步间隔 | 60s |
 | `--report_traffics_interval` | `X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL` | 流量上报间隔 | 80s |
 | `--heartbeat_interval` | `X_PANDA_TROJAN_HEARTBEAT_INTERVAL` | 心跳间隔 | 180s |
@@ -56,7 +56,13 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ### 启动示例
 
 ```bash
-# 基本启动
+# 基本启动 (使用默认证书路径 /root/.cert/server.crt 和 /root/.cert/server.key)
+server-trojan \
+  --api https://panel.example.com/api \
+  --token your_api_token \
+  --node 1
+
+# 自定义证书路径
 server-trojan \
   --api https://panel.example.com/api \
   --token your_api_token \
@@ -68,8 +74,6 @@ server-trojan \
 export X_PANDA_TROJAN_API=https://panel.example.com/api
 export X_PANDA_TROJAN_TOKEN=your_api_token
 export X_PANDA_TROJAN_NODE=1
-export X_PANDA_TROJAN_CERT_FILE=/etc/ssl/cert.pem
-export X_PANDA_TROJAN_KEY_FILE=/etc/ssl/key.pem
 server-trojan
 ```
 

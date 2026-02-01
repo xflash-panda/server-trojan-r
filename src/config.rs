@@ -45,12 +45,20 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_NODE")]
     pub node: i64,
 
-    /// TLS certificate file path (required)
-    #[arg(long, env = "X_PANDA_TROJAN_CERT_FILE")]
+    /// TLS certificate file path (default: /root/.cert/server.crt)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_CERT_FILE",
+        default_value = "/root/.cert/server.crt"
+    )]
     pub cert_file: String,
 
-    /// TLS private key file path (required)
-    #[arg(long, env = "X_PANDA_TROJAN_KEY_FILE")]
+    /// TLS private key file path (default: /root/.cert/server.key)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_KEY_FILE",
+        default_value = "/root/.cert/server.key"
+    )]
     pub key_file: String,
 
     /// Interval for fetching users (e.g., "60s", "2m", default: 60s)
