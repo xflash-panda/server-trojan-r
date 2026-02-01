@@ -42,7 +42,7 @@ acl-engine-r = { git = "https://github.com/xflash-panda/acl-engine-r.git", tag =
 # API Client (remote)
 server-r-client = { git = "https://github.com/xflash-panda/server-r-client.git", tag = "v0.1.8" }
 hostname = "0.4"
-socket2 = "0.5"
+socket2 = "0.6"
 
 [[bin]]
 name = "server"
