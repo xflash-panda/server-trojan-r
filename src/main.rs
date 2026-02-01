@@ -117,7 +117,7 @@ async fn process_connection(
         Some(id) => id,
         None => {
             log::authentication(&peer_addr, false);
-            log::warn!(
+            log::debug!(
                 peer = %peer_addr,
                 transport = %meta.transport_type,
                 "Invalid user credentials"
@@ -157,7 +157,7 @@ async fn process_connection(
         }
         TrojanCmd::UdpAssociate => {
             // UDP support would be implemented here
-            log::warn!(peer = %peer_addr, "UDP associate not implemented in new architecture");
+            log::debug!(peer = %peer_addr, "UDP associate not implemented in new architecture");
             Err(anyhow!("UDP associate not implemented"))
         }
     }
@@ -232,11 +232,11 @@ async fn handle_direct_connect(
             stream
         }
         Ok(Err(e)) => {
-            log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
+            log::debug!(peer = %peer_addr, error = %e, "TCP connect failed");
             return Err(e.into());
         }
         Err(_) => {
-            log::warn!(peer = %peer_addr, "TCP connect timeout");
+            log::debug!(peer = %peer_addr, "TCP connect timeout");
             return Err(anyhow!("TCP connect timeout"));
         }
     };
@@ -265,7 +265,7 @@ async fn handle_direct_connect(
             match result {
                 Ok(r) if r.completed => {}
                 Ok(_) => {
-                    log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
+                    log::debug!(peer = %peer_addr, "Connection timeout due to inactivity");
                 }
                 Err(e) => {
                     log::debug!(peer = %peer_addr, error = %e, "Relay error");
@@ -390,7 +390,7 @@ where
                     log::debug!(peer = %peer_addr_for_log, "gRPC connection closed normally");
                 }
                 Err(e) => {
-                    log::warn!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
+                    log::debug!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
                 }
             }
             result
@@ -519,7 +519,7 @@ async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Resul
                                     Err(anyhow!("TLS handshake failed: {}", e))
                                 }
                                 Err(_) => {
-                                    log::warn!(peer = %peer_addr, "TLS handshake timeout");
+                                    log::debug!(peer = %peer_addr, "TLS handshake timeout");
                                     Err(anyhow!("TLS handshake timeout"))
                                 }
                             }

@@ -251,7 +251,7 @@ impl ApiManager {
         log::debug!(count = data.len(), "Submitting traffic data");
 
         self.client
-            .submit_with_agent(NodeType::Trojan, &register_id, data)
+            .submit(NodeType::Trojan, &register_id, data)
             .await?;
 
         log::debug!("Traffic data submitted");
