@@ -1812,7 +1812,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
+name = "server-r-client"
+version = "0.1.8"
+source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.8#966f97d45087c3ca506460bb9335ab8bf4a341e9"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "server-trojan-r"
 version = "0.1.2"
 dependencies = [
  "acl-engine-r",
@@ -1853,20 +1867,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "server-r-client"
-version = "0.1.8"
-source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.8#966f97d45087c3ca506460bb9335ab8bf4a341e9"
-dependencies = [
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
