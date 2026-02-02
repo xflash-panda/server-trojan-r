@@ -1,7 +1,7 @@
-//! Configuration module for Trojan server
+//! Configuration module for Trojan server (Agent version)
 //!
 //! This module handles CLI argument parsing with environment variable support.
-//! Configuration is fetched from remote panel API, not from local files.
+//! Configuration is fetched from gRPC panel API, not from local files.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -23,27 +23,27 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     })
 }
 
-/// Default data directory for state persistence (same as server-trojan Go version)
-const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-node";
+/// Default data directory for state persistence
+const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-agent-node";
 
-/// CLI arguments for the Trojan server
+/// CLI arguments for the Trojan server (Agent version with gRPC)
 ///
 /// Supports environment variables with X_PANDA_TROJAN_ prefix
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Trojan Server with Remote Panel Integration")]
+#[command(author, version, about = "Trojan Server Agent with gRPC Panel Integration")]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
-    /// API endpoint URL (required)
-    #[arg(long, env = "X_PANDA_TROJAN_API")]
-    pub api: String,
+    /// gRPC server host (e.g., "127.0.0.1")
+    #[arg(long = "server_host", env = "X_PANDA_TROJAN_SERVER_HOST", default_value = "127.0.0.1")]
+    pub server_host: String,
 
-    /// API authentication token (required)
-    #[arg(long, env = "X_PANDA_TROJAN_TOKEN")]
-    pub token: String,
+    /// gRPC server port (e.g., 8082)
+    #[arg(long = "port", env = "X_PANDA_TROJAN_PORT", default_value_t = 8082)]
+    pub port: u16,
 
     /// Node ID from the panel (required)
     #[arg(long, env = "X_PANDA_TROJAN_NODE")]
-    pub node: i64,
+    pub node: u32,
 
     /// TLS certificate file path (default: /root/.cert/server.crt)
     #[arg(
@@ -65,23 +65,23 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_FETCH_USERS_INTERVAL", default_value = "60s", value_parser = parse_duration)]
     pub fetch_users_interval: Duration,
 
-    /// Interval for reporting traffic (e.g., "80s", "2m", default: 80s)
-    #[arg(long, env = "X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL", default_value = "80s", value_parser = parse_duration)]
+    /// Interval for reporting traffic (e.g., "100s", "2m", default: 100s)
+    #[arg(long, env = "X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL", default_value = "100s", value_parser = parse_duration)]
     pub report_traffics_interval: Duration,
 
     /// Interval for sending heartbeat (e.g., "3m", "180s", default: 180s)
     #[arg(long, env = "X_PANDA_TROJAN_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
     pub heartbeat_interval: Duration,
 
-    /// API request timeout (e.g., "30s", "1m", default: 30s)
-    #[arg(long, env = "X_PANDA_TROJAN_API_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
+    /// gRPC API request timeout (e.g., "15s", default: 15s)
+    #[arg(long = "api_timeout", env = "X_PANDA_TROJAN_API_TIMEOUT", default_value = "15s", value_parser = parse_duration)]
     pub api_timeout: Duration,
 
     /// Log mode: debug, info, warn, error (default: info)
     #[arg(long, env = "X_PANDA_TROJAN_LOG_MODE", default_value = "info")]
     pub log_mode: String,
 
-    /// Data directory for state persistence (default: /var/lib/trojan-node)
+    /// Data directory for state persistence (default: /var/lib/trojan-agent-node)
     #[arg(long, env = "X_PANDA_TROJAN_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
     pub data_dir: PathBuf,
 
@@ -92,6 +92,10 @@ pub struct CliArgs {
     /// Block connections to private/loopback IP addresses (SSRF protection)
     #[arg(long, env = "X_PANDA_TROJAN_BLOCK_PRIVATE_IP", default_value_t = true)]
     pub block_private_ip: bool,
+
+    /// Force refresh geoip and geosite databases on startup
+    #[arg(long = "refresh_geodata", env = "X_PANDA_TROJAN_REFRESH_GEODATA", default_value_t = false)]
+    pub refresh_geodata: bool,
 
     // ==================== Performance Tuning ====================
     /// Connection idle timeout - disconnect if no data transferred (default: 5m)
@@ -141,25 +145,22 @@ impl CliArgs {
 
     /// Validate the CLI arguments
     pub fn validate(&self) -> Result<()> {
-        if self.api.is_empty() {
-            return Err(anyhow!("API endpoint URL is required"));
+        if self.server_host.is_empty() {
+            return Err(anyhow!("gRPC server host is required"));
         }
-        if self.token.is_empty() {
-            return Err(anyhow!("API token is required"));
-        }
-        if self.node <= 0 {
+        if self.node == 0 {
             return Err(anyhow!("Node ID must be a positive integer"));
         }
 
         // Validate TLS cert/key - both are required for Trojan protocol
         if self.cert_file.is_empty() {
             return Err(anyhow!(
-                "TLS certificate file path is required (--cert-file)"
+                "TLS certificate file path is required (--cert_file)"
             ));
         }
         if self.key_file.is_empty() {
             return Err(anyhow!(
-                "TLS private key file path is required (--key-file)"
+                "TLS private key file path is required (--key_file)"
             ));
         }
 
@@ -207,7 +208,7 @@ impl CliArgs {
 
     /// Get the state file path for register_id persistence
     pub fn get_state_file_path(&self) -> PathBuf {
-        self.data_dir.join(".trojan_state")
+        self.data_dir.join("state.json")
     }
 }
 
@@ -242,7 +243,7 @@ pub struct ConnConfig {
     pub idle_timeout: Duration,
     /// TCP connect timeout
     pub connect_timeout: Duration,
-    /// Request read timeout
+    /// Request timeout
     pub request_timeout: Duration,
     /// TLS handshake timeout
     pub tls_handshake_timeout: Duration,
@@ -362,15 +363,15 @@ mod tests {
 
     fn create_test_cli_args() -> CliArgs {
         CliArgs {
-            api: "https://api.example.com".to_string(),
-            token: "test-token".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            port: 8082,
             node: 1,
             cert_file: "/path/to/cert.pem".to_string(),
             key_file: "/path/to/key.pem".to_string(),
             fetch_users_interval: Duration::from_secs(60),
-            report_traffics_interval: Duration::from_secs(80),
+            report_traffics_interval: Duration::from_secs(100),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(30),
+            api_timeout: Duration::from_secs(15),
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -382,6 +383,7 @@ mod tests {
             tcp_backlog: 1024,
             tcp_nodelay: true,
             block_private_ip: true,
+            refresh_geodata: false,
         }
     }
 
@@ -395,19 +397,20 @@ mod tests {
         std::fs::write(&key_path, "dummy key").unwrap();
 
         let cli = CliArgs {
-            api: "https://api.example.com".to_string(),
-            token: "test-token".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            port: 8082,
             node: 1,
             cert_file: cert_path.to_string_lossy().to_string(),
             key_file: key_path.to_string_lossy().to_string(),
             fetch_users_interval: Duration::from_secs(60),
-            report_traffics_interval: Duration::from_secs(80),
+            report_traffics_interval: Duration::from_secs(100),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(30),
+            api_timeout: Duration::from_secs(15),
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
             block_private_ip: true,
+            refresh_geodata: false,
             conn_idle_timeout: Duration::from_secs(300),
             tcp_connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
@@ -424,7 +427,7 @@ mod tests {
         // Test that test helper creates valid default values
         let cli = create_test_cli_args();
         assert_eq!(cli.fetch_users_interval, Duration::from_secs(60));
-        assert_eq!(cli.report_traffics_interval, Duration::from_secs(80));
+        assert_eq!(cli.report_traffics_interval, Duration::from_secs(100));
         assert_eq!(cli.heartbeat_interval, Duration::from_secs(180));
     }
 
@@ -435,16 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_validate_empty_api() {
+    fn test_cli_args_validate_empty_server_host() {
         let mut cli = create_test_cli_args();
-        cli.api = "".to_string();
-        assert!(cli.validate().is_err());
-    }
-
-    #[test]
-    fn test_cli_args_validate_empty_token() {
-        let mut cli = create_test_cli_args();
-        cli.token = "".to_string();
+        cli.server_host = "".to_string();
         assert!(cli.validate().is_err());
     }
 
@@ -452,9 +448,6 @@ mod tests {
     fn test_cli_args_validate_invalid_node_id() {
         let mut cli = create_test_cli_args();
         cli.node = 0;
-        assert!(cli.validate().is_err());
-
-        cli.node = -1;
         assert!(cli.validate().is_err());
     }
 
@@ -523,12 +516,12 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.data_dir = PathBuf::from("/tmp/test-data");
         let state_file = cli.get_state_file_path();
-        assert_eq!(state_file, PathBuf::from("/tmp/test-data/.trojan_state"));
+        assert_eq!(state_file, PathBuf::from("/tmp/test-data/state.json"));
     }
 
     #[test]
     fn test_default_data_dir_value() {
-        assert_eq!(DEFAULT_DATA_DIR, "/var/lib/trojan-node");
+        assert_eq!(DEFAULT_DATA_DIR, "/var/lib/trojan-agent-node");
     }
 
     #[test]

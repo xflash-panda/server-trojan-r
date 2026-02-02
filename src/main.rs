@@ -1,9 +1,9 @@
-//! Trojan proxy server with layered architecture
+//! Trojan proxy server with layered architecture (Agent version with gRPC)
 //!
 //! Architecture:
 //! - `core/`: Core proxy logic with hook traits for extensibility
 //! - `transport/`: Transport layer abstraction (TCP, WebSocket, gRPC)
-//! - `business/`: Business implementations (API, auth, stats)
+//! - `business/`: Business implementations (gRPC API, auth, stats)
 
 mod acl;
 mod business;
@@ -42,8 +42,9 @@ use crate::transport::{ConnectionMeta, TransportStream, TransportType};
 async fn read_trojan_request(
     stream: &mut TransportStream,
     buf: &mut BytesMut,
-    buffer_size: usize,
+    conn_config: &config::ConnConfig,
 ) -> Result<TrojanRequest> {
+    let buffer_size = conn_config.buffer_size;
     let mut temp_buf = vec![0u8; buffer_size];
 
     loop {
@@ -105,7 +106,7 @@ async fn process_connection(
 
     let request = tokio::time::timeout(
         server.conn_config.request_timeout,
-        read_trojan_request(&mut stream, &mut buf, buffer_size),
+        read_trojan_request(&mut stream, &mut buf, &server.conn_config),
     )
     .await
     .map_err(|_| anyhow!("Request read timeout"))??;
@@ -298,6 +299,7 @@ fn build_transport_config(config: &config::ServerConfig) -> (TransportType, bool
 /// Build outbound router from ACL configuration
 async fn build_router(
     config: &config::ServerConfig,
+    refresh_geodata: bool,
 ) -> Result<Arc<dyn core::hooks::OutboundRouter>> {
     use crate::acl::AclRouter;
 
@@ -315,12 +317,15 @@ async fn build_router(
         }
 
         let acl_config = acl::load_acl_config(acl_path).await?;
-        let engine = acl::AclEngine::new(acl_config, Some(config.data_dir.as_path())).await?;
+        let engine =
+            acl::AclEngine::new(acl_config, Some(config.data_dir.as_path()), refresh_geodata)
+                .await?;
 
         log::info!(
             acl_file = %acl_path.display(),
             rules = engine.rule_count(),
             block_private_ip = config.block_private_ip,
+            refresh_geodata = refresh_geodata,
             "ACL router loaded"
         );
 
@@ -564,9 +569,10 @@ async fn main() -> Result<()> {
     logger::init_logger(&cli.log_mode);
 
     log::info!(
-        api = %cli.api,
+        grpc_host = %cli.server_host,
+        grpc_port = cli.port,
         node = cli.node,
-        "Starting Trojan server with layered architecture"
+        "Starting Trojan server agent with gRPC"
     );
 
     // Create connection manager (shared between core and business layers)
@@ -599,7 +605,7 @@ async fn main() -> Result<()> {
     let stats_collector = Arc::new(ApiStatsCollector::new());
 
     // Build router from ACL config
-    let router = build_router(&server_config).await?;
+    let router = build_router(&server_config, cli.refresh_geodata).await?;
 
     // Build connection config from CLI args
     let conn_config = config::ConnConfig::from_cli(&cli);

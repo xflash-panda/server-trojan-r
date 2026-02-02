@@ -1,6 +1,6 @@
-# Server Trojan-R
+# Server Trojan Agent
 
-高性能 Rust 实现的 Trojan 代理服务器节点，
+高性能 Rust 实现的 Trojan 代理服务器节点 (Agent 版本，使用 gRPC 通信)
 
 ## 特性
 
@@ -9,7 +9,7 @@
 - **ACL 规则引擎**: 支持 Direct、SOCKS5、HTTP、Reject 出站
 - **GeoIP/GeoSite**: 支持 MaxMind MMDB 和 Sing-box 规则格式
 - **SSRF 防护**: 默认阻止访问私有/回环地址
-- **API 集成**: 自动同步用户、上报流量、心跳保活
+- **gRPC 集成**: 通过 gRPC 自动同步用户、上报流量、心跳保活
 
 ## 安装
 
@@ -27,19 +27,20 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 | 参数 | 环境变量 | 说明 | 默认值 |
 |------|----------|------|--------|
-| `--api` | `X_PANDA_TROJAN_API` | API 地址 (必需) | - |
-| `--token` | `X_PANDA_TROJAN_TOKEN` | API 令牌 (必需) | - |
+| `--server_host` | `X_PANDA_TROJAN_SERVER_HOST` | gRPC 服务器地址 | 127.0.0.1 |
+| `--port` | `X_PANDA_TROJAN_PORT` | gRPC 服务器端口 | 8082 |
 | `--node` | `X_PANDA_TROJAN_NODE` | 节点 ID (必需) | - |
 | `--cert_file` | `X_PANDA_TROJAN_CERT_FILE` | TLS 证书路径 | /root/.cert/server.crt |
 | `--key_file` | `X_PANDA_TROJAN_KEY_FILE` | TLS 私钥路径 | /root/.cert/server.key |
 | `--fetch_users_interval` | `X_PANDA_TROJAN_FETCH_USERS_INTERVAL` | 用户同步间隔 | 60s |
-| `--report_traffics_interval` | `X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL` | 流量上报间隔 | 80s |
+| `--report_traffics_interval` | `X_PANDA_TROJAN_REPORT_TRAFFICS_INTERVAL` | 流量上报间隔 | 100s |
 | `--heartbeat_interval` | `X_PANDA_TROJAN_HEARTBEAT_INTERVAL` | 心跳间隔 | 180s |
-| `--api_timeout` | `X_PANDA_TROJAN_API_TIMEOUT` | API 请求超时 | 30s |
+| `--api_timeout` | `X_PANDA_TROJAN_API_TIMEOUT` | gRPC API 请求超时 | 15s |
 | `--log_mode` | `X_PANDA_TROJAN_LOG_MODE` | 日志级别 | info |
-| `--data_dir` | `X_PANDA_TROJAN_DATA_DIR` | 数据目录 | /var/lib/trojan-node |
+| `--data_dir` | `X_PANDA_TROJAN_DATA_DIR` | 数据目录 | /var/lib/trojan-agent-node |
 | `--acl_conf_file` | `X_PANDA_TROJAN_ACL_CONF_FILE` | ACL 配置文件 | - |
 | `--block_private_ip` | `X_PANDA_TROJAN_BLOCK_PRIVATE_IP` | 阻止私有IP访问 | true |
+| `--refresh_geodata` | `X_PANDA_TROJAN_REFRESH_GEODATA` | 强制刷新 GeoIP/GeoSite 数据 | false |
 
 #### 性能调优参数
 
@@ -47,7 +48,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 |------|----------|------|--------|
 | `--conn_idle_timeout` | `X_PANDA_TROJAN_CONN_IDLE_TIMEOUT` | 连接空闲超时 | 5m |
 | `--tcp_connect_timeout` | `X_PANDA_TROJAN_TCP_CONNECT_TIMEOUT` | TCP 连接超时 | 5s |
-| `--request_timeout` | `X_PANDA_TROJAN_REQUEST_TIMEOUT` | 请求读取超时 | 5s |
+| `--request_timeout` | `X_PANDA_TROJAN_REQUEST_TIMEOUT` | 请求头读取超时 | 5s |
 | `--tls_handshake_timeout` | `X_PANDA_TROJAN_TLS_HANDSHAKE_TIMEOUT` | TLS 握手超时 | 10s |
 | `--buffer_size` | `X_PANDA_TROJAN_BUFFER_SIZE` | 数据传输缓冲区大小 (字节) | 32768 |
 | `--tcp_backlog` | `X_PANDA_TROJAN_TCP_BACKLOG` | TCP 监听积压队列大小 | 1024 |
@@ -57,24 +58,24 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ```bash
 # 基本启动 (使用默认证书路径 /root/.cert/server.crt 和 /root/.cert/server.key)
-server-trojan \
-  --api https://panel.example.com/api \
-  --token your_api_token \
+server-trojan-agent \
+  --server_host 127.0.0.1 \
+  --port 8082 \
   --node 1
 
 # 自定义证书路径
-server-trojan \
-  --api https://panel.example.com/api \
-  --token your_api_token \
+server-trojan-agent \
+  --server_host 127.0.0.1 \
+  --port 8082 \
   --node 1 \
   --cert_file /etc/ssl/cert.pem \
   --key_file /etc/ssl/key.pem
 
 # 使用环境变量
-export X_PANDA_TROJAN_API=https://panel.example.com/api
-export X_PANDA_TROJAN_TOKEN=your_api_token
+export X_PANDA_TROJAN_SERVER_HOST=127.0.0.1
+export X_PANDA_TROJAN_PORT=8082
 export X_PANDA_TROJAN_NODE=1
-server-trojan
+server-trojan-agent
 ```
 
 ## ACL 配置

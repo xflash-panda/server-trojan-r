@@ -282,7 +282,16 @@ pub struct AclEngine {
 
 impl AclEngine {
     /// Create a new ACL engine from configuration
-    pub async fn new(config: AclConfig, data_dir: Option<&Path>) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `config` - ACL configuration
+    /// * `data_dir` - Optional data directory for geo data files
+    /// * `refresh_geodata` - If true, force refresh geo data files on startup
+    pub async fn new(
+        config: AclConfig,
+        data_dir: Option<&Path>,
+        refresh_geodata: bool,
+    ) -> Result<Self> {
         // Step 1: Parse outbounds into handler map
         let mut outbounds: HashMap<String, Arc<OutboundHandler>> = HashMap::new();
 
@@ -317,7 +326,7 @@ impl AclEngine {
             .map_err(|e| anyhow!("Failed to parse ACL rules: {}", e))?;
 
         // Step 5: Create geo loader
-        let geo_loader = if let Some(dir) = data_dir {
+        let mut geo_loader = if let Some(dir) = data_dir {
             AutoGeoLoader::new()
                 .with_data_dir(dir)
                 .with_geoip(GeoIpFormat::Mmdb)
@@ -327,6 +336,13 @@ impl AclEngine {
                 .with_geoip(GeoIpFormat::Mmdb)
                 .with_geosite(GeoSiteFormat::Sing)
         };
+
+        // Force refresh geodata if requested
+        if refresh_geodata {
+            use std::time::Duration;
+            geo_loader = geo_loader.with_update_interval(Duration::ZERO);
+            log::info!("Geo data refresh requested, will download latest files");
+        }
 
         // Step 6: Compile rules
         let compiled = acl_engine_r::compile(&text_rules, &outbounds, 4096, &geo_loader)
@@ -854,7 +870,7 @@ acl:
     - direct(all)
 "#;
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
-        let engine = AclEngine::new(config, None).await.unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
 
         assert_eq!(engine.rule_count(), 3);
     }
@@ -882,7 +898,7 @@ acl:
     - direct(all)
 "#;
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
-        let engine = AclEngine::new(config, None).await.unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
 
         // Test blocked domain
         let handler = engine.match_host("www.blocked.com", 443, Protocol::TCP);
@@ -905,7 +921,7 @@ acl:
     - direct(all)
 "#;
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
-        let engine = AclEngine::new(config, None).await.unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
 
         // UDP on port 443 should be rejected
         let handler = engine.match_host("example.com", 443, Protocol::UDP);
@@ -938,7 +954,7 @@ acl:
     - direct(all)
 "#;
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
-        let engine = AclEngine::new(config, None).await.unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
 
         // Port 22 should match warp (socks5)
         let handler = engine.match_host("any.host.com", 22, Protocol::TCP);
@@ -1028,7 +1044,7 @@ acl:
         // Create engine (without geo data, will skip geosite rules)
         // Note: This may fail if geosite rules are required and data_dir is not provided
         // For a full test with geosite, provide data_dir with actual geo files
-        let engine_result = AclEngine::new(config, None).await;
+        let engine_result = AclEngine::new(config, None, false).await;
 
         // If engine creation succeeds, test some rules
         if let Ok(engine) = engine_result {
@@ -1093,7 +1109,7 @@ acl:
         }
 
         let config = load_acl_config(acl_path).await.unwrap();
-        let engine = AclEngine::new(config, Some(data_dir)).await;
+        let engine = AclEngine::new(config, Some(data_dir), false).await;
 
         match engine {
             Ok(engine) => {
