@@ -184,100 +184,147 @@ async fn handle_connect(
 
     log::debug!(peer = %peer_addr, target = %target, outbound = ?outbound_type, "Connecting to target");
 
+    // Build connect context
+    let ctx = ConnectContext {
+        server,
+        client_stream,
+        target: &target,
+        initial_payload,
+        peer_addr: &peer_addr,
+        user_id,
+        cancel_token,
+    };
+
     // Connect based on outbound type
     match outbound_type {
-        core::hooks::OutboundType::Direct => {
-            handle_direct_connect(
-                server,
-                client_stream,
-                &target,
-                initial_payload,
-                &peer_addr,
-                user_id,
-                cancel_token,
-            )
-            .await
+        core::hooks::OutboundType::Direct => handle_direct_connect(ctx).await,
+        core::hooks::OutboundType::Proxy(handler) => handle_proxy_connect(ctx, handler).await,
+        core::hooks::OutboundType::Reject => Ok(()), // Already handled above
+    }
+}
+
+/// Context for handling outbound connections
+struct ConnectContext<'a> {
+    server: &'a Server,
+    client_stream: TransportStream,
+    target: &'a Address,
+    initial_payload: bytes::Bytes,
+    peer_addr: &'a str,
+    user_id: UserId,
+    cancel_token: CancellationToken,
+}
+
+impl<'a> ConnectContext<'a> {
+    /// Relay data between client and remote with stats tracking
+    async fn relay<S>(self, mut remote_stream: S) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        // Write initial payload if any
+        if !self.initial_payload.is_empty() {
+            self.server
+                .stats
+                .record_upload(self.user_id, self.initial_payload.len() as u64);
+            remote_stream.write_all(&self.initial_payload).await?;
         }
-        core::hooks::OutboundType::Reject => {
-            // Already handled above
-            Ok(())
+
+        // Relay data with stats tracking and cancellation support
+        let stats = Arc::clone(&self.server.stats);
+        let relay_fut = copy_bidirectional_with_stats(
+            self.client_stream,
+            remote_stream,
+            self.server.conn_config.idle_timeout_secs(),
+            Some((self.user_id, stats)),
+        );
+
+        tokio::select! {
+            result = relay_fut => {
+                match result {
+                    Ok(r) if r.completed => {}
+                    Ok(_) => {
+                        log::debug!(peer = %self.peer_addr, "Connection timeout due to inactivity");
+                    }
+                    Err(e) => {
+                        log::debug!(peer = %self.peer_addr, error = %e, "Relay error");
+                    }
+                }
+            }
+            _ = self.cancel_token.cancelled() => {
+                log::debug!(peer = %self.peer_addr, "Connection kicked by admin");
+            }
         }
+
+        Ok(())
     }
 }
 
 /// Handle direct connection
-async fn handle_direct_connect(
-    server: &Server,
-    client_stream: TransportStream,
-    target: &Address,
-    initial_payload: bytes::Bytes,
-    peer_addr: &str,
-    user_id: UserId,
-    cancel_token: CancellationToken,
-) -> Result<()> {
+async fn handle_direct_connect(ctx: ConnectContext<'_>) -> Result<()> {
     // Resolve target address
-    let remote_addr = target.to_socket_addr().await?;
+    let remote_addr = ctx.target.to_socket_addr().await?;
 
     // Connect with timeout
-    let mut remote_stream = match tokio::time::timeout(
-        server.conn_config.connect_timeout,
+    let remote_stream = match tokio::time::timeout(
+        ctx.server.conn_config.connect_timeout,
         TcpStream::connect(remote_addr),
     )
     .await
     {
         Ok(Ok(stream)) => {
-            if server.conn_config.tcp_nodelay {
+            if ctx.server.conn_config.tcp_nodelay {
                 let _ = stream.set_nodelay(true);
             }
             stream
         }
         Ok(Err(e)) => {
-            log::debug!(peer = %peer_addr, error = %e, "TCP connect failed");
+            log::debug!(peer = %ctx.peer_addr, error = %e, "TCP connect failed");
             return Err(e.into());
         }
         Err(_) => {
-            log::debug!(peer = %peer_addr, "TCP connect timeout");
+            log::debug!(peer = %ctx.peer_addr, "TCP connect timeout");
             return Err(anyhow!("TCP connect timeout"));
         }
     };
 
-    log::debug!(peer = %peer_addr, remote = %remote_addr, "Connected to remote (direct)");
+    log::debug!(peer = %ctx.peer_addr, remote = %remote_addr, "Connected to remote (direct)");
+    ctx.relay(remote_stream).await
+}
 
-    // Write initial payload if any
-    if !initial_payload.is_empty() {
-        server
-            .stats
-            .record_upload(user_id, initial_payload.len() as u64);
-        remote_stream.write_all(&initial_payload).await?;
-    }
+/// Handle proxy connection via ACL engine outbound handler
+async fn handle_proxy_connect(
+    ctx: ConnectContext<'_>,
+    handler: Arc<acl::OutboundHandler>,
+) -> Result<()> {
+    use acl::{Addr as AclAddr, AsyncOutbound};
 
-    // Relay data with stats tracking and cancellation support
-    let stats = Arc::clone(&server.stats);
-    let relay_fut = copy_bidirectional_with_stats(
-        client_stream,
-        remote_stream,
-        server.conn_config.idle_timeout_secs(),
-        Some((user_id, stats)),
-    );
+    // Convert Address to ACL Addr
+    let (host, port) = match ctx.target {
+        Address::IPv4(ip, port) => (std::net::Ipv4Addr::from(*ip).to_string(), *port),
+        Address::IPv6(ip, port) => (std::net::Ipv6Addr::from(*ip).to_string(), *port),
+        Address::Domain(domain, port) => (domain.clone(), *port),
+    };
+    let mut acl_addr = AclAddr::new(&host, port);
 
-    tokio::select! {
-        result = relay_fut => {
-            match result {
-                Ok(r) if r.completed => {}
-                Ok(_) => {
-                    log::debug!(peer = %peer_addr, "Connection timeout due to inactivity");
-                }
-                Err(e) => {
-                    log::debug!(peer = %peer_addr, error = %e, "Relay error");
-                }
-            }
+    // Connect via proxy with timeout
+    let remote_stream = match tokio::time::timeout(
+        ctx.server.conn_config.connect_timeout,
+        handler.dial_tcp(&mut acl_addr),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            log::debug!(peer = %ctx.peer_addr, target = %ctx.target, error = %e, "Proxy connect failed");
+            return Err(anyhow!("Proxy connect failed: {}", e));
         }
-        _ = cancel_token.cancelled() => {
-            log::debug!(peer = %peer_addr, "Connection kicked by admin");
+        Err(_) => {
+            log::debug!(peer = %ctx.peer_addr, target = %ctx.target, "Proxy connect timeout");
+            return Err(anyhow!("Proxy connect timeout"));
         }
-    }
+    };
 
-    Ok(())
+    log::debug!(peer = %ctx.peer_addr, target = %ctx.target, handler = ?handler, "Connected to remote (proxy)");
+    ctx.relay(remote_stream).await
 }
 
 /// Build transport configuration

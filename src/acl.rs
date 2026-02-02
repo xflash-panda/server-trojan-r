@@ -541,15 +541,9 @@ impl AclRouter {
         match self.engine.match_host(host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
                 OutboundHandler::Direct(_) => crate::core::hooks::OutboundType::Direct,
-                OutboundHandler::Socks5 { .. } => {
-                    // For SOCKS5, ACL engine handles the connection internally
-                    // The core layer just needs to know this isn't a direct connection
-                    // For now, return Direct as ACL engine will handle the proxy
-                    crate::core::hooks::OutboundType::Direct
-                }
-                OutboundHandler::Http(_) => {
-                    // For HTTP proxy, ACL engine handles the connection internally
-                    crate::core::hooks::OutboundType::Direct
+                OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
+                    // Return the proxy handler for core layer to use
+                    crate::core::hooks::OutboundType::Proxy(handler)
                 }
                 OutboundHandler::Reject(_) => crate::core::hooks::OutboundType::Reject,
             },

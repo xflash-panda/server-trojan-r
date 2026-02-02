@@ -34,12 +34,24 @@ pub trait OutboundRouter: Send + Sync {
 }
 
 /// Outbound type for routing decisions
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum OutboundType {
     /// Direct connection
     Direct,
     /// Reject connection
     Reject,
+    /// Proxy connection via ACL engine outbound handler
+    Proxy(std::sync::Arc<crate::acl::OutboundHandler>),
+}
+
+impl std::fmt::Debug for OutboundType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutboundType::Direct => write!(f, "Direct"),
+            OutboundType::Reject => write!(f, "Reject"),
+            OutboundType::Proxy(handler) => write!(f, "Proxy({:?})", handler),
+        }
+    }
 }
 
 /// Direct router - routes all traffic directly with optional private IP blocking
