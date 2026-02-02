@@ -131,6 +131,10 @@ pub struct CliArgs {
         help_heading = "Performance"
     )]
     pub tcp_nodelay: bool,
+
+    /// Refresh geodata files (geoip.dat, geosite.dat) on startup
+    #[arg(long, env = "X_PANDA_TROJAN_REFRESH_GEODATA", default_value_t = false)]
+    pub refresh_geodata: bool,
 }
 
 impl CliArgs {
@@ -207,7 +211,7 @@ impl CliArgs {
 
     /// Get the state file path for register_id persistence
     pub fn get_state_file_path(&self) -> PathBuf {
-        self.data_dir.join(".trojan_state")
+        self.data_dir.join("state.json")
     }
 }
 
@@ -382,6 +386,7 @@ mod tests {
             tcp_backlog: 1024,
             tcp_nodelay: true,
             block_private_ip: true,
+            refresh_geodata: false,
         }
     }
 
@@ -415,6 +420,7 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
+            refresh_geodata: false,
         };
         (cli, temp_dir)
     }
@@ -523,7 +529,7 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.data_dir = PathBuf::from("/tmp/test-data");
         let state_file = cli.get_state_file_path();
-        assert_eq!(state_file, PathBuf::from("/tmp/test-data/.trojan_state"));
+        assert_eq!(state_file, PathBuf::from("/tmp/test-data/state.json"));
     }
 
     #[test]

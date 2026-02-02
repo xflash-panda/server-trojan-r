@@ -298,6 +298,7 @@ fn build_transport_config(config: &config::ServerConfig) -> (TransportType, bool
 /// Build outbound router from ACL configuration
 async fn build_router(
     config: &config::ServerConfig,
+    refresh_geodata: bool,
 ) -> Result<Arc<dyn core::hooks::OutboundRouter>> {
     use crate::acl::AclRouter;
 
@@ -315,12 +316,15 @@ async fn build_router(
         }
 
         let acl_config = acl::load_acl_config(acl_path).await?;
-        let engine = acl::AclEngine::new(acl_config, Some(config.data_dir.as_path())).await?;
+        let engine =
+            acl::AclEngine::new(acl_config, Some(config.data_dir.as_path()), refresh_geodata)
+                .await?;
 
         log::info!(
             acl_file = %acl_path.display(),
             rules = engine.rule_count(),
             block_private_ip = config.block_private_ip,
+            refresh_geodata = refresh_geodata,
             "ACL router loaded"
         );
 
@@ -599,7 +603,7 @@ async fn main() -> Result<()> {
     let stats_collector = Arc::new(ApiStatsCollector::new());
 
     // Build router from ACL config
-    let router = build_router(&server_config).await?;
+    let router = build_router(&server_config, cli.refresh_geodata).await?;
 
     // Build connection config from CLI args
     let conn_config = config::ConnConfig::from_cli(&cli);

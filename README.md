@@ -40,6 +40,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 | `--data_dir` | `X_PANDA_TROJAN_DATA_DIR` | 数据目录 | /var/lib/trojan-node |
 | `--acl_conf_file` | `X_PANDA_TROJAN_ACL_CONF_FILE` | ACL 配置文件 | - |
 | `--block_private_ip` | `X_PANDA_TROJAN_BLOCK_PRIVATE_IP` | 阻止私有IP访问 | true |
+| `--refresh_geodata` | `X_PANDA_TROJAN_REFRESH_GEODATA` | 启动时刷新 GeoIP/GeoSite 数据 | false |
 
 #### 性能调优参数
 
