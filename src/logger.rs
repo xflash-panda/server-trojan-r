@@ -79,7 +79,10 @@ pub fn init_logger(log_level_str: &str) {
     let level = LogLevel::from_str(log_level_str).unwrap_or_default();
 
     let filter = tracing_subscriber::filter::Targets::new()
-        .with_targets(vec![("trojan_rs", level.to_level_filter())])
+        .with_targets(vec![
+            ("server_trojan_r", level.to_level_filter()),
+            ("server", level.to_level_filter()),
+        ])
         .with_default(LevelFilter::INFO);
 
     let registry = tracing_subscriber::registry();
