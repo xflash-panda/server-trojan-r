@@ -1,13 +1,13 @@
 //! gRPC API client for remote panel communication (Agent version)
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use server_r_agent_proto::pkg::{
     agent_client::AgentClient, ConfigRequest, ConfigResponse, HeartbeatRequest,
     NodeType as GrpcNodeType, RegisterRequest as GrpcRegisterRequest, SubmitRequest,
     UnregisterRequest, UsersRequest, VerifyRequest,
 };
-use server_r_client::models::{NodeType, TrojanConfig, parse_raw_config_response, unmarshal_users};
-use serde::{Deserialize, Serialize};
+use server_r_client::models::{parse_raw_config_response, unmarshal_users, NodeType, TrojanConfig};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -98,12 +98,6 @@ pub struct PanelConfig {
     pub server_port: u16,
     /// Node ID for this server
     pub node_id: u32,
-    /// Interval for fetching users from API
-    pub fetch_users_interval: Duration,
-    /// Interval for reporting traffic stats to API
-    pub report_traffics_interval: Duration,
-    /// Interval for sending heartbeat to API
-    pub heartbeat_interval: Duration,
     /// Data directory for persisting state and other data
     pub data_dir: PathBuf,
     /// API request timeout
@@ -117,9 +111,6 @@ impl PanelConfig {
             server_host: cli.server_host.clone(),
             server_port: cli.port,
             node_id: cli.node,
-            fetch_users_interval: cli.fetch_users_interval,
-            report_traffics_interval: cli.report_traffics_interval,
-            heartbeat_interval: cli.heartbeat_interval,
             data_dir: cli.data_dir.clone(),
             api_timeout: cli.api_timeout,
         }
@@ -153,7 +144,10 @@ impl ApiManager {
 
     /// Connect to the gRPC server
     async fn connect(&self) -> Result<AgentClient<Channel>> {
-        let endpoint = format!("http://{}:{}", self.config.server_host, self.config.server_port);
+        let endpoint = format!(
+            "http://{}:{}",
+            self.config.server_host, self.config.server_port
+        );
         let timeout = self.config.api_timeout;
         log::info!(
             endpoint = %endpoint,
@@ -185,12 +179,6 @@ impl ApiManager {
         let client = self.connect().await?;
         *self.client.write().await = Some(client.clone());
         Ok(client)
-    }
-
-    /// Reset the cached gRPC client to force reconnection on next request
-    pub async fn reset_client(&self) {
-        *self.client.write().await = None;
-        log::warn!("gRPC client reset, will reconnect on next request");
     }
 
     /// Get the state file path
@@ -385,9 +373,10 @@ impl ApiManager {
                 "Registering node"
             );
 
-            let register_id = self.register_node(hostname, port).await.map_err(|e| {
-                anyhow!("Failed to register node, cannot continue: {}", e)
-            })?;
+            let register_id = self
+                .register_node(hostname, port)
+                .await
+                .map_err(|e| anyhow!("Failed to register node, cannot continue: {}", e))?;
 
             log::info!(register_id = %register_id, "Node registered successfully");
 
@@ -459,8 +448,13 @@ impl ApiManager {
         let raw_data_str = String::from_utf8_lossy(&users_response.raw_data);
         log::debug!(raw_data = %raw_data_str, "Raw users data from server");
 
-        let parsed_users = unmarshal_users(&users_response.raw_data)
-            .map_err(|e| anyhow!("Failed to parse users response: {} - raw_data: {}", e, raw_data_str))?;
+        let parsed_users = unmarshal_users(&users_response.raw_data).map_err(|e| {
+            anyhow!(
+                "Failed to parse users response: {} - raw_data: {}",
+                e,
+                raw_data_str
+            )
+        })?;
 
         let users: Vec<User> = parsed_users
             .into_iter()
@@ -550,11 +544,6 @@ impl ApiManager {
         } else {
             Err(anyhow!("Heartbeat failed: server returned false"))
         }
-    }
-
-    /// Get panel config
-    pub fn panel_config(&self) -> &PanelConfig {
-        &self.config
     }
 }
 

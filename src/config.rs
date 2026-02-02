@@ -30,11 +30,19 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-agent-node";
 ///
 /// Supports environment variables with X_PANDA_TROJAN_ prefix
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Trojan Server Agent with gRPC Panel Integration")]
+#[command(
+    author,
+    version,
+    about = "Trojan Server Agent with gRPC Panel Integration"
+)]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
     /// gRPC server host (e.g., "127.0.0.1")
-    #[arg(long = "server_host", env = "X_PANDA_TROJAN_SERVER_HOST", default_value = "127.0.0.1")]
+    #[arg(
+        long = "server_host",
+        env = "X_PANDA_TROJAN_SERVER_HOST",
+        default_value = "127.0.0.1"
+    )]
     pub server_host: String,
 
     /// gRPC server port (e.g., 8082)
@@ -94,7 +102,11 @@ pub struct CliArgs {
     pub block_private_ip: bool,
 
     /// Force refresh geoip and geosite databases on startup
-    #[arg(long = "refresh_geodata", env = "X_PANDA_TROJAN_REFRESH_GEODATA", default_value_t = false)]
+    #[arg(
+        long = "refresh_geodata",
+        env = "X_PANDA_TROJAN_REFRESH_GEODATA",
+        default_value_t = false
+    )]
     pub refresh_geodata: bool,
 
     // ==================== Performance Tuning ====================
@@ -204,11 +216,6 @@ impl CliArgs {
         }
 
         Ok(())
-    }
-
-    /// Get the state file path for register_id persistence
-    pub fn get_state_file_path(&self) -> PathBuf {
-        self.data_dir.join("state.json")
     }
 }
 
@@ -509,14 +516,6 @@ mod tests {
         // Test invalid input
         assert!(parse_duration("invalid").is_err());
         assert!(parse_duration("").is_err());
-    }
-
-    #[test]
-    fn test_cli_args_get_state_file_path() {
-        let mut cli = create_test_cli_args();
-        cli.data_dir = PathBuf::from("/tmp/test-data");
-        let state_file = cli.get_state_file_path();
-        assert_eq!(state_file, PathBuf::from("/tmp/test-data/state.json"));
     }
 
     #[test]
