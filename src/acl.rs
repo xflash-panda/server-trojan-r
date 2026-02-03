@@ -100,9 +100,13 @@ pub struct Socks5Config {
     #[serde(default)]
     pub password: Option<String>,
 
-    /// Whether to allow UDP through this proxy
-    #[serde(default)]
+    /// Whether to allow UDP through this proxy (default: true)
+    #[serde(default = "default_allow_udp")]
     pub allow_udp: bool,
+}
+
+fn default_allow_udp() -> bool {
+    true
 }
 
 /// HTTP proxy configuration
@@ -239,7 +243,6 @@ impl OutboundHandler {
     }
 
     /// Check if this handler allows UDP
-    #[allow(dead_code)]
     pub fn allows_udp(&self) -> bool {
         match self {
             OutboundHandler::Direct(_) => true,
