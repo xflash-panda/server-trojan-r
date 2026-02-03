@@ -587,4 +587,235 @@ mod tests {
         // Empty domain should fail to resolve
         assert!(result.is_err());
     }
+
+    // Tests for Address helper methods
+
+    #[test]
+    fn test_address_host_ipv4() {
+        let addr = Address::IPv4([192, 168, 1, 1], 8080);
+        assert_eq!(addr.host(), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_address_host_ipv6() {
+        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
+        assert_eq!(addr.host(), "::1");
+    }
+
+    #[test]
+    fn test_address_host_domain() {
+        let addr = Address::Domain("example.com".to_string(), 80);
+        assert_eq!(addr.host(), "example.com");
+    }
+
+    #[test]
+    fn test_address_port() {
+        let ipv4 = Address::IPv4([127, 0, 0, 1], 8080);
+        assert_eq!(ipv4.port(), 8080);
+
+        let ipv6 = Address::IPv6([0; 16], 443);
+        assert_eq!(ipv6.port(), 443);
+
+        let domain = Address::Domain("test.com".to_string(), 53);
+        assert_eq!(domain.port(), 53);
+    }
+
+    #[test]
+    fn test_address_encode_ipv4() {
+        let addr = Address::IPv4([192, 168, 1, 1], 8080);
+        let mut buf = Vec::new();
+        let len = addr.encode(&mut buf);
+        assert_eq!(len, 7);
+        assert_eq!(buf, vec![1, 192, 168, 1, 1, 0x1F, 0x90]);
+    }
+
+    #[test]
+    fn test_address_encode_ipv6() {
+        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
+        let mut buf = Vec::new();
+        let len = addr.encode(&mut buf);
+        assert_eq!(len, 19);
+        assert_eq!(buf[0], 4); // ATYP_IPV6
+        assert_eq!(&buf[1..17], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(&buf[17..19], &[0x01, 0xBB]); // port 443
+    }
+
+    #[test]
+    fn test_address_encode_domain() {
+        let addr = Address::Domain("test.com".to_string(), 80);
+        let mut buf = Vec::new();
+        let len = addr.encode(&mut buf);
+        assert_eq!(len, 1 + 1 + 8 + 2); // ATYP + len + domain + port
+        assert_eq!(buf[0], 3); // ATYP_DOMAIN
+        assert_eq!(buf[1], 8); // domain length
+        assert_eq!(&buf[2..10], b"test.com");
+        assert_eq!(&buf[10..12], &[0x00, 0x50]); // port 80
+    }
+
+    #[test]
+    fn test_address_encode_decode_roundtrip() {
+        let original = Address::Domain("example.com".to_string(), 443);
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+
+        match Address::decode(&buf) {
+            DecodeResult::Ok(decoded, _) => {
+                assert_eq!(decoded, original);
+            }
+            _ => panic!("Failed to decode"),
+        }
+    }
+
+    // Tests for TrojanUdpPacket
+
+    #[test]
+    fn test_trojan_udp_packet_decode_ipv4() {
+        let mut buf = Vec::new();
+        // IPv4 address: 8.8.8.8:53
+        buf.push(1); // ATYP_IPV4
+        buf.extend_from_slice(&[8, 8, 8, 8]);
+        buf.extend_from_slice(&[0x00, 0x35]); // port 53
+        // Length: 5 bytes
+        buf.extend_from_slice(&[0x00, 0x05]);
+        // CRLF
+        buf.extend_from_slice(b"\r\n");
+        // Payload
+        buf.extend_from_slice(b"hello");
+
+        match TrojanUdpPacket::decode(&buf) {
+            DecodeResult::Ok(packet, consumed) => {
+                assert_eq!(consumed, 7 + 2 + 2 + 5); // addr + length + crlf + payload
+                assert!(matches!(packet.addr, Address::IPv4([8, 8, 8, 8], 53)));
+                assert_eq!(packet.payload.as_ref(), b"hello");
+            }
+            _ => panic!("Expected successful decode"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_decode_domain() {
+        let mut buf = Vec::new();
+        // Domain address: dns.google:53
+        buf.push(3); // ATYP_DOMAIN
+        buf.push(10); // domain length
+        buf.extend_from_slice(b"dns.google");
+        buf.extend_from_slice(&[0x00, 0x35]); // port 53
+        // Length: 4 bytes
+        buf.extend_from_slice(&[0x00, 0x04]);
+        // CRLF
+        buf.extend_from_slice(b"\r\n");
+        // Payload
+        buf.extend_from_slice(b"test");
+
+        match TrojanUdpPacket::decode(&buf) {
+            DecodeResult::Ok(packet, consumed) => {
+                assert_eq!(consumed, 1 + 1 + 10 + 2 + 2 + 2 + 4);
+                assert!(matches!(packet.addr, Address::Domain(ref d, 53) if d == "dns.google"));
+                assert_eq!(packet.payload.as_ref(), b"test");
+            }
+            _ => panic!("Expected successful decode"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_decode_need_more_data() {
+        // Too short
+        let buf = vec![1, 8, 8, 8, 8];
+        assert!(matches!(
+            TrojanUdpPacket::decode(&buf),
+            DecodeResult::NeedMoreData
+        ));
+
+        // Missing payload
+        let mut buf = Vec::new();
+        buf.push(1);
+        buf.extend_from_slice(&[8, 8, 8, 8]);
+        buf.extend_from_slice(&[0x00, 0x35]);
+        buf.extend_from_slice(&[0x00, 0x10]); // claims 16 bytes payload
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(b"short"); // only 5 bytes
+
+        assert!(matches!(
+            TrojanUdpPacket::decode(&buf),
+            DecodeResult::NeedMoreData
+        ));
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_decode_invalid_crlf() {
+        let mut buf = Vec::new();
+        buf.push(1);
+        buf.extend_from_slice(&[8, 8, 8, 8]);
+        buf.extend_from_slice(&[0x00, 0x35]);
+        buf.extend_from_slice(&[0x00, 0x05]);
+        buf.extend_from_slice(b"\n\r"); // Wrong order
+        buf.extend_from_slice(b"hello");
+
+        assert!(matches!(
+            TrojanUdpPacket::decode(&buf),
+            DecodeResult::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_encode() {
+        let addr = Address::IPv4([8, 8, 8, 8], 53);
+        let payload = b"hello";
+        let encoded = TrojanUdpPacket::encode(&addr, payload);
+
+        // Verify structure: addr(7) + length(2) + crlf(2) + payload(5) = 16
+        assert_eq!(encoded.len(), 16);
+        assert_eq!(&encoded[0..7], &[1, 8, 8, 8, 8, 0x00, 0x35]);
+        assert_eq!(&encoded[7..9], &[0x00, 0x05]); // length
+        assert_eq!(&encoded[9..11], b"\r\n");
+        assert_eq!(&encoded[11..16], b"hello");
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_encode_decode_roundtrip() {
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let payload = b"test payload data";
+
+        let encoded = TrojanUdpPacket::encode(&addr, payload);
+
+        match TrojanUdpPacket::decode(&encoded) {
+            DecodeResult::Ok(packet, consumed) => {
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(packet.addr, addr);
+                assert_eq!(packet.payload.as_ref(), payload);
+            }
+            _ => panic!("Failed to decode"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_empty_payload() {
+        let addr = Address::IPv4([1, 2, 3, 4], 80);
+        let payload: &[u8] = &[];
+
+        let encoded = TrojanUdpPacket::encode(&addr, payload);
+
+        match TrojanUdpPacket::decode(&encoded) {
+            DecodeResult::Ok(packet, _) => {
+                assert!(packet.payload.is_empty());
+            }
+            _ => panic!("Failed to decode"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_large_payload() {
+        let addr = Address::IPv4([1, 2, 3, 4], 80);
+        let payload = vec![0xAB; 1000];
+
+        let encoded = TrojanUdpPacket::encode(&addr, &payload);
+
+        match TrojanUdpPacket::decode(&encoded) {
+            DecodeResult::Ok(packet, _) => {
+                assert_eq!(packet.payload.len(), 1000);
+                assert!(packet.payload.iter().all(|&b| b == 0xAB));
+            }
+            _ => panic!("Failed to decode"),
+        }
+    }
 }
