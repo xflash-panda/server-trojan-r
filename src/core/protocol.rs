@@ -636,7 +636,10 @@ mod tests {
         let len = addr.encode(&mut buf);
         assert_eq!(len, 19);
         assert_eq!(buf[0], 4); // ATYP_IPV6
-        assert_eq!(&buf[1..17], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            &buf[1..17],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
         assert_eq!(&buf[17..19], &[0x01, 0xBB]); // port 443
     }
 
@@ -675,12 +678,9 @@ mod tests {
         buf.push(1); // ATYP_IPV4
         buf.extend_from_slice(&[8, 8, 8, 8]);
         buf.extend_from_slice(&[0x00, 0x35]); // port 53
-        // Length: 5 bytes
-        buf.extend_from_slice(&[0x00, 0x05]);
-        // CRLF
-        buf.extend_from_slice(b"\r\n");
-        // Payload
-        buf.extend_from_slice(b"hello");
+        buf.extend_from_slice(&[0x00, 0x05]); // length: 5 bytes
+        buf.extend_from_slice(b"\r\n"); // CRLF
+        buf.extend_from_slice(b"hello"); // Payload
 
         match TrojanUdpPacket::decode(&buf) {
             DecodeResult::Ok(packet, consumed) => {
@@ -700,12 +700,9 @@ mod tests {
         buf.push(10); // domain length
         buf.extend_from_slice(b"dns.google");
         buf.extend_from_slice(&[0x00, 0x35]); // port 53
-        // Length: 4 bytes
-        buf.extend_from_slice(&[0x00, 0x04]);
-        // CRLF
-        buf.extend_from_slice(b"\r\n");
-        // Payload
-        buf.extend_from_slice(b"test");
+        buf.extend_from_slice(&[0x00, 0x04]); // length: 4 bytes
+        buf.extend_from_slice(b"\r\n"); // CRLF
+        buf.extend_from_slice(b"test"); // Payload
 
         match TrojanUdpPacket::decode(&buf) {
             DecodeResult::Ok(packet, consumed) => {
