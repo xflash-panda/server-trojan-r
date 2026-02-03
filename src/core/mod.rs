@@ -15,6 +15,6 @@ mod server;
 
 pub use connection::ConnectionManager;
 pub use hooks::UserId;
-pub use protocol::{Address, DecodeResult, TrojanCmd, TrojanRequest};
+pub use protocol::{Address, DecodeResult, TrojanCmd, TrojanRequest, TrojanUdpPacket};
 pub use relay::copy_bidirectional_with_stats;
 pub use server::Server;

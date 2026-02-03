@@ -73,6 +73,48 @@ pub enum DecodeResult<T> {
 }
 
 impl Address {
+    /// Encode address to buffer
+    pub fn encode(&self, buf: &mut Vec<u8>) -> usize {
+        match self {
+            Address::IPv4(ip, port) => {
+                buf.push(ATYP_IPV4);
+                buf.extend_from_slice(ip);
+                buf.extend_from_slice(&port.to_be_bytes());
+                7
+            }
+            Address::IPv6(ip, port) => {
+                buf.push(ATYP_IPV6);
+                buf.extend_from_slice(ip);
+                buf.extend_from_slice(&port.to_be_bytes());
+                19
+            }
+            Address::Domain(domain, port) => {
+                let domain_bytes = domain.as_bytes();
+                buf.push(ATYP_DOMAIN);
+                buf.push(domain_bytes.len() as u8);
+                buf.extend_from_slice(domain_bytes);
+                buf.extend_from_slice(&port.to_be_bytes());
+                1 + 1 + domain_bytes.len() + 2
+            }
+        }
+    }
+
+    /// Get the port number
+    pub fn port(&self) -> u16 {
+        match self {
+            Address::IPv4(_, port) | Address::IPv6(_, port) | Address::Domain(_, port) => *port,
+        }
+    }
+
+    /// Get the host string (IP or domain)
+    pub fn host(&self) -> String {
+        match self {
+            Address::IPv4(ip, _) => Ipv4Addr::from(*ip).to_string(),
+            Address::IPv6(ip, _) => Ipv6Addr::from(*ip).to_string(),
+            Address::Domain(domain, _) => domain.clone(),
+        }
+    }
+
     /// Decode address from buffer
     pub fn decode(buf: &[u8]) -> DecodeResult<Self> {
         if buf.is_empty() {
@@ -253,6 +295,85 @@ impl TrojanRequest {
             },
             header_len,
         )
+    }
+}
+
+/// Trojan UDP packet format (within TCP stream)
+///
+/// Format: ATYP + DST.ADDR + DST.PORT + Length(2 bytes) + CRLF + Payload
+#[derive(Debug)]
+pub struct TrojanUdpPacket {
+    /// Target address
+    pub addr: Address,
+    /// UDP payload
+    pub payload: Bytes,
+}
+
+impl TrojanUdpPacket {
+    /// Minimum packet size: 1 (ATYP) + 4 (min addr) + 2 (port) + 2 (length) + 2 (CRLF) = 11
+    pub const MIN_SIZE: usize = 11;
+
+    /// Decode a single UDP packet from buffer
+    ///
+    /// Returns the decoded packet and consumed bytes count
+    pub fn decode(buf: &[u8]) -> DecodeResult<Self> {
+        if buf.len() < Self::MIN_SIZE {
+            return DecodeResult::NeedMoreData;
+        }
+
+        // Parse address
+        let (addr, addr_consumed) = match Address::decode(buf) {
+            DecodeResult::Ok(addr, consumed) => (addr, consumed),
+            DecodeResult::NeedMoreData => return DecodeResult::NeedMoreData,
+            DecodeResult::Invalid(msg) => return DecodeResult::Invalid(msg),
+        };
+
+        let length_pos = addr_consumed;
+
+        // Check if we have enough data for length + CRLF
+        if buf.len() < length_pos + 4 {
+            return DecodeResult::NeedMoreData;
+        }
+
+        // Parse payload length (2 bytes, big-endian)
+        let payload_len = u16::from_be_bytes([buf[length_pos], buf[length_pos + 1]]) as usize;
+
+        // Check CRLF after length
+        if buf[length_pos + 2] != b'\r' || buf[length_pos + 3] != b'\n' {
+            return DecodeResult::Invalid("missing CRLF after length");
+        }
+
+        let payload_start = length_pos + 4;
+        let total_len = payload_start + payload_len;
+
+        // Check if we have the complete payload
+        if buf.len() < total_len {
+            return DecodeResult::NeedMoreData;
+        }
+
+        let payload = Bytes::copy_from_slice(&buf[payload_start..total_len]);
+
+        DecodeResult::Ok(TrojanUdpPacket { addr, payload }, total_len)
+    }
+
+    /// Encode a UDP packet to bytes
+    pub fn encode(addr: &Address, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + payload.len());
+
+        // Encode address
+        addr.encode(&mut buf);
+
+        // Add length (2 bytes, big-endian)
+        let payload_len = payload.len() as u16;
+        buf.extend_from_slice(&payload_len.to_be_bytes());
+
+        // Add CRLF
+        buf.extend_from_slice(b"\r\n");
+
+        // Add payload
+        buf.extend_from_slice(payload);
+
+        buf
     }
 }
 
