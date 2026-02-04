@@ -180,38 +180,40 @@ where
         }
     };
 
-    let result = tokio::select! {
+    // Execute relay and capture result (success, timeout, or error)
+    let (completed, io_error) = tokio::select! {
         result = copy_task => {
-            let (a_to_b, b_to_a) = result?;
-            CopyResult {
-                a_to_b,
-                b_to_a,
-                completed: true,
+            match result {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e)),
             }
         }
-        _ = timeout_check => {
-            // Even on timeout, we have accurate traffic stats from counters
-            let a_to_b = counters.a_to_b.load(Ordering::Relaxed);
-            let b_to_a = counters.b_to_a.load(Ordering::Relaxed);
-            CopyResult {
-                a_to_b,
-                b_to_a,
-                completed: false,
-            }
-        }
+        _ = timeout_check => (false, None)
     };
 
-    // Record stats if provided
+    // Always get accurate traffic data from counters (real-time tracked)
+    let a_to_b = counters.a_to_b.load(Ordering::Relaxed);
+    let b_to_a = counters.b_to_a.load(Ordering::Relaxed);
+
+    // Always record traffic stats - regardless of success, timeout, or error
     if let Some((user_id, collector)) = stats {
-        if result.a_to_b > 0 {
-            collector.record_upload(user_id, result.a_to_b);
+        if a_to_b > 0 {
+            collector.record_upload(user_id, a_to_b);
         }
-        if result.b_to_a > 0 {
-            collector.record_download(user_id, result.b_to_a);
+        if b_to_a > 0 {
+            collector.record_download(user_id, b_to_a);
         }
     }
 
-    Ok(result)
+    // Return result based on execution outcome
+    match io_error {
+        Some(e) => Err(e),
+        None => Ok(CopyResult {
+            a_to_b,
+            b_to_a,
+            completed,
+        }),
+    }
 }
 
 #[cfg(test)]
