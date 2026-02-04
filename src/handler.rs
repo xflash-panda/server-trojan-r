@@ -231,9 +231,11 @@ impl<'a> ConnectContext<'a> {
         tokio::select! {
             result = relay_fut => {
                 match result {
-                    Ok(r) if r.completed => {}
-                    Ok(_) => {
-                        log::debug!(peer = %self.peer_addr, "Connection timeout due to inactivity");
+                    Ok(r) if r.completed => {
+                        log::trace!(peer = %self.peer_addr, up = r.a_to_b, down = r.b_to_a, "Relay completed");
+                    }
+                    Ok(r) => {
+                        log::debug!(peer = %self.peer_addr, up = r.a_to_b, down = r.b_to_a, "Connection timeout");
                     }
                     Err(e) => {
                         log::debug!(peer = %self.peer_addr, error = %e, "Relay error");
@@ -241,7 +243,7 @@ impl<'a> ConnectContext<'a> {
                 }
             }
             _ = self.cancel_token.cancelled() => {
-                log::debug!(peer = %self.peer_addr, "Connection kicked by admin");
+                log::debug!(peer = %self.peer_addr, "Connection kicked");
             }
         }
 
