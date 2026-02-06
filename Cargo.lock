@@ -1813,8 +1813,8 @@ dependencies = [
 
 [[package]]
 name = "server-r-client"
-version = "0.1.8"
-source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.8#966f97d45087c3ca506460bb9335ab8bf4a341e9"
+version = "0.1.9"
+source = "git+https://github.com/xflash-panda/server-r-client.git?tag=v0.1.9#077baeb3d2232e20cd78bf95e975bb8f16fe8e5a"
 dependencies = [
  "reqwest",
  "serde",
@@ -1827,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "server-trojan-r"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "acl-engine-r",
  "anyhow",

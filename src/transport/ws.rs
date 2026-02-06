@@ -15,6 +15,9 @@ use tokio_tungstenite::{tungstenite::Message, WebSocketStream as TungsteniteStre
 /// Initial write buffer capacity (4KB - typical MTU size)
 const INITIAL_WRITE_BUFFER_CAPACITY: usize = 4 * 1024;
 
+/// Maximum write buffer size to prevent memory exhaustion (512KB)
+const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
+
 /// WebSocket transport wrapper
 ///
 /// Implements AsyncRead + AsyncWrite to provide a unified stream interface
@@ -147,6 +150,14 @@ where
             }
         }
 
+        // Check buffer size limit to prevent memory exhaustion
+        if self.write_buffer.len() + buf.len() > MAX_WRITE_BUFFER_SIZE {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "WebSocket write buffer exceeded limit",
+            )));
+        }
+
         // Add new data to buffer
         self.write_buffer.extend_from_slice(buf);
 
@@ -221,5 +232,12 @@ mod tests {
     #[test]
     fn test_initial_buffer_capacity() {
         assert_eq!(INITIAL_WRITE_BUFFER_CAPACITY, 4 * 1024);
+    }
+
+    #[test]
+    fn test_max_write_buffer_size() {
+        assert_eq!(MAX_WRITE_BUFFER_SIZE, 512 * 1024);
+        // Compile-time check: max > initial
+        const _: () = assert!(MAX_WRITE_BUFFER_SIZE > INITIAL_WRITE_BUFFER_CAPACITY);
     }
 }

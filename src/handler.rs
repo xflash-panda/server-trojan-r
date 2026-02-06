@@ -320,6 +320,9 @@ async fn handle_proxy_connect(
     ctx.relay(remote_stream).await
 }
 
+/// Maximum UDP read buffer size to prevent memory exhaustion
+const UDP_MAX_READ_BUFFER_SIZE: usize = 256 * 1024; // 256KB
+
 /// Handle UDP ASSOCIATE command
 async fn handle_udp_associate(
     server: &Server,
@@ -332,8 +335,8 @@ async fn handle_udp_associate(
 ) -> Result<()> {
     use acl::{Addr as AclAddr, AsyncOutbound, AsyncUdpConn};
 
-    // Buffer for reading UDP packets from TCP stream
-    let mut read_buf = BytesMut::new();
+    // Buffer for reading UDP packets from TCP stream (with size limit)
+    let mut read_buf = BytesMut::with_capacity(8 * 1024); // Start with 8KB
     if !initial_payload.is_empty() {
         read_buf.extend_from_slice(&initial_payload);
     }
@@ -359,6 +362,16 @@ async fn handle_udp_associate(
                     }
                 };
 
+                // Check buffer size limit to prevent memory exhaustion
+                if read_buf.len() + n > UDP_MAX_READ_BUFFER_SIZE {
+                    log::warn!(
+                        peer = %peer_addr,
+                        buffer_size = read_buf.len(),
+                        "UDP read buffer exceeded limit, closing connection"
+                    );
+                    break;
+                }
+
                 read_buf.extend_from_slice(&temp_buf[..n]);
 
                 // Process all complete UDP packets in buffer
@@ -378,12 +391,17 @@ async fn handle_udp_associate(
                                 hooks::OutboundType::Direct => {
                                     // For direct, we need to create a UDP connection if not exists
                                     if udp_conn.is_none() || current_handler.is_some() {
+                                        // Explicitly drop old connection to release resources
+                                        if let Some(old_conn) = udp_conn.take() {
+                                            drop(old_conn);
+                                        }
+                                        current_handler = None;
+
                                         let direct = acl::Direct::new();
                                         let mut acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
                                         match direct.dial_udp(&mut acl_addr).await {
                                             Ok(conn) => {
                                                 udp_conn = Some(conn);
-                                                current_handler = None;
                                             }
                                             Err(e) => {
                                                 log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create direct UDP connection");
@@ -406,6 +424,11 @@ async fn handle_udp_associate(
                                     };
 
                                     if need_new_conn {
+                                        // Explicitly drop old connection to release resources
+                                        if let Some(old_conn) = udp_conn.take() {
+                                            drop(old_conn);
+                                        }
+
                                         let mut acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
                                         match handler.dial_udp(&mut acl_addr).await {
                                             Ok(conn) => {

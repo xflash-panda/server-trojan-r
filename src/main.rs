@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         Arc::clone(&user_manager),
         Arc::clone(&stats_collector),
     );
-    background_tasks.start();
+    let background_handle = background_tasks.start();
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
 
     // Setup shutdown handler
     let api_for_shutdown = Arc::clone(&api_manager);
-    tokio::spawn(async move {
+    let shutdown_handle = tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -142,6 +142,26 @@ async fn main() -> Result<()> {
             log::info!("Shutdown signal received...");
         }
 
+        cancel_token_clone.cancel();
+
+        // Return the api_manager for shutdown operations
+        api_for_shutdown
+    });
+
+    // Run server (will run until cancel_token is cancelled or error)
+    let server_result = tokio::select! {
+        result = server_runner::run_server(server, &server_config) => result,
+        _ = cancel_token.cancelled() => Ok(()),
+    };
+
+    // Graceful shutdown sequence
+    log::info!("Server stopped, performing graceful shutdown...");
+
+    // Wait for shutdown handler to complete and get api_manager
+    if let Ok(api_for_shutdown) = shutdown_handle.await {
+        // Shutdown background tasks first (ensures final traffic report is sent)
+        background_handle.shutdown().await;
+
         // Unregister node
         log::info!("Unregistering node...");
         if let Err(e) = api_for_shutdown.unregister().await {
@@ -149,12 +169,8 @@ async fn main() -> Result<()> {
         } else {
             log::info!("Node unregistered successfully");
         }
+    }
 
-        cancel_token_clone.cancel();
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        std::process::exit(0);
-    });
-
-    // Run server
-    server_runner::run_server(server, &server_config).await
+    log::info!("Shutdown complete");
+    server_result
 }

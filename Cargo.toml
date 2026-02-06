@@ -1,6 +1,6 @@
 [package]
 name = "server-trojan-r"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 
 [dependencies]
@@ -41,7 +41,7 @@ async-trait = "0.1"
 acl-engine-r = { git = "https://github.com/xflash-panda/acl-engine-r.git", tag = "v0.3.0", features = ["async"] }
 
 # API Client (remote)
-server-r-client = { git = "https://github.com/xflash-panda/server-r-client.git", tag = "v0.1.8" }
+server-r-client = { git = "https://github.com/xflash-panda/server-r-client.git", tag = "v0.1.9" }
 hostname = "0.4"
 socket2 = "0.6"
 
