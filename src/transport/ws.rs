@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn test_max_write_buffer_size() {
         assert_eq!(MAX_WRITE_BUFFER_SIZE, 512 * 1024);
-        // Ensure max > initial
-        assert!(MAX_WRITE_BUFFER_SIZE > INITIAL_WRITE_BUFFER_CAPACITY);
+        // Compile-time check: max > initial
+        const _: () = assert!(MAX_WRITE_BUFFER_SIZE > INITIAL_WRITE_BUFFER_CAPACITY);
     }
 }
