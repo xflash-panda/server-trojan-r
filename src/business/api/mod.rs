@@ -12,5 +12,5 @@ mod tasks;
 mod user_manager;
 
 pub use client::ApiManager;
-pub use tasks::{BackgroundTasks, TaskConfig};
+pub use tasks::{BackgroundTasks, BackgroundTasksHandle, TaskConfig};
 pub use user_manager::UserManager;

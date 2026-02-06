@@ -18,6 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+/// Maximum UDP read buffer size to prevent memory exhaustion
+const UDP_MAX_READ_BUFFER_SIZE: usize = 256 * 1024; // 256KB
+
 /// Read and decode a complete Trojan request from the stream
 ///
 /// This function handles partial reads by continuing to read until
@@ -357,6 +360,16 @@ async fn handle_udp_associate(
                         break;
                     }
                     Ok(n) => {
+                        // Check buffer size limit to prevent memory exhaustion
+                        if pending_data.len() + n > UDP_MAX_READ_BUFFER_SIZE {
+                            log::warn!(
+                                peer = %peer_addr,
+                                buffer_size = pending_data.len(),
+                                "UDP read buffer exceeded limit, closing connection"
+                            );
+                            break;
+                        }
+
                         pending_data.extend_from_slice(&read_buf[..n]);
 
                         // Process all complete UDP packets in buffer
@@ -377,12 +390,17 @@ async fn handle_udp_associate(
                                         hooks::OutboundType::Direct => {
                                             // For direct, we need to create a UDP connection if not exists
                                             if udp_conn.is_none() || current_handler.is_some() {
+                                                // Explicitly drop old connection to release resources
+                                                if let Some(old_conn) = udp_conn.take() {
+                                                    drop(old_conn);
+                                                }
+                                                current_handler = None;
+
                                                 let direct = acl::Direct::new();
                                                 let mut acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
                                                 match direct.dial_udp(&mut acl_addr).await {
                                                     Ok(conn) => {
                                                         udp_conn = Some(conn);
-                                                        current_handler = None;
                                                     }
                                                     Err(e) => {
                                                         log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create direct UDP connection");
@@ -404,6 +422,11 @@ async fn handle_udp_associate(
                                             };
 
                                             if need_new_conn {
+                                                // Explicitly drop old connection to release resources
+                                                if let Some(old_conn) = udp_conn.take() {
+                                                    drop(old_conn);
+                                                }
+
                                                 let mut acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
                                                 match handler.dial_udp(&mut acl_addr).await {
                                                     Ok(conn) => {

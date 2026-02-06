@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
         Arc::clone(&user_manager),
         Arc::clone(&stats_collector),
     );
-    background_tasks.start();
+    let tasks_handle = background_tasks.start();
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
 
     // Setup shutdown handler
     let api_for_shutdown = Arc::clone(&api_manager);
-    tokio::spawn(async move {
+    let shutdown_handle = tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -153,10 +153,17 @@ async fn main() -> Result<()> {
         }
 
         cancel_token_clone.cancel();
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        std::process::exit(0);
     });
 
-    // Run server
-    server_runner::run_server(server, &server_config).await
+    // Run server until shutdown
+    let result = server_runner::run_server(server, &server_config).await;
+
+    // Wait for shutdown signal to complete
+    let _ = shutdown_handle.await;
+
+    // Gracefully shutdown background tasks
+    tasks_handle.shutdown().await;
+
+    log::info!("Server shutdown complete");
+    result
 }

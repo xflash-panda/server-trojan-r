@@ -9,7 +9,7 @@ pub mod api;
 mod auth;
 mod stats;
 
-pub use api::{ApiManager, BackgroundTasks, TaskConfig, UserManager};
+pub use api::{ApiManager, BackgroundTasks, BackgroundTasksHandle, TaskConfig, UserManager};
 pub use auth::ApiAuthenticator;
 pub use stats::ApiStatsCollector;
 

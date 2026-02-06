@@ -4,6 +4,7 @@ use super::client::UserTraffic;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::client::ApiManager;
@@ -66,8 +67,32 @@ pub struct BackgroundTasks {
     api_manager: Arc<ApiManager>,
     user_manager: Arc<UserManager>,
     stats_collector: Arc<ApiStatsCollector>,
-    shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+/// Handle for running background tasks with graceful shutdown support
+pub struct BackgroundTasksHandle {
+    shutdown_tx: watch::Sender<bool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl BackgroundTasksHandle {
+    /// Gracefully shutdown all background tasks
+    pub async fn shutdown(self) {
+        log::info!("Stopping background tasks...");
+        let _ = self.shutdown_tx.send(true);
+
+        for (i, handle) in self.handles.into_iter().enumerate() {
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => log::debug!(task = i, "Background task stopped"),
+                Ok(Err(e)) => log::warn!(task = i, error = %e, "Background task panicked"),
+                Err(_) => log::warn!(task = i, "Background task shutdown timeout"),
+            }
+        }
+
+        log::info!("Background tasks stopped");
+    }
 }
 
 impl BackgroundTasks {
@@ -89,23 +114,23 @@ impl BackgroundTasks {
         }
     }
 
-    /// Start all background tasks
-    pub fn start(&self) {
-        self.start_fetch_users_task();
-        self.start_report_traffic_task();
-        self.start_heartbeat_task();
+    /// Start all background tasks and return a handle for shutdown
+    pub fn start(self) -> BackgroundTasksHandle {
+        let handles = vec![
+            self.start_fetch_users_task(),
+            self.start_report_traffic_task(),
+            self.start_heartbeat_task(),
+        ];
         log::info!("Background tasks started");
-    }
 
-    /// Stop all background tasks
-    #[allow(dead_code)]
-    pub fn stop(&self) {
-        let _ = self.shutdown_tx.send(true);
-        log::info!("Background tasks stopped");
+        BackgroundTasksHandle {
+            shutdown_tx: self.shutdown_tx,
+            handles,
+        }
     }
 
     /// Start the fetch users task
-    fn start_fetch_users_task(&self) {
+    fn start_fetch_users_task(&self) -> JoinHandle<()> {
         let api_manager = Arc::clone(&self.api_manager);
         let user_manager = Arc::clone(&self.user_manager);
         let interval_duration = self.config.fetch_users_interval;
@@ -128,11 +153,11 @@ impl BackgroundTasks {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Start the report traffic task
-    fn start_report_traffic_task(&self) {
+    fn start_report_traffic_task(&self) -> JoinHandle<()> {
         let api_manager = Arc::clone(&self.api_manager);
         let stats_collector = Arc::clone(&self.stats_collector);
         let interval_duration = self.config.report_traffic_interval;
@@ -159,11 +184,11 @@ impl BackgroundTasks {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Start the heartbeat task
-    fn start_heartbeat_task(&self) {
+    fn start_heartbeat_task(&self) -> JoinHandle<()> {
         let api_manager = Arc::clone(&self.api_manager);
         let interval_duration = self.config.heartbeat_interval;
         let mut shutdown_rx = self.shutdown_rx.clone();
@@ -188,7 +213,7 @@ impl BackgroundTasks {
                     }
                 }
             }
-        });
+        })
     }
 }
 
