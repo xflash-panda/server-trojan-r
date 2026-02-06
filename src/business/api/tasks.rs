@@ -170,7 +170,9 @@ impl BackgroundTasks {
 
         tokio::spawn(async move {
             let mut interval = interval(interval_duration);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Use Delay instead of Skip to ensure heartbeat is sent as soon as possible
+            // after a slow/failed request, rather than skipping the next tick
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
