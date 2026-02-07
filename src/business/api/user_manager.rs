@@ -13,8 +13,6 @@ use crate::logger::log;
 pub struct UserManager {
     /// Current users map: password_hex -> user_id
     users: Arc<RwLock<HashMap<[u8; 56], UserId>>>,
-    /// Current user IDs set for quick lookup
-    user_ids: Arc<RwLock<HashSet<UserId>>>,
     /// Connection manager for kick-off
     connections: ConnectionManager,
 }
@@ -24,7 +22,6 @@ impl UserManager {
     pub fn new(connections: ConnectionManager) -> Self {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
-            user_ids: Arc::new(RwLock::new(HashSet::new())),
             connections,
         }
     }
@@ -43,15 +40,11 @@ impl UserManager {
     /// Initialize with users
     pub async fn init(&self, users: &[User]) {
         let mut users_map = self.users.write().await;
-        let mut user_ids = self.user_ids.write().await;
-
         users_map.clear();
-        user_ids.clear();
 
         for user in users {
             let hex = password_to_hex(&user.uuid);
             users_map.insert(hex, user.id);
-            user_ids.insert(user.id);
         }
 
         log::info!(count = users.len(), "Users initialized");
@@ -61,62 +54,67 @@ impl UserManager {
     ///
     /// - Add new users
     /// - Remove deleted users and kick their connections
-    pub async fn update(&self, new_users: &[User]) -> (usize, usize, usize) {
+    /// - Detect UUID changes and kick affected connections
+    pub async fn update(&self, new_users: &[User]) -> (usize, usize, usize, usize) {
         let mut users_map = self.users.write().await;
-        let mut user_ids = self.user_ids.write().await;
 
-        // Build new user set
+        // Build new map and user_id set
+        let mut new_map: HashMap<[u8; 56], UserId> = HashMap::with_capacity(new_users.len());
         let new_user_ids: HashSet<UserId> = new_users.iter().map(|u| u.id).collect();
 
-        // Find users to remove (in current but not in new)
-        let to_remove: Vec<UserId> = user_ids.difference(&new_user_ids).copied().collect();
+        for user in new_users {
+            let hex = password_to_hex(&user.uuid);
+            new_map.insert(hex, user.id);
+        }
 
-        // Find users to add (in new but not in current)
-        let to_add: Vec<&User> = new_users
-            .iter()
-            .filter(|u| !user_ids.contains(&u.id))
-            .collect();
+        // Collect old user_ids from current map
+        let old_user_ids: HashSet<UserId> = users_map.values().copied().collect();
 
-        let added = to_add.len();
-        let removed = to_remove.len();
+        let added = new_user_ids.difference(&old_user_ids).count();
+        let removed = old_user_ids.difference(&new_user_ids).count();
+        let mut uuid_changed = 0;
         let mut kicked = 0;
 
-        // Remove old users - single O(n) pass instead of O(n) per user
-        if !to_remove.is_empty() {
-            let to_remove_set: HashSet<UserId> = to_remove.iter().copied().collect();
+        // Kick removed users
+        for user_id in old_user_ids.difference(&new_user_ids) {
+            let k = self.connections.kick_user(*user_id);
+            kicked += k;
+            if k > 0 {
+                log::info!(user_id = user_id, kicked = k, "User removed and kicked");
+            }
+        }
 
-            // Single retain call - O(n) total instead of O(n²)
-            users_map.retain(|_, id| !to_remove_set.contains(id));
-
-            // Update user_ids and kick connections
-            for user_id in &to_remove {
-                user_ids.remove(user_id);
-                let k = self.connections.kick_user(*user_id);
-                kicked += k;
-                if k > 0 {
-                    log::info!(user_id = user_id, kicked = k, "User removed and kicked");
+        // Kick users with UUID changes
+        for (new_hex, &new_id) in &new_map {
+            if old_user_ids.contains(&new_id) {
+                // User exists in old map, check if password_hex changed
+                if users_map.get(new_hex) != Some(&new_id) {
+                    // UUID changed
+                    uuid_changed += 1;
+                    let k = self.connections.kick_user(new_id);
+                    kicked += k;
+                    if k > 0 {
+                        log::info!(user_id = new_id, kicked = k, "User UUID changed and kicked");
+                    }
                 }
             }
         }
 
-        // Add new users
-        for user in to_add {
-            let hex = password_to_hex(&user.uuid);
-            users_map.insert(hex, user.id);
-            user_ids.insert(user.id);
-        }
+        // Replace map
+        *users_map = new_map;
 
-        if added > 0 || removed > 0 {
+        if added > 0 || removed > 0 || uuid_changed > 0 {
             log::info!(
                 added = added,
                 removed = removed,
+                uuid_changed = uuid_changed,
                 kicked = kicked,
                 total = users_map.len(),
                 "Users updated"
             );
         }
 
-        (added, removed, kicked)
+        (added, removed, uuid_changed, kicked)
     }
 
     /// Get user count
@@ -169,9 +167,10 @@ mod tests {
             create_user(3, "uuid-3"),
         ];
 
-        let (added, removed, kicked) = user_manager.update(&new_users).await;
+        let (added, removed, uuid_changed, kicked) = user_manager.update(&new_users).await;
         assert_eq!(added, 2);
         assert_eq!(removed, 0);
+        assert_eq!(uuid_changed, 0);
         assert_eq!(kicked, 0);
         assert_eq!(user_manager.user_count().await, 3);
     }
@@ -190,9 +189,10 @@ mod tests {
 
         let new_users = vec![create_user(1, "uuid-1")];
 
-        let (added, removed, _kicked) = user_manager.update(&new_users).await;
+        let (added, removed, uuid_changed, _kicked) = user_manager.update(&new_users).await;
         assert_eq!(added, 0);
         assert_eq!(removed, 2);
+        assert_eq!(uuid_changed, 0);
         assert_eq!(user_manager.user_count().await, 1);
     }
 
@@ -206,9 +206,33 @@ mod tests {
 
         let new_users = vec![create_user(2, "uuid-2"), create_user(3, "uuid-3")];
 
-        let (added, removed, _kicked) = user_manager.update(&new_users).await;
+        let (added, removed, uuid_changed, _kicked) = user_manager.update(&new_users).await;
         assert_eq!(added, 1);
         assert_eq!(removed, 1);
+        assert_eq!(uuid_changed, 0);
+        assert_eq!(user_manager.user_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_user_manager_update_uuid_changed() {
+        let conn_manager = ConnectionManager::new();
+
+        // Register a connection for user 1
+        let (_, _token) = conn_manager.register(1, "127.0.0.1:1234".to_string());
+
+        let user_manager = UserManager::new(conn_manager);
+
+        let initial_users = vec![create_user(1, "uuid-1"), create_user(2, "uuid-2")];
+        user_manager.init(&initial_users).await;
+
+        // User 1's UUID changed from "uuid-1" to "uuid-1-new"
+        let new_users = vec![create_user(1, "uuid-1-new"), create_user(2, "uuid-2")];
+
+        let (added, removed, uuid_changed, kicked) = user_manager.update(&new_users).await;
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(uuid_changed, 1);
+        assert_eq!(kicked, 1);
         assert_eq!(user_manager.user_count().await, 2);
     }
 
@@ -239,7 +263,7 @@ mod tests {
 
         // Remove user 1
         let new_users: Vec<User> = vec![];
-        let (_added, removed, kicked) = user_manager.update(&new_users).await;
+        let (_added, removed, _uuid_changed, kicked) = user_manager.update(&new_users).await;
 
         assert_eq!(removed, 1);
         assert_eq!(kicked, 1);
