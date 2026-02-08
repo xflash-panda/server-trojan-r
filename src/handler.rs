@@ -343,6 +343,7 @@ async fn handle_udp_associate(
 
     // UDP relay loop
     let mut temp_buf = vec![0u8; 65536];
+    let mut udp_recv_buf = vec![0u8; 65536];
     let mut udp_conn: Option<Box<dyn AsyncUdpConn>> = None;
     let mut current_handler: Option<Arc<acl::OutboundHandler>> = None;
 
@@ -468,23 +469,22 @@ async fn handle_udp_associate(
                 }
             }
 
-            // Read from UDP connection (if exists)
+            // Read from UDP connection (if exists), reusing pre-allocated buffer
             result = async {
                 if let Some(ref conn) = udp_conn {
-                    let mut buf = vec![0u8; 65536];
-                    conn.read_from(&mut buf).await.map(|(n, addr)| (n, addr, buf))
+                    conn.read_from(&mut udp_recv_buf).await
                 } else {
                     // No UDP connection, wait forever
-                    std::future::pending::<acl_engine_r::Result<(usize, AclAddr, Vec<u8>)>>().await
+                    std::future::pending::<acl_engine_r::Result<(usize, AclAddr)>>().await
                 }
             } => {
                 match result {
-                    Ok((n, from_addr, buf)) => {
+                    Ok((n, from_addr)) => {
                         // Convert AclAddr back to Address
                         let addr = acl_addr_to_address(&from_addr);
 
                         // Encode and send back to client
-                        let response = TrojanUdpPacket::encode(&addr, &buf[..n]);
+                        let response = TrojanUdpPacket::encode(&addr, &udp_recv_buf[..n]);
                         if let Err(e) = client_stream.write_all(&response).await {
                             log::debug!(peer = %peer_addr, error = %e, "Failed to write UDP response");
                             break;
