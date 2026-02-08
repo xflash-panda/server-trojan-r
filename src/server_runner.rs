@@ -173,9 +173,17 @@ where
 /// Run the server accept loop
 pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
     use crate::transport::TlsTransportListener;
+    use tokio::sync::Semaphore;
 
     let addr = format!("{}:{}", config.host, config.port);
     let (transport_type, has_tls) = build_transport_config(config);
+
+    // Connection limiter: 0 = unlimited
+    let conn_limiter = if server.conn_config.max_connections > 0 {
+        Some(Arc::new(Semaphore::new(server.conn_config.max_connections)))
+    } else {
+        None
+    };
 
     // Build TLS acceptor if needed
     let tls_acceptor = if has_tls {
@@ -217,6 +225,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
         address = %local_addr,
         transport = %transport_type,
         tls = has_tls,
+        max_connections = server.conn_config.max_connections,
         ws_path = %network_settings.ws_path,
         grpc_service = %network_settings.grpc_service_name,
         "Server started"
@@ -228,11 +237,26 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                 let peer_addr = addr.to_string();
                 log::connection(&peer_addr, "new");
 
+                // Acquire connection permit (backpressure when at limit)
+                let _permit = if let Some(ref limiter) = conn_limiter {
+                    match limiter.clone().acquire_owned().await {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            // Semaphore closed, shutting down
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let server = Arc::clone(&server);
                 let tls_acceptor = tls_acceptor.clone();
                 let network_settings = network_settings.clone();
 
                 tokio::spawn(async move {
+                    // Hold permit for the lifetime of this connection
+                    let _permit = _permit;
                     let result = async {
                         // Set TCP_NODELAY for lower latency
                         if server.conn_config.tcp_nodelay {
@@ -283,4 +307,60 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn test_conn_limiter_backpressure() {
+        let limiter = Arc::new(Semaphore::new(2));
+
+        let permit1 = limiter.clone().acquire_owned().await.unwrap();
+        let permit2 = limiter.clone().acquire_owned().await.unwrap();
+        assert_eq!(limiter.available_permits(), 0);
+
+        assert!(limiter.try_acquire().is_err());
+
+        drop(permit1);
+        assert_eq!(limiter.available_permits(), 1);
+
+        let _permit3 = limiter.clone().acquire_owned().await.unwrap();
+        assert_eq!(limiter.available_permits(), 0);
+
+        drop(permit2);
+        drop(_permit3);
+        assert_eq!(limiter.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_conn_limiter_unlimited_when_none() {
+        let max_connections: usize = 0;
+        let conn_limiter: Option<Arc<Semaphore>> = if max_connections > 0 {
+            Some(Arc::new(Semaphore::new(max_connections)))
+        } else {
+            None
+        };
+
+        assert!(conn_limiter.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_conn_limiter_permit_moved_into_task() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let limiter_clone = limiter.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = limiter_clone.acquire_owned().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(limiter.available_permits(), 0);
+
+        handle.await.unwrap();
+        assert_eq!(limiter.available_permits(), 1);
+    }
 }

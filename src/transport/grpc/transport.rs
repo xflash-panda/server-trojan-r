@@ -214,6 +214,13 @@ impl AsyncRead for GrpcTransport {
 
                     self.read_pending.advance(consumed);
 
+                    // Reclaim memory: after advance(), the consumed bytes become
+                    // inaccessible "dead space" in the allocation. Replace with a
+                    // fresh small buffer so idle connections don't waste memory.
+                    if self.read_pending.is_empty() {
+                        self.read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+                    }
+
                     let to_release = self.pending_release_capacity.min(consumed);
                     if to_release > 0 {
                         if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release)
@@ -347,5 +354,48 @@ mod tests {
     #[test]
     fn test_max_frame_size() {
         assert_eq!(MAX_FRAME_SIZE, 64 * 1024);
+    }
+
+    /// Verify that read_pending is reset to initial size after all data is consumed.
+    #[test]
+    fn test_read_pending_shrinks_after_grpc_message_consumed() {
+        use crate::transport::grpc::codec::{encode_grpc_message, parse_grpc_message};
+        use bytes::Buf;
+
+        let mut read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+        assert_eq!(read_pending.capacity(), INITIAL_READ_BUFFER_SIZE);
+
+        let payload = vec![0xAB; 64 * 1024];
+        let encoded = encode_grpc_message(&payload);
+        read_pending.extend_from_slice(&encoded);
+
+        let grown_capacity = read_pending.capacity();
+        assert!(
+            grown_capacity > INITIAL_READ_BUFFER_SIZE,
+            "buffer should have grown, capacity={}",
+            grown_capacity
+        );
+
+        let (consumed, parsed) = parse_grpc_message(&read_pending).unwrap().unwrap();
+        assert_eq!(parsed.len(), 64 * 1024);
+        read_pending.advance(consumed);
+        assert!(read_pending.is_empty());
+
+        let wasted_capacity = read_pending.capacity();
+        assert!(
+            wasted_capacity < INITIAL_READ_BUFFER_SIZE,
+            "after full advance, usable capacity should be small, got {}",
+            wasted_capacity
+        );
+
+        if read_pending.is_empty() {
+            read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+        }
+
+        assert_eq!(
+            read_pending.capacity(),
+            INITIAL_READ_BUFFER_SIZE,
+            "after shrink, buffer should be reset to initial size"
+        );
     }
 }

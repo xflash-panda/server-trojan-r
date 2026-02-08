@@ -147,6 +147,15 @@ pub struct CliArgs {
         help_heading = "Performance"
     )]
     pub tcp_nodelay: bool,
+
+    /// Maximum concurrent connections, 0 means unlimited (default: 65535)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_MAX_CONNECTIONS",
+        default_value_t = 65535,
+        help_heading = "Performance"
+    )]
+    pub max_connections: usize,
 }
 
 impl CliArgs {
@@ -260,6 +269,8 @@ pub struct ConnConfig {
     pub tcp_backlog: i32,
     /// Enable TCP_NODELAY
     pub tcp_nodelay: bool,
+    /// Maximum concurrent connections (0 = unlimited)
+    pub max_connections: usize,
 }
 
 impl ConnConfig {
@@ -273,6 +284,7 @@ impl ConnConfig {
             buffer_size: cli.buffer_size,
             tcp_backlog: cli.tcp_backlog,
             tcp_nodelay: cli.tcp_nodelay,
+            max_connections: cli.max_connections,
         }
     }
 
@@ -389,6 +401,7 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
+            max_connections: 65535,
             block_private_ip: true,
             refresh_geodata: false,
         }
@@ -425,6 +438,7 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
+            max_connections: 65535,
         };
         (cli, temp_dir)
     }
@@ -499,6 +513,21 @@ mod tests {
         let (mut cli, _temp_dir) = create_test_cli_args_with_temp_certs();
         cli.heartbeat_interval = Duration::ZERO;
         assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn test_conn_config_from_cli_max_connections() {
+        let cli = create_test_cli_args();
+        let config = ConnConfig::from_cli(&cli);
+        assert_eq!(config.max_connections, 65535);
+    }
+
+    #[test]
+    fn test_conn_config_from_cli_max_connections_unlimited() {
+        let mut cli = create_test_cli_args();
+        cli.max_connections = 0;
+        let config = ConnConfig::from_cli(&cli);
+        assert_eq!(config.max_connections, 0);
     }
 
     #[test]

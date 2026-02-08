@@ -109,7 +109,7 @@ pub mod log {
         if success {
             debug!(peer = addr, "Authentication successful");
         } else {
-            warn!(peer = addr, "Authentication failed");
+            debug!(peer = addr, "Authentication failed");
         }
     }
 

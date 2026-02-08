@@ -476,6 +476,7 @@ async fn handle_udp_associate(
             // Read from UDP connection (responses)
             recv_result = async {
                 if let Some(ref conn) = udp_conn {
+                    recv_buf.iter_mut().for_each(|b| *b = 0);
                     conn.read_from(&mut recv_buf).await
                 } else {
                     // No connection, wait forever
@@ -535,4 +536,77 @@ fn acl_addr_to_address(addr: &acl_engine_r::outbound::Addr) -> Address {
     }
     // Otherwise treat as domain
     Address::Domain(addr.host.clone(), addr.port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_udp_recv_buf_reuse_no_stale_data() {
+        let mut buf = vec![0u8; 1024];
+
+        // Simulate first recv: write some data
+        buf[..5].copy_from_slice(b"hello");
+        let n1 = 5;
+        assert_eq!(&buf[..n1], b"hello");
+
+        // Simulate clearing before second recv (same as production code)
+        buf.iter_mut().for_each(|b| *b = 0);
+
+        // Simulate second recv: shorter data
+        buf[..2].copy_from_slice(b"hi");
+        let n2 = 2;
+
+        // Only n2 bytes should be valid; bytes after should be zero
+        assert_eq!(&buf[..n2], b"hi");
+        assert_eq!(buf[n2], 0, "byte after recv data should be zero, not stale");
+    }
+
+    #[test]
+    fn test_acl_addr_to_address_ipv4() {
+        let addr = acl_engine_r::outbound::Addr::new("192.168.1.1", 80);
+        let result = acl_addr_to_address(&addr);
+        assert!(matches!(result, Address::IPv4(_, 80)));
+    }
+
+    #[test]
+    fn test_acl_addr_to_address_ipv6() {
+        let addr = acl_engine_r::outbound::Addr::new("::1", 443);
+        let result = acl_addr_to_address(&addr);
+        assert!(matches!(result, Address::IPv6(_, 443)));
+    }
+
+    #[test]
+    fn test_acl_addr_to_address_ipv6_full() {
+        let addr = acl_engine_r::outbound::Addr::new("2001:db8::1", 8080);
+        let result = acl_addr_to_address(&addr);
+        assert!(matches!(result, Address::IPv6(_, 8080)));
+    }
+
+    #[test]
+    fn test_acl_addr_to_address_domain() {
+        let addr = acl_engine_r::outbound::Addr::new("example.com", 443);
+        let result = acl_addr_to_address(&addr);
+        match result {
+            Address::Domain(host, port) => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 443);
+            }
+            _ => panic!("Expected Domain address"),
+        }
+    }
+
+    #[test]
+    fn test_acl_addr_to_address_domain_with_subdomain() {
+        let addr = acl_engine_r::outbound::Addr::new("sub.example.com", 8443);
+        let result = acl_addr_to_address(&addr);
+        match result {
+            Address::Domain(host, port) => {
+                assert_eq!(host, "sub.example.com");
+                assert_eq!(port, 8443);
+            }
+            _ => panic!("Expected Domain address"),
+        }
+    }
 }
