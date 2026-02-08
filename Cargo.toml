@@ -43,7 +43,7 @@ acl-engine-r = { git = "https://github.com/xflash-panda/acl-engine-r.git", tag =
 
 # Panel gRPC Client
 server-r-agent-proto = { git = "https://github.com/xflash-panda/server-r-agent-proto.git", tag = "v0.1.2" }
-server-r-client = { git = "https://github.com/xflash-panda/server-r-client.git", tag = "v0.1.8" }
+server-r-client = { git = "https://github.com/xflash-panda/server-r-client.git", tag = "v0.1.9" }
 hostname = "0.4"
 socket2 = "0.6"
 
