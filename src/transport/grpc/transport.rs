@@ -218,8 +218,7 @@ impl AsyncRead for GrpcTransport {
                     // inaccessible "dead space" in the allocation. Replace with a
                     // fresh small buffer so idle connections don't waste memory.
                     if self.read_pending.is_empty() {
-                        self.read_pending =
-                            BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+                        self.read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
                     }
 
                     let to_release = self.pending_release_capacity.min(consumed);
@@ -384,7 +383,11 @@ mod tests {
 
         // Parse and consume (same as poll_read line 205-215)
         let (consumed, parsed) = parse_grpc_message(&read_pending).unwrap().unwrap();
-        assert_eq!(parsed.len(), 64 * 1024, "parsed payload should match original size");
+        assert_eq!(
+            parsed.len(),
+            64 * 1024,
+            "parsed payload should match original size"
+        );
         read_pending.advance(consumed);
         assert!(read_pending.is_empty());
 

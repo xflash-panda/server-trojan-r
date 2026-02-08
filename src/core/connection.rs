@@ -93,10 +93,11 @@ impl ConnectionManager {
             // Atomically remove conn_id from the Vec and delete the entry if empty.
             // remove_if holds the shard lock for the entire check, so a concurrent
             // register() cannot insert into the Vec between our retain and remove.
-            self.user_connections.remove_if_mut(&user_id, |_, conn_ids| {
-                conn_ids.retain(|&id| id != conn_id);
-                conn_ids.is_empty()
-            });
+            self.user_connections
+                .remove_if_mut(&user_id, |_, conn_ids| {
+                    conn_ids.retain(|&id| id != conn_id);
+                    conn_ids.is_empty()
+                });
         }
     }
 
@@ -280,9 +281,8 @@ mod tests {
             let (conn_id2, _token2) = handle_b.join().unwrap();
 
             // conn1 should be gone
-            assert_eq!(
+            assert!(
                 manager.connections.get(&conn_id1).is_none(),
-                true,
                 "conn1 should have been removed from connections"
             );
 
