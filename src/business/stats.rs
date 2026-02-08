@@ -130,21 +130,15 @@ impl ApiStatsCollector {
             }
         }
 
-        // Remove zero-traffic entries to prevent unbounded growth
-        // Check all entries since we swapped all to 0
+        // Atomically remove zero-traffic entries to prevent unbounded growth.
+        // remove_if holds the shard lock during the check, so a concurrent
+        // record_upload/download/request cannot write between check and remove.
         for key in all_keys {
-            // Double-check the entry is still zero before removing
-            // (new traffic may have arrived during iteration)
-            if let Some(entry) = self.stats.get(&key) {
-                let data = entry.value();
-                if data.upload_bytes.load(Ordering::Relaxed) == 0
+            self.stats.remove_if(&key, |_, data| {
+                data.upload_bytes.load(Ordering::Relaxed) == 0
                     && data.download_bytes.load(Ordering::Relaxed) == 0
                     && data.request_count.load(Ordering::Relaxed) == 0
-                {
-                    drop(entry); // Release the reference before remove
-                    self.stats.remove(&key);
-                }
-            }
+            });
         }
 
         snapshots
@@ -335,6 +329,66 @@ mod tests {
         // Some may have been collected by resets, some remain
         // The important thing is no data is lost
         assert!(remaining <= 5000);
+    }
+
+    /// Strict invariant: total collected via resets + final remaining == total written.
+    /// Any data loss (e.g. remove racing with concurrent write) breaks this.
+    #[test]
+    fn test_reset_all_no_data_loss_strict() {
+        use std::thread;
+
+        // Run many iterations to increase chance of hitting race window
+        for _ in 0..50 {
+            let collector = Arc::new(ApiStatsCollector::new());
+            let total_per_thread = 2000u64;
+            let num_writers = 5;
+            let expected_total = num_writers * total_per_thread;
+
+            let mut write_handles = vec![];
+
+            // Writers: all write to user_id=1 to maximize shard contention
+            for _ in 0..num_writers {
+                let c = Arc::clone(&collector);
+                write_handles.push(thread::spawn(move || {
+                    for _ in 0..total_per_thread {
+                        c.record_upload(1, 1);
+                    }
+                }));
+            }
+
+            // Resetter: rapidly reset to maximize race window
+            let c = Arc::clone(&collector);
+            let reset_handle = thread::spawn(move || {
+                let mut total_collected = 0u64;
+                for _ in 0..200 {
+                    let snapshots = c.reset_all();
+                    for s in &snapshots {
+                        total_collected += s.upload_bytes;
+                    }
+                    thread::yield_now();
+                }
+                total_collected
+            });
+
+            for h in write_handles {
+                h.join().unwrap();
+            }
+
+            let collected = reset_handle.join().unwrap();
+
+            // Final reset to drain remaining
+            let final_snapshots = collector.reset_all();
+            let remaining: u64 = final_snapshots.iter().map(|s| s.upload_bytes).sum();
+
+            assert_eq!(
+                collected + remaining,
+                expected_total,
+                "Data loss: collected={}, remaining={}, expected={}",
+                collected,
+                remaining,
+                expected_total
+            );
+        }
     }
 
     #[test]

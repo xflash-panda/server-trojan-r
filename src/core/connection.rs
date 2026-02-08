@@ -90,15 +90,14 @@ impl ConnectionManager {
     pub fn unregister(&self, conn_id: ConnectionId) {
         if let Some((_, conn)) = self.connections.remove(&conn_id) {
             let user_id = conn.info.user_id;
-            // Remove from user_connections and clean up empty entries
-            if let Some(mut conn_ids) = self.user_connections.get_mut(&user_id) {
-                conn_ids.retain(|&id| id != conn_id);
-                // Drop the mutable reference before removing
-                if conn_ids.is_empty() {
-                    drop(conn_ids);
-                    self.user_connections.remove(&user_id);
-                }
-            }
+            // Atomically remove conn_id from the Vec and delete the entry if empty.
+            // remove_if holds the shard lock for the entire check, so a concurrent
+            // register() cannot insert into the Vec between our retain and remove.
+            self.user_connections
+                .remove_if_mut(&user_id, |_, conn_ids| {
+                    conn_ids.retain(|&id| id != conn_id);
+                    conn_ids.is_empty()
+                });
         }
     }
 
@@ -232,5 +231,134 @@ mod tests {
         assert_eq!(manager.connection_count(), 0);
         // All user entries should also be cleaned up
         assert_eq!(manager.user_count(), 0);
+    }
+
+    /// Test that unregister of the last connection for a user does NOT
+    /// delete a new connection registered by another thread in between.
+    ///
+    /// Race scenario (same user_id):
+    ///   Thread A: unregister(conn1) -> retain removes conn1, vec is empty
+    ///            -> drop(guard) releases DashMap lock
+    ///            ---- window ----
+    ///   Thread B: register(user, conn2) -> pushes conn2 into vec
+    ///            ---- window ----
+    ///   Thread A: user_connections.remove(user_id) -> deletes vec containing conn2!
+    ///
+    /// After this, conn2 exists in `connections` but NOT in `user_connections`,
+    /// so kick_user will miss it, and user_count is wrong.
+    #[test]
+    fn test_unregister_register_race_same_user() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Run many iterations to increase chance of hitting the race window
+        for _ in 0..200 {
+            let manager = ConnectionManager::new();
+            let user_id: UserId = 42;
+
+            // Register initial connection
+            let (conn_id1, _token1) = manager.register(user_id, "127.0.0.1:1000".to_string());
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Thread A: unregister conn1 (the last conn for this user)
+            let m_a = manager.clone();
+            let b_a = Arc::clone(&barrier);
+            let handle_a = thread::spawn(move || {
+                b_a.wait();
+                m_a.unregister(conn_id1);
+            });
+
+            // Thread B: register a new conn for the same user
+            let m_b = manager.clone();
+            let b_b = Arc::clone(&barrier);
+            let handle_b = thread::spawn(move || {
+                b_b.wait();
+                m_b.register(user_id, "127.0.0.1:2000".to_string())
+            });
+
+            handle_a.join().unwrap();
+            let (conn_id2, _token2) = handle_b.join().unwrap();
+
+            // conn1 should be gone
+            assert!(
+                manager.connections.get(&conn_id1).is_none(),
+                "conn1 should have been removed from connections"
+            );
+
+            // conn2 must still exist in connections
+            assert!(
+                manager.connections.get(&conn_id2).is_some(),
+                "conn2 must exist in connections map"
+            );
+
+            // CRITICAL: conn2 must also be tracked in user_connections
+            // If the race occurred, user_connections.remove() deleted conn2's entry
+            let has_user_entry = manager.user_connections.get(&user_id).is_some();
+            let user_conn_contains_conn2 = manager
+                .user_connections
+                .get(&user_id)
+                .map(|ids| ids.contains(&conn_id2))
+                .unwrap_or(false);
+
+            assert!(
+                has_user_entry,
+                "user_connections entry for user {} must exist (conn2 is still active)",
+                user_id
+            );
+            assert!(
+                user_conn_contains_conn2,
+                "user_connections must contain conn_id2={} for user {}",
+                conn_id2, user_id
+            );
+
+            // Clean up
+            manager.unregister(conn_id2);
+            assert_eq!(manager.connection_count(), 0);
+            assert_eq!(manager.user_count(), 0);
+        }
+    }
+
+    /// Test that high-contention concurrent register/unregister for the SAME user
+    /// always leaves consistent state: connection_count == 0, user_count == 0.
+    #[test]
+    fn test_concurrent_same_user_consistency() {
+        use std::thread;
+
+        for _ in 0..50 {
+            let manager = ConnectionManager::new();
+            let user_id: UserId = 1;
+
+            let handles: Vec<_> = (0..20)
+                .map(|j| {
+                    let m = manager.clone();
+                    thread::spawn(move || {
+                        for k in 0..100 {
+                            let (conn_id, _) =
+                                m.register(user_id, format!("127.0.0.1:{}", j * 1000 + k));
+                            // Tiny yield to increase interleaving
+                            std::thread::yield_now();
+                            m.unregister(conn_id);
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert_eq!(
+                manager.connection_count(),
+                0,
+                "all connections must be cleaned up"
+            );
+            // This is the key assertion: user_connections must also be fully cleaned
+            assert_eq!(
+                manager.user_count(),
+                0,
+                "user_connections must be empty when all connections are gone"
+            );
+        }
     }
 }

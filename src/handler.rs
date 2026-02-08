@@ -343,6 +343,7 @@ async fn handle_udp_associate(
 
     // UDP relay loop
     let mut temp_buf = vec![0u8; 65536];
+    let mut udp_recv_buf = vec![0u8; 65536];
     let mut udp_conn: Option<Box<dyn AsyncUdpConn>> = None;
     let mut current_handler: Option<Arc<acl::OutboundHandler>> = None;
 
@@ -468,23 +469,22 @@ async fn handle_udp_associate(
                 }
             }
 
-            // Read from UDP connection (if exists)
+            // Read from UDP connection (if exists), reusing pre-allocated buffer
             result = async {
                 if let Some(ref conn) = udp_conn {
-                    let mut buf = vec![0u8; 65536];
-                    conn.read_from(&mut buf).await.map(|(n, addr)| (n, addr, buf))
+                    conn.read_from(&mut udp_recv_buf).await
                 } else {
                     // No UDP connection, wait forever
-                    std::future::pending::<acl_engine_r::Result<(usize, AclAddr, Vec<u8>)>>().await
+                    std::future::pending::<acl_engine_r::Result<(usize, AclAddr)>>().await
                 }
             } => {
                 match result {
-                    Ok((n, from_addr, buf)) => {
+                    Ok((n, from_addr)) => {
                         // Convert AclAddr back to Address
                         let addr = acl_addr_to_address(&from_addr);
 
                         // Encode and send back to client
-                        let response = TrojanUdpPacket::encode(&addr, &buf[..n]);
+                        let response = TrojanUdpPacket::encode(&addr, &udp_recv_buf[..n]);
                         if let Err(e) = client_stream.write_all(&response).await {
                             log::debug!(peer = %peer_addr, error = %e, "Failed to write UDP response");
                             break;
@@ -568,5 +568,65 @@ mod tests {
         let acl_addr = AclAddr::new("sub.example.com", 443);
         let addr = acl_addr_to_address(&acl_addr);
         assert!(matches!(addr, Address::Domain(ref d, 443) if d == "sub.example.com"));
+    }
+
+    /// Verify that reusing a pre-allocated buffer for UDP recv produces correct
+    /// TrojanUdpPacket encoding — stale data beyond `n` bytes must not leak
+    /// into the encoded packet.
+    #[test]
+    fn test_udp_recv_buf_reuse_no_stale_data() {
+        // Simulate a reused 64KB buffer (like udp_recv_buf in handle_udp_associate)
+        let mut recv_buf = vec![0xFFu8; 65536]; // filled with 0xFF "stale" data
+
+        // --- First "read": 5 bytes ---
+        let data1 = b"hello";
+        recv_buf[..data1.len()].copy_from_slice(data1);
+        let n1 = data1.len();
+
+        let addr1 = Address::IPv4([8, 8, 8, 8], 53);
+        let encoded1 = TrojanUdpPacket::encode(&addr1, &recv_buf[..n1]);
+
+        // Decode and verify only "hello" is in the payload, no stale 0xFF
+        match TrojanUdpPacket::decode(&encoded1) {
+            DecodeResult::Ok(pkt, _) => {
+                assert_eq!(pkt.payload.as_ref(), b"hello");
+                assert_eq!(pkt.payload.len(), 5);
+            }
+            _ => panic!("Failed to decode first packet"),
+        }
+
+        // --- Second "read": 3 bytes (shorter than first) ---
+        // Bytes 3..5 still contain 'l','o' from the first read — stale data
+        let data2 = b"bye";
+        recv_buf[..data2.len()].copy_from_slice(data2);
+        let n2 = data2.len();
+
+        let addr2 = Address::Domain("dns.example.com".to_string(), 53);
+        let encoded2 = TrojanUdpPacket::encode(&addr2, &recv_buf[..n2]);
+
+        match TrojanUdpPacket::decode(&encoded2) {
+            DecodeResult::Ok(pkt, _) => {
+                // Must be "bye" only, NOT "byelo" or anything longer
+                assert_eq!(pkt.payload.as_ref(), b"bye");
+                assert_eq!(pkt.payload.len(), 3);
+            }
+            _ => panic!("Failed to decode second packet"),
+        }
+
+        // --- Third "read": large payload ---
+        let data3 = vec![0xABu8; 1024];
+        recv_buf[..data3.len()].copy_from_slice(&data3);
+        let n3 = data3.len();
+
+        let addr3 = Address::IPv4([1, 1, 1, 1], 443);
+        let encoded3 = TrojanUdpPacket::encode(&addr3, &recv_buf[..n3]);
+
+        match TrojanUdpPacket::decode(&encoded3) {
+            DecodeResult::Ok(pkt, _) => {
+                assert_eq!(pkt.payload.len(), 1024);
+                assert!(pkt.payload.iter().all(|&b| b == 0xAB));
+            }
+            _ => panic!("Failed to decode third packet"),
+        }
     }
 }

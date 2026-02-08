@@ -146,6 +146,7 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
+            max_connections: 65535,
         }
     }
 
