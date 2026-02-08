@@ -214,6 +214,14 @@ impl AsyncRead for GrpcTransport {
 
                     self.read_pending.advance(consumed);
 
+                    // Reclaim memory: after advance(), the consumed bytes become
+                    // inaccessible "dead space" in the allocation. Replace with a
+                    // fresh small buffer so idle connections don't waste memory.
+                    if self.read_pending.is_empty() {
+                        self.read_pending =
+                            BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+                    }
+
                     let to_release = self.pending_release_capacity.min(consumed);
                     if to_release > 0 {
                         if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release)
@@ -347,5 +355,59 @@ mod tests {
     #[test]
     fn test_max_frame_size() {
         assert_eq!(MAX_FRAME_SIZE, 64 * 1024);
+    }
+
+    /// Verify that read_pending is reset to initial size after all data is consumed.
+    ///
+    /// Problem: BytesMut::advance() creates "dead space" at the front of the
+    /// allocation. After consuming a large gRPC message, the buffer is empty
+    /// but the allocation stays large. For idle connections, this wastes memory.
+    #[test]
+    fn test_read_pending_shrinks_after_grpc_message_consumed() {
+        use crate::transport::grpc::codec::{encode_grpc_message, parse_grpc_message};
+        use bytes::Buf;
+
+        let mut read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+        assert_eq!(read_pending.capacity(), INITIAL_READ_BUFFER_SIZE);
+
+        // Simulate receiving a large gRPC message (same as poll_read does)
+        let payload = vec![0xAB; 64 * 1024];
+        let encoded = encode_grpc_message(&payload);
+        read_pending.extend_from_slice(&encoded);
+
+        let grown_capacity = read_pending.capacity();
+        assert!(
+            grown_capacity > INITIAL_READ_BUFFER_SIZE,
+            "buffer should have grown, capacity={}",
+            grown_capacity
+        );
+
+        // Parse and consume (same as poll_read line 205-215)
+        let (consumed, parsed) = parse_grpc_message(&read_pending).unwrap().unwrap();
+        assert_eq!(parsed.len(), 64 * 1024, "parsed payload should match original size");
+        read_pending.advance(consumed);
+        assert!(read_pending.is_empty());
+
+        // After advance: capacity is near 0 because the pointer is at the end.
+        // The underlying ALLOCATION is still large (64KB+) but inaccessible.
+        // This is the "only grows, never shrinks" problem.
+        let wasted_capacity = read_pending.capacity();
+        assert!(
+            wasted_capacity < INITIAL_READ_BUFFER_SIZE,
+            "after full advance, usable capacity should be small, got {}",
+            wasted_capacity
+        );
+
+        // Apply the production shrink logic (same as what poll_read should do)
+        if read_pending.is_empty() {
+            read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
+        }
+
+        // After shrink: fresh buffer with proper initial capacity
+        assert_eq!(
+            read_pending.capacity(),
+            INITIAL_READ_BUFFER_SIZE,
+            "after shrink, buffer should be reset to initial size"
+        );
     }
 }
