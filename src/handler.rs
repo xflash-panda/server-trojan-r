@@ -225,6 +225,7 @@ impl<'a> ConnectContext<'a> {
             self.client_stream,
             remote_stream,
             self.server.conn_config.idle_timeout_secs(),
+            self.server.conn_config.buffer_size,
             Some((self.user_id, stats)),
         );
 
