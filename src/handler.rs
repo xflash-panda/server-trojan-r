@@ -19,7 +19,10 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum UDP read buffer size to prevent memory exhaustion
-const UDP_MAX_READ_BUFFER_SIZE: usize = 256 * 1024; // 256KB
+const UDP_MAX_READ_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+
+/// Maximum entries in per-session UDP route cache
+const UDP_MAX_ROUTE_CACHE_ENTRIES: usize = 256;
 
 /// Read and decode a complete Trojan request from the stream
 ///
@@ -96,6 +99,10 @@ pub async fn process_connection(
     )
     .await
     .map_err(|_| anyhow!("Request read timeout"))??;
+
+    // Free request parsing buffer immediately — payload is an independent Bytes.
+    // Saves 32KB per connection during the relay phase.
+    drop(buf);
 
     let peer_addr = meta.peer_addr.to_string();
 
@@ -414,6 +421,10 @@ async fn handle_udp_associate(
                                                 }
                                                 _ => AclAddr::new(packet.addr.host().into_owned(), packet.addr.port()),
                                             };
+                                            // Evict all entries when cache is full to bound memory
+                                            if route_cache.len() >= UDP_MAX_ROUTE_CACHE_ENTRIES {
+                                                route_cache.clear();
+                                            }
                                             route_cache.insert(packet.addr.clone(), (result.clone(), acl_addr));
                                             let cached = route_cache.get(&packet.addr).unwrap();
                                             (cached.0.clone(), &cached.1)

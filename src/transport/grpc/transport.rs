@@ -16,8 +16,8 @@ use super::codec::{encode_grpc_message, parse_grpc_message};
 /// Initial read buffer size (start small, grow as needed)
 const INITIAL_READ_BUFFER_SIZE: usize = 8 * 1024;
 
-/// Maximum read buffer size
-const MAX_READ_BUFFER_SIZE: usize = 512 * 1024;
+/// Maximum read buffer size (128KB — bounded to limit per-connection memory at high scale)
+const MAX_READ_BUFFER_SIZE: usize = 128 * 1024;
 
 /// Maximum frame size for HTTP/2
 pub(super) const MAX_FRAME_SIZE: u32 = 64 * 1024;
@@ -25,8 +25,8 @@ pub(super) const MAX_FRAME_SIZE: u32 = 64 * 1024;
 /// Default gRPC message size (used when no config is provided)
 const DEFAULT_GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
 
-/// Maximum send queue bytes
-pub(super) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;
+/// Maximum send queue bytes (128KB — bounded to limit per-connection memory at high scale)
+pub(super) const MAX_SEND_QUEUE_BYTES: usize = 128 * 1024;
 
 /// gRPC transport layer (v2ray compatible)
 ///
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_max_buffer_size() {
-        assert_eq!(MAX_READ_BUFFER_SIZE, 512 * 1024);
+        assert_eq!(MAX_READ_BUFFER_SIZE, 128 * 1024);
     }
 
     #[test]
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_max_send_queue_bytes() {
-        assert_eq!(MAX_SEND_QUEUE_BYTES, 512 * 1024);
+        assert_eq!(MAX_SEND_QUEUE_BYTES, 128 * 1024);
     }
 
     #[test]
@@ -375,7 +375,7 @@ mod tests {
         let mut read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
         assert_eq!(read_pending.capacity(), INITIAL_READ_BUFFER_SIZE);
 
-        let payload = vec![0xAB; 64 * 1024];
+        let payload = vec![0xAB; 32 * 1024];
         let encoded = encode_grpc_message(&payload);
         read_pending.extend_from_slice(&encoded);
 
@@ -387,7 +387,7 @@ mod tests {
         );
 
         let (consumed, parsed) = parse_grpc_message(&read_pending).unwrap().unwrap();
-        assert_eq!(parsed.len(), 64 * 1024);
+        assert_eq!(parsed.len(), 32 * 1024);
         read_pending.advance(consumed);
         assert!(read_pending.is_empty());
 
