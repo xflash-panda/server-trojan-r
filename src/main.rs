@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 
     // Fetch initial users
     let users = api_manager.fetch_users().await?;
-    user_manager.init(&users).await;
+    user_manager.init(&users);
 
     // Build server config
     let server_config = config::ServerConfig::from_remote(&remote_config, &cli, users)?;

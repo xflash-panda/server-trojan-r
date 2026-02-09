@@ -36,6 +36,7 @@ dashmap = "6.1"
 moka = { version = "0.12", features = ["future"] }
 mimalloc = { version = "0.1", default-features = false }
 async-trait = "0.1"
+arc-swap = "1"
 
 # ACL Engine (remote)
 acl-engine-r = { git = "https://github.com/xflash-panda/acl-engine-r.git", tag = "v0.3.1", features = ["async"] }
