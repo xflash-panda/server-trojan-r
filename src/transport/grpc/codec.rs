@@ -54,19 +54,17 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     Ok(Some((consumed, payload)))
 }
 
-/// Encode gRPC message frame
+/// Encode gRPC message frame (single allocation)
 pub fn encode_grpc_message(payload: &[u8]) -> BytesMut {
-    let mut proto_header = BytesMut::with_capacity(10);
-    proto_header.put_u8(0x0A);
-    encode_varint(payload.len() as u64, &mut proto_header);
+    let varint_bytes = varint_len(payload.len() as u64);
+    let proto_len = 1 + varint_bytes + payload.len(); // tag + varint + payload
 
-    let grpc_payload_len = (proto_header.len() + payload.len()) as u32;
-    let mut buf = BytesMut::with_capacity(5 + proto_header.len() + payload.len());
-    buf.put_u8(0x00);
-    buf.put_u32(grpc_payload_len);
-    buf.extend_from_slice(&proto_header);
+    let mut buf = BytesMut::with_capacity(5 + proto_len);
+    buf.put_u8(0x00); // not compressed
+    buf.put_u32(proto_len as u32); // gRPC frame length
+    buf.put_u8(0x0A); // protobuf field 1, wire type 2
+    encode_varint(payload.len() as u64, &mut buf);
     buf.extend_from_slice(payload);
-
     buf
 }
 
@@ -95,6 +93,15 @@ fn decode_varint(data: &[u8]) -> io::Result<(u64, usize)> {
         io::ErrorKind::UnexpectedEof,
         "incomplete varint",
     ))
+}
+
+/// Compute the number of bytes needed to encode a varint
+fn varint_len(value: u64) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let bits = 64 - value.leading_zeros() as usize;
+    (bits + 6) / 7
 }
 
 fn encode_varint(mut value: u64, buf: &mut BytesMut) {
