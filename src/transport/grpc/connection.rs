@@ -23,11 +23,13 @@ const MAX_CONCURRENT_STREAMS: usize = 100;
 /// Maximum HTTP/2 header list size
 const MAX_HEADER_LIST_SIZE: u32 = 8 * 1024;
 
-/// Initial HTTP/2 window size
-const INITIAL_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+/// Initial HTTP/2 stream window size (per stream)
+/// Go net/http2 default is 1MB. 8MB was excessive and caused high memory
+/// usage under load (100 streams × 8MB = 800MB per H2 connection).
+const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 
-/// Initial HTTP/2 connection window size
-const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+/// Initial HTTP/2 connection window size (shared across all streams)
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 
 /// gRPC HTTP/2 connection manager
 ///
@@ -248,5 +250,28 @@ mod tests {
         }
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    // Compile-time assertions for H2 window size relationships
+    const _: () = assert!(INITIAL_WINDOW_SIZE <= INITIAL_CONNECTION_WINDOW_SIZE);
+    const _: () = assert!(INITIAL_CONNECTION_WINDOW_SIZE >= INITIAL_WINDOW_SIZE * 2);
+
+    #[test]
+    fn test_h2_window_sizes() {
+        // Match Go net/http2 defaults (1MB stream, 4MB connection)
+        assert_eq!(INITIAL_WINDOW_SIZE, 1024 * 1024);
+        assert_eq!(INITIAL_CONNECTION_WINDOW_SIZE, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_h2_max_concurrent_streams() {
+        // Memory bound: MAX_CONCURRENT_STREAMS × INITIAL_WINDOW_SIZE should be reasonable
+        let max_memory_per_conn = MAX_CONCURRENT_STREAMS as u64 * INITIAL_WINDOW_SIZE as u64;
+        // With 100 streams × 1MB = 100MB per H2 connection (was 800MB with 8MB windows)
+        assert!(
+            max_memory_per_conn <= 256 * 1024 * 1024,
+            "per-connection memory bound too high: {}MB",
+            max_memory_per_conn / (1024 * 1024)
+        );
     }
 }
