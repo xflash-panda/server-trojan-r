@@ -117,6 +117,7 @@ use super::hooks::{StatsCollector, UserId};
 /// - `a`: Client stream
 /// - `b`: Remote/outbound stream
 /// - `idle_timeout_secs`: Idle timeout in seconds
+/// - `buffer_size`: Buffer size for each direction of the relay
 /// - `stats`: Optional tuple of (user_id, stats_collector) for traffic tracking
 ///
 /// Returns CopyResult with bytes transferred and completion status.
@@ -125,6 +126,7 @@ pub async fn copy_bidirectional_with_stats<A, B>(
     a: A,
     b: B,
     idle_timeout_secs: u64,
+    buffer_size: usize,
     stats: Option<(UserId, Arc<dyn StatsCollector>)>,
 ) -> std::io::Result<CopyResult>
 where
@@ -164,14 +166,11 @@ where
         Arc::clone(&counters.a_to_b), // writes to B = upload (not used by copy_bidirectional for counting)
     );
 
-    // Use 32KB buffers (default is 8KB) to reduce poll_write call frequency.
-    // 32KB matches Go's io.Copy default (what xray uses) — good throughput/memory balance.
-    const RELAY_BUF_SIZE: usize = 32 * 1024;
     let copy_task = tokio::io::copy_bidirectional_with_sizes(
         &mut stream_a,
         &mut stream_b,
-        RELAY_BUF_SIZE,
-        RELAY_BUF_SIZE,
+        buffer_size,
+        buffer_size,
     );
 
     let timeout_check = async {

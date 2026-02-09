@@ -22,8 +22,8 @@ const MAX_READ_BUFFER_SIZE: usize = 512 * 1024;
 /// Maximum frame size for HTTP/2
 pub(super) const MAX_FRAME_SIZE: u32 = 64 * 1024;
 
-/// Maximum gRPC message size
-const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
+/// Default gRPC message size (used when no config is provided)
+const DEFAULT_GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
 
 /// Maximum send queue bytes
 pub(super) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;
@@ -42,11 +42,20 @@ pub struct GrpcTransport {
     pub(crate) send_queue_bytes: usize,
     pub(crate) current_frame: Option<Bytes>,
     pub(crate) current_frame_offset: usize,
+    pub(crate) max_message_size: usize,
     pub(crate) closed: bool,
 }
 
 impl GrpcTransport {
     pub(crate) fn new(recv_stream: RecvStream, send_stream: SendStream<Bytes>) -> Self {
+        Self::with_buffer_size(recv_stream, send_stream, DEFAULT_GRPC_MAX_MESSAGE_SIZE)
+    }
+
+    pub(crate) fn with_buffer_size(
+        recv_stream: RecvStream,
+        send_stream: SendStream<Bytes>,
+        max_message_size: usize,
+    ) -> Self {
         Self {
             recv_stream,
             send_stream,
@@ -58,6 +67,7 @@ impl GrpcTransport {
             send_queue_bytes: 0,
             current_frame: None,
             current_frame_offset: 0,
+            max_message_size,
             closed: false,
         }
     }
@@ -279,7 +289,7 @@ impl AsyncWrite for GrpcTransport {
             return Poll::Pending;
         }
 
-        let to_write = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
+        let to_write = buf.len().min(self.max_message_size);
         let frame = encode_grpc_message(&buf[..to_write]);
         let frame_bytes = frame.len();
         self.send_queue.push_back(frame.freeze());
@@ -342,8 +352,8 @@ mod tests {
     }
 
     #[test]
-    fn test_grpc_max_message_size() {
-        assert_eq!(GRPC_MAX_MESSAGE_SIZE, 32 * 1024);
+    fn test_default_grpc_max_message_size() {
+        assert_eq!(DEFAULT_GRPC_MAX_MESSAGE_SIZE, 32 * 1024);
     }
 
     #[test]

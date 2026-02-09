@@ -41,6 +41,8 @@ pub struct GrpcConnection<S> {
     active_count: Arc<AtomicUsize>,
     /// Expected gRPC path (format: "/${service_name}/Tun")
     expected_path: String,
+    /// Buffer size for gRPC message framing
+    buffer_size: usize,
 }
 
 /// Default gRPC service name (Xray compatible)
@@ -60,6 +62,18 @@ where
     ///
     /// The expected path will be "/${service_name}/Tun" (v2ray/Xray compatible)
     pub async fn with_service_name(stream: S, service_name: &str) -> io::Result<Self> {
+        Self::with_config(stream, service_name, 0).await
+    }
+
+    /// Create a new gRPC connection with a custom service name and buffer size
+    ///
+    /// `buffer_size` controls the gRPC message framing size.
+    /// If 0, uses the default (32KB).
+    pub async fn with_config(
+        stream: S,
+        service_name: &str,
+        buffer_size: usize,
+    ) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
             .initial_window_size(INITIAL_WINDOW_SIZE)
@@ -78,6 +92,7 @@ where
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             active_count: Arc::new(AtomicUsize::new(0)),
             expected_path,
+            buffer_size,
         })
     }
 
@@ -91,6 +106,7 @@ where
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
         let active_count = self.active_count;
+        let buffer_size = self.buffer_size;
 
         let mut heartbeat = H2Heartbeat::new(h2_conn.ping_pong());
 
@@ -151,10 +167,18 @@ where
                                 }
                             };
 
-                            let transport = GrpcTransport::new(
-                                request.into_body(),
-                                send_stream,
-                            );
+                            let transport = if buffer_size > 0 {
+                                GrpcTransport::with_buffer_size(
+                                    request.into_body(),
+                                    send_stream,
+                                    buffer_size,
+                                )
+                            } else {
+                                GrpcTransport::new(
+                                    request.into_body(),
+                                    send_stream,
+                                )
+                            };
 
                             let handler_clone = Arc::clone(&handler);
                             let active_count_clone = Arc::clone(&active_count);
