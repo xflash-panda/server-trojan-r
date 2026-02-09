@@ -109,7 +109,7 @@ mod tests {
         // Swap to a completely different map while snapshot is held
         let mut new_map = HashMap::new();
         new_map.insert(pw1, 100); // pw1 changed
-        // pw2 removed
+                                  // pw2 removed
         users.store(Arc::new(new_map));
 
         // Snapshot still sees old data (consistent read)

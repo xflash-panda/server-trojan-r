@@ -9,6 +9,7 @@
 //! - Payload
 
 use bytes::{Bytes, BytesMut};
+use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::lookup_host;
 
@@ -106,12 +107,15 @@ impl Address {
         }
     }
 
-    /// Get the host string (IP or domain)
-    pub fn host(&self) -> String {
+    /// Get the host as a borrowed or owned string.
+    ///
+    /// Returns `Cow::Borrowed` for domains (zero allocation) and
+    /// `Cow::Owned` for IP addresses (requires formatting).
+    pub fn host(&self) -> Cow<'_, str> {
         match self {
-            Address::IPv4(ip, _) => Ipv4Addr::from(*ip).to_string(),
-            Address::IPv6(ip, _) => Ipv6Addr::from(*ip).to_string(),
-            Address::Domain(domain, _) => domain.clone(),
+            Address::IPv4(ip, _) => Cow::Owned(Ipv4Addr::from(*ip).to_string()),
+            Address::IPv6(ip, _) => Cow::Owned(Ipv6Addr::from(*ip).to_string()),
+            Address::Domain(domain, _) => Cow::Borrowed(domain),
         }
     }
 
@@ -653,6 +657,49 @@ mod tests {
         assert_eq!(buf[1], 8); // domain length
         assert_eq!(&buf[2..10], b"test.com");
         assert_eq!(&buf[10..12], &[0x00, 0x50]); // port 80
+    }
+
+    /// Verify that host() returns Cow::Borrowed for domains (zero allocation)
+    /// and Cow::Owned for IP addresses.
+    #[test]
+    fn test_address_host_cow_borrowing() {
+        use std::borrow::Cow;
+
+        // Domain: should be Cow::Borrowed (no heap allocation)
+        let domain = Address::Domain("example.com".to_string(), 80);
+        let host = domain.host();
+        assert!(
+            matches!(host, Cow::Borrowed(_)),
+            "Domain host should be Cow::Borrowed"
+        );
+
+        // IPv4: must be Cow::Owned (requires formatting)
+        let ipv4 = Address::IPv4([10, 0, 0, 1], 80);
+        let host = ipv4.host();
+        assert!(
+            matches!(host, Cow::Owned(_)),
+            "IPv4 host should be Cow::Owned"
+        );
+
+        // IPv6: must be Cow::Owned (requires formatting)
+        let ipv6 = Address::IPv6([0; 16], 443);
+        let host = ipv6.host();
+        assert!(
+            matches!(host, Cow::Owned(_)),
+            "IPv6 host should be Cow::Owned"
+        );
+    }
+
+    /// Verify that host().into_owned() works for AclAddr construction
+    #[test]
+    fn test_address_host_into_owned() {
+        let domain = Address::Domain("test.com".to_string(), 443);
+        let owned: String = domain.host().into_owned();
+        assert_eq!(owned, "test.com");
+
+        let ipv4 = Address::IPv4([8, 8, 8, 8], 53);
+        let owned: String = ipv4.host().into_owned();
+        assert_eq!(owned, "8.8.8.8");
     }
 
     #[test]
