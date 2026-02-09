@@ -17,9 +17,12 @@ mod logger;
 mod server_runner;
 mod transport;
 
-// Use mimalloc as the global allocator for better performance
+// Use jemalloc as the global allocator.
+// jemalloc actively returns freed memory to the OS (via muzzy/dirty page decay),
+// unlike mimalloc which retains segments at peak capacity permanently.
+// This prevents RSS from growing monotonically under high connection churn.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use logger::log;
 
