@@ -143,27 +143,26 @@ where
             // These limits enable backpressure so copy_bidirectional slows down
             // reads from the remote instead of buffering indefinitely.
             let ws_config = WebSocketConfig::default()
-                .write_buffer_size(32 * 1024)            // 32KB (default 128KB)
-                .max_write_buffer_size(2 * 1024 * 1024)  // 2MB (default usize::MAX!)
-                .max_message_size(Some(2 * 1024 * 1024))  // 2MB (default 64MB)
-                .max_frame_size(Some(512 * 1024));        // 512KB (default 16MB)
+                .write_buffer_size(32 * 1024) // 32KB (default 128KB)
+                .max_write_buffer_size(2 * 1024 * 1024) // 2MB (default usize::MAX!)
+                .max_message_size(Some(2 * 1024 * 1024)) // 2MB (default 64MB)
+                .max_frame_size(Some(512 * 1024)); // 512KB (default 16MB)
 
             // WebSocket handshake with path validation
             let ws_path = network_settings.ws_path.clone();
-            let ws_stream =
-                tokio_tungstenite::accept_hdr_async_with_config(
-                    stream,
-                    |req: &Request, response: Response| {
-                        let path = req.uri().path();
-                        if path != ws_path && !ws_path.is_empty() && ws_path != "/" {
-                            log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
-                            // For "/" or empty path, accept any path (Xray behavior)
-                        }
-                        Ok(response)
-                    },
-                    Some(ws_config),
-                )
-                .await?;
+            let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(
+                stream,
+                |req: &Request, response: Response| {
+                    let path = req.uri().path();
+                    if path != ws_path && !ws_path.is_empty() && ws_path != "/" {
+                        log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
+                        // For "/" or empty path, accept any path (Xray behavior)
+                    }
+                    Ok(response)
+                },
+                Some(ws_config),
+            )
+            .await?;
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
