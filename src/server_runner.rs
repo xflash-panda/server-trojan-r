@@ -147,9 +147,9 @@ where
             let buf_size = server.conn_config.buffer_size;
             let ws_config = WebSocketConfig::default()
                 .write_buffer_size(buf_size) // matches relay buffer size
-                .max_write_buffer_size(buf_size * 4) // 4x buffer_size (default usize::MAX!)
-                .max_message_size(Some(1024 * 1024)) // 1MB (default 64MB)
-                .max_frame_size(Some(buf_size * 4)); // 4x buffer_size (default 16MB)
+                .max_write_buffer_size(buf_size * 2) // 2x buffer_size (default usize::MAX!)
+                .max_message_size(Some(buf_size * 4)) // 4x buffer_size = 128KB (default 64MB)
+                .max_frame_size(Some(buf_size * 2)); // 2x buffer_size (default 16MB)
 
             // WebSocket handshake with path validation
             let ws_path = network_settings.ws_path.clone();
@@ -401,19 +401,19 @@ mod tests {
         let buf_size: usize = 32 * 1024;
         let ws_config = WebSocketConfig::default()
             .write_buffer_size(buf_size)
-            .max_write_buffer_size(buf_size * 4)
-            .max_message_size(Some(1024 * 1024))
-            .max_frame_size(Some(buf_size * 4));
+            .max_write_buffer_size(buf_size * 2)
+            .max_message_size(Some(buf_size * 4))
+            .max_frame_size(Some(buf_size * 2));
 
         // Write buffer matches configured buffer_size
         assert_eq!(ws_config.write_buffer_size, buf_size);
-        // Max write buffer is 4x buffer_size and bounded (not usize::MAX)
-        assert_eq!(ws_config.max_write_buffer_size, buf_size * 4);
+        // Max write buffer is 2x buffer_size and bounded (not usize::MAX)
+        assert_eq!(ws_config.max_write_buffer_size, buf_size * 2);
         assert!(ws_config.max_write_buffer_size < usize::MAX);
 
         // Message and frame sizes are bounded
-        assert_eq!(ws_config.max_message_size, Some(1024 * 1024));
-        assert_eq!(ws_config.max_frame_size, Some(buf_size * 4));
+        assert_eq!(ws_config.max_message_size, Some(buf_size * 4));
+        assert_eq!(ws_config.max_frame_size, Some(buf_size * 2));
     }
 
     #[test]
