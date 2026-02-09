@@ -41,7 +41,7 @@ impl TryFrom<u8> for TrojanCmd {
 }
 
 /// Address types supported by Trojan
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Address {
     /// IPv4 address
     IPv4([u8; 4], u16),

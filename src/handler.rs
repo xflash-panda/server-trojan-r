@@ -191,7 +191,7 @@ async fn handle_connect(
 
     // Connect based on outbound type
     match outbound_type {
-        hooks::OutboundType::Direct => handle_direct_connect(ctx).await,
+        hooks::OutboundType::Direct(resolved) => handle_direct_connect(ctx, resolved).await,
         hooks::OutboundType::Reject => Ok(()), // Already handled above
         hooks::OutboundType::Proxy(handler) => handle_proxy_connect(ctx, handler).await,
     }
@@ -255,9 +255,15 @@ impl<'a> ConnectContext<'a> {
 }
 
 /// Handle direct connection
-async fn handle_direct_connect(ctx: ConnectContext<'_>) -> Result<()> {
-    // Resolve target address
-    let remote_addr = ctx.target.to_socket_addr().await?;
+async fn handle_direct_connect(
+    ctx: ConnectContext<'_>,
+    resolved: Option<std::net::SocketAddr>,
+) -> Result<()> {
+    // Use pre-resolved address from SSRF check when available, avoiding redundant DNS
+    let remote_addr = match resolved {
+        Some(addr) => addr,
+        None => ctx.target.to_socket_addr().await?,
+    };
 
     // Connect with timeout
     let remote_stream = match tokio::time::timeout(
@@ -330,6 +336,7 @@ async fn handle_udp_associate(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use acl_engine_r::outbound::{Addr as AclAddr, AsyncOutbound, AsyncUdpConn};
+    use std::collections::HashMap;
 
     log::debug!(peer = %peer_addr, "UDP associate started");
 
@@ -342,6 +349,9 @@ async fn handle_udp_associate(
     if !initial_payload.is_empty() {
         pending_data.extend_from_slice(&initial_payload);
     }
+
+    // Per-session route cache: avoids repeated router.route() + DNS for the same target
+    let mut route_cache: HashMap<Address, hooks::OutboundType> = HashMap::new();
 
     // UDP connection state - reuse connection when possible
     let mut udp_conn: Option<Box<dyn AsyncUdpConn>> = None;
@@ -379,15 +389,22 @@ async fn handle_udp_associate(
                                     // Remove consumed bytes from buffer
                                     let _ = pending_data.split_to(consumed);
 
-                                    // Route the packet
-                                    let outbound_type = server.router.route(&packet.addr).await;
+                                    // Route the packet (use cache to avoid repeated DNS lookups)
+                                    let outbound_type = match route_cache.get(&packet.addr) {
+                                        Some(cached) => cached.clone(),
+                                        None => {
+                                            let result = server.router.route(&packet.addr).await;
+                                            route_cache.insert(packet.addr.clone(), result.clone());
+                                            result
+                                        }
+                                    };
 
-                                    match outbound_type {
+                                    match &outbound_type {
                                         hooks::OutboundType::Reject => {
                                             log::debug!(peer = %peer_addr, target = %packet.addr, "UDP packet rejected by router");
                                             continue;
                                         }
-                                        hooks::OutboundType::Direct => {
+                                        hooks::OutboundType::Direct(resolved) => {
                                             // For direct, we need to create a UDP connection if not exists
                                             if udp_conn.is_none() || current_handler.is_some() {
                                                 // Explicitly drop old connection to release resources
@@ -397,7 +414,11 @@ async fn handle_udp_associate(
                                                 current_handler = None;
 
                                                 let direct = acl::Direct::new();
-                                                let mut acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
+                                                // Use pre-resolved address when available to skip DNS
+                                                let mut acl_addr = match resolved {
+                                                    Some(addr) => AclAddr::new(addr.ip().to_string(), addr.port()),
+                                                    None => AclAddr::new(packet.addr.host(), packet.addr.port()),
+                                                };
                                                 match direct.dial_udp(&mut acl_addr).await {
                                                     Ok(conn) => {
                                                         udp_conn = Some(conn);
@@ -418,7 +439,7 @@ async fn handle_udp_associate(
                                             // Create new UDP connection if handler changed or not exists
                                             let need_new_conn = match &current_handler {
                                                 None => true,
-                                                Some(h) => !Arc::ptr_eq(h, &handler),
+                                                Some(h) => !Arc::ptr_eq(h, handler),
                                             };
 
                                             if need_new_conn {
@@ -431,7 +452,7 @@ async fn handle_udp_associate(
                                                 match handler.dial_udp(&mut acl_addr).await {
                                                     Ok(conn) => {
                                                         udp_conn = Some(conn);
-                                                        current_handler = Some(handler);
+                                                        current_handler = Some(handler.clone());
                                                     }
                                                     Err(e) => {
                                                         log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create proxy UDP connection");
@@ -442,9 +463,14 @@ async fn handle_udp_associate(
                                         }
                                     }
 
-                                    // Send UDP packet
+                                    // Send UDP packet (use resolved IP for direct to skip DNS in write_to)
                                     if let Some(ref conn) = udp_conn {
-                                        let acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
+                                        let acl_addr = match &outbound_type {
+                                            hooks::OutboundType::Direct(Some(addr)) => {
+                                                AclAddr::new(addr.ip().to_string(), addr.port())
+                                            }
+                                            _ => AclAddr::new(packet.addr.host(), packet.addr.port()),
+                                        };
                                         match conn.write_to(&packet.payload, &acl_addr).await {
                                             Ok(n) => {
                                                 server.stats.record_upload(user_id, n as u64);
