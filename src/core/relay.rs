@@ -388,10 +388,7 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
@@ -432,17 +429,11 @@ mod tests {
             )))
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -464,14 +455,7 @@ mod tests {
             shutdown_called: Arc::clone(&remote_shutdown),
         };
 
-        let result = copy_bidirectional_with_stats(
-            &mut client,
-            &mut remote,
-            300,
-            1024,
-            None,
-        )
-        .await;
+        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1024, None).await;
 
         assert!(result.is_err(), "Should return error from broken stream");
         assert!(
@@ -493,15 +477,9 @@ mod tests {
         let mut client = Cursor::new(data.to_vec());
         let mut remote = Cursor::new(Vec::new());
 
-        let result = copy_bidirectional_with_stats(
-            &mut client,
-            &mut remote,
-            300,
-            1024,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1024, None)
+            .await
+            .unwrap();
 
         assert!(result.completed);
         assert!(result.a_to_b > 0);
@@ -515,5 +493,4 @@ mod tests {
             .await
             .unwrap();
     }
-
 }
