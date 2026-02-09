@@ -23,11 +23,13 @@ const MAX_CONCURRENT_STREAMS: usize = 100;
 /// Maximum HTTP/2 header list size
 const MAX_HEADER_LIST_SIZE: u32 = 8 * 1024;
 
-/// Initial HTTP/2 window size
-const INITIAL_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+/// Initial HTTP/2 stream window size (per stream)
+/// Go net/http2 default is 1MB. 8MB was excessive and caused high memory
+/// usage under load (100 streams × 8MB = 800MB per H2 connection).
+const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 
-/// Initial HTTP/2 connection window size
-const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+/// Initial HTTP/2 connection window size (shared across all streams)
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 
 /// gRPC HTTP/2 connection manager
 ///
