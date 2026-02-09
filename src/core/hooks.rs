@@ -4,6 +4,7 @@
 
 use crate::core::Address;
 use async_trait::async_trait;
+use std::net::SocketAddr;
 
 /// User ID type used throughout the system.
 /// Using i64 for consistency with database and API layer.
@@ -36,8 +37,10 @@ pub trait OutboundRouter: Send + Sync {
 /// Outbound type for routing decisions
 #[derive(Clone)]
 pub enum OutboundType {
-    /// Direct connection
-    Direct,
+    /// Direct connection, optionally with a pre-resolved address to skip redundant DNS.
+    /// When the router already resolved the domain (e.g. for SSRF checking), it passes
+    /// the result here so the handler can reuse it instead of resolving again.
+    Direct(Option<SocketAddr>),
     /// Reject connection
     Reject,
     /// Proxy connection via ACL engine outbound handler
@@ -47,7 +50,8 @@ pub enum OutboundType {
 impl std::fmt::Debug for OutboundType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutboundType::Direct => write!(f, "Direct"),
+            OutboundType::Direct(None) => write!(f, "Direct"),
+            OutboundType::Direct(Some(addr)) => write!(f, "Direct({})", addr),
             OutboundType::Reject => write!(f, "Reject"),
             OutboundType::Proxy(handler) => write!(f, "Proxy({:?})", handler),
         }
@@ -83,48 +87,57 @@ impl Default for DirectRouter {
 #[async_trait]
 impl OutboundRouter for DirectRouter {
     async fn route(&self, addr: &Address) -> OutboundType {
-        if self.block_private_ip && is_private_address(addr).await {
-            return OutboundType::Reject;
+        if self.block_private_ip {
+            let (is_private, resolved) = check_private_and_resolve(addr).await;
+            if is_private {
+                return OutboundType::Reject;
+            }
+            return OutboundType::Direct(resolved);
         }
-        OutboundType::Direct
+        OutboundType::Direct(None)
     }
 }
 
-/// Check if an address is private/loopback/link-local
-async fn is_private_address(addr: &Address) -> bool {
+/// Check if an address is private/loopback/link-local.
+/// For domain addresses, also returns the first non-private resolved SocketAddr
+/// so callers can reuse it without a second DNS lookup.
+pub(crate) async fn check_private_and_resolve(addr: &Address) -> (bool, Option<SocketAddr>) {
     use super::ip_filter::{is_private_ipv4, is_private_ipv6};
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     match addr {
         Address::IPv4(ip, _) => {
             let ipv4 = Ipv4Addr::from(*ip);
-            is_private_ipv4(&ipv4)
+            (is_private_ipv4(&ipv4), None)
         }
         Address::IPv6(ip, _) => {
             let ipv6 = Ipv6Addr::from(*ip);
-            is_private_ipv6(&ipv6)
+            (is_private_ipv6(&ipv6), None)
         }
-        Address::Domain(domain, _) => {
-            // Resolve domain and check if it resolves to private IP
+        Address::Domain(domain, port) => {
             use tokio::net::lookup_host;
-            let lookup = format!("{}:0", domain);
-            if let Ok(addrs) = lookup_host(&lookup).await {
-                for addr in addrs {
-                    match addr.ip() {
-                        std::net::IpAddr::V4(ipv4) => {
-                            if is_private_ipv4(&ipv4) {
-                                return true;
-                            }
-                        }
-                        std::net::IpAddr::V6(ipv6) => {
-                            if is_private_ipv6(&ipv6) {
-                                return true;
-                            }
+            let lookup = format!("{}:{}", domain, port);
+            let resolved: Vec<SocketAddr> = match lookup_host(&lookup).await {
+                Ok(addrs) => addrs.collect(),
+                Err(_) => return (false, None),
+            };
+            let mut first_public: Option<SocketAddr> = None;
+            for addr in resolved {
+                match addr.ip() {
+                    IpAddr::V4(ipv4) if is_private_ipv4(&ipv4) => {
+                        return (true, None);
+                    }
+                    IpAddr::V6(ipv6) if is_private_ipv6(&ipv6) => {
+                        return (true, None);
+                    }
+                    _ => {
+                        if first_public.is_none() {
+                            first_public = Some(addr);
                         }
                     }
                 }
             }
-            false
+            (false, first_public)
         }
     }
 }
@@ -138,7 +151,7 @@ mod tests {
         let router = DirectRouter::new();
         let addr = Address::Domain("example.com".to_string(), 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct));
+        assert!(matches!(result, OutboundType::Direct(_)));
     }
 
     #[tokio::test]
@@ -169,7 +182,7 @@ mod tests {
         let router = DirectRouter::new();
         let addr = Address::IPv4([8, 8, 8, 8], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct));
+        assert!(matches!(result, OutboundType::Direct(None)));
     }
 
     #[tokio::test]
@@ -177,6 +190,55 @@ mod tests {
         let router = DirectRouter::with_block_private_ip(false);
         let addr = Address::IPv4([127, 0, 0, 1], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct));
+        assert!(matches!(result, OutboundType::Direct(None)));
+    }
+
+    #[tokio::test]
+    async fn test_direct_router_domain_returns_resolved_addr() {
+        let router = DirectRouter::new();
+        // localhost resolves to 127.0.0.1 which is private → Reject
+        let addr = Address::Domain("localhost".to_string(), 80);
+        let result = router.route(&addr).await;
+        assert!(matches!(result, OutboundType::Reject));
+    }
+
+    #[tokio::test]
+    async fn test_check_private_and_resolve_ipv4_private() {
+        let addr = Address::IPv4([10, 0, 0, 1], 80);
+        let (is_private, resolved) = check_private_and_resolve(&addr).await;
+        assert!(is_private);
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_private_and_resolve_ipv4_public() {
+        let addr = Address::IPv4([8, 8, 8, 8], 53);
+        let (is_private, resolved) = check_private_and_resolve(&addr).await;
+        assert!(!is_private);
+        // IP addresses don't need DNS, resolved is None
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_private_and_resolve_domain_private() {
+        let addr = Address::Domain("localhost".to_string(), 80);
+        let (is_private, resolved) = check_private_and_resolve(&addr).await;
+        assert!(is_private);
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_private_and_resolve_domain_public() {
+        // example.com should resolve to a public IP
+        let addr = Address::Domain("example.com".to_string(), 80);
+        let (is_private, resolved) = check_private_and_resolve(&addr).await;
+        assert!(!is_private);
+        // Should have a resolved address from the DNS lookup
+        assert!(
+            resolved.is_some(),
+            "public domain should return resolved addr"
+        );
+        let socket_addr = resolved.unwrap();
+        assert_eq!(socket_addr.port(), 80);
     }
 }

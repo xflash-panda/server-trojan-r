@@ -164,7 +164,15 @@ where
         Arc::clone(&counters.a_to_b), // writes to B = upload (not used by copy_bidirectional for counting)
     );
 
-    let copy_task = tokio::io::copy_bidirectional(&mut stream_a, &mut stream_b);
+    // Use 32KB buffers (default is 8KB) to reduce poll_write call frequency.
+    // 32KB matches Go's io.Copy default (what xray uses) — good throughput/memory balance.
+    const RELAY_BUF_SIZE: usize = 32 * 1024;
+    let copy_task = tokio::io::copy_bidirectional_with_sizes(
+        &mut stream_a,
+        &mut stream_b,
+        RELAY_BUF_SIZE,
+        RELAY_BUF_SIZE,
+    );
 
     let timeout_check = async {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));

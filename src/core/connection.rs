@@ -3,6 +3,7 @@
 //! Tracks active connections and provides kick-off capability.
 
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,7 +39,7 @@ pub struct ConnectionManager {
     /// Map from connection_id to active connection
     connections: Arc<DashMap<ConnectionId, ActiveConnection>>,
     /// Map from user_id to set of connection_ids (for quick user lookup)
-    user_connections: Arc<DashMap<UserId, Vec<ConnectionId>>>,
+    user_connections: Arc<DashMap<UserId, HashSet<ConnectionId>>>,
 }
 
 impl Default for ConnectionManager {
@@ -81,7 +82,7 @@ impl ConnectionManager {
         self.user_connections
             .entry(user_id)
             .or_default()
-            .push(conn_id);
+            .insert(conn_id);
 
         (conn_id, cancel_token)
     }
@@ -95,7 +96,7 @@ impl ConnectionManager {
             // register() cannot insert into the Vec between our retain and remove.
             self.user_connections
                 .remove_if_mut(&user_id, |_, conn_ids| {
-                    conn_ids.retain(|&id| id != conn_id);
+                    conn_ids.remove(&conn_id);
                     conn_ids.is_empty()
                 });
         }

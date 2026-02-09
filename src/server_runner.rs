@@ -137,16 +137,15 @@ where
             use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
             // Limit tungstenite internal buffers to prevent unbounded memory growth.
-            // Defaults are: write_buffer_size=128KB, max_write_buffer_size=usize::MAX,
-            // max_send_queue=None (unlimited). With slow clients, tungstenite buffers
-            // data internally without bound, causing memory to grow to 10+ GB.
-            // These limits enable backpressure so copy_bidirectional slows down
-            // reads from the remote instead of buffering indefinitely.
+            // At 50k connections, tungstenite's defaults (write_buffer_size=128KB,
+            // max_write_buffer_size=usize::MAX) would allow tens of GB total.
+            // Our WebSocketTransport layer handles backpressure via Poll::Pending,
+            // but tungstenite's own buffers must also be bounded.
             let ws_config = WebSocketConfig::default()
-                .write_buffer_size(32 * 1024) // 32KB (default 128KB)
-                .max_write_buffer_size(2 * 1024 * 1024) // 2MB (default usize::MAX!)
-                .max_message_size(Some(2 * 1024 * 1024)) // 2MB (default 64MB)
-                .max_frame_size(Some(512 * 1024)); // 512KB (default 16MB)
+                .write_buffer_size(32 * 1024) // 32KB — matches relay buffer size
+                .max_write_buffer_size(128 * 1024) // 128KB (default usize::MAX!)
+                .max_message_size(Some(1024 * 1024)) // 1MB (default 64MB)
+                .max_frame_size(Some(128 * 1024)); // 128KB (default 16MB)
 
             // WebSocket handshake with path validation
             let ws_path = network_settings.ws_path.clone();
@@ -397,18 +396,19 @@ mod tests {
 
         let ws_config = WebSocketConfig::default()
             .write_buffer_size(32 * 1024)
-            .max_write_buffer_size(2 * 1024 * 1024)
-            .max_message_size(Some(2 * 1024 * 1024))
-            .max_frame_size(Some(512 * 1024));
+            .max_write_buffer_size(128 * 1024)
+            .max_message_size(Some(1024 * 1024))
+            .max_frame_size(Some(128 * 1024));
 
-        // Write buffer is bounded (not usize::MAX)
+        // Write buffer matches relay buffer size
         assert_eq!(ws_config.write_buffer_size, 32 * 1024);
-        assert_eq!(ws_config.max_write_buffer_size, 2 * 1024 * 1024);
+        // Max write buffer is bounded (not usize::MAX)
+        assert_eq!(ws_config.max_write_buffer_size, 128 * 1024);
         assert!(ws_config.max_write_buffer_size < usize::MAX);
 
         // Message and frame sizes are bounded
-        assert_eq!(ws_config.max_message_size, Some(2 * 1024 * 1024));
-        assert_eq!(ws_config.max_frame_size, Some(512 * 1024));
+        assert_eq!(ws_config.max_message_size, Some(1024 * 1024));
+        assert_eq!(ws_config.max_frame_size, Some(128 * 1024));
     }
 
     #[test]
