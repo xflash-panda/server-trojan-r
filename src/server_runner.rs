@@ -380,4 +380,34 @@ mod tests {
         handle.await.unwrap();
         assert_eq!(limiter.available_permits(), 1);
     }
+
+    #[test]
+    fn test_ws_config_buffer_limits() {
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let ws_config = WebSocketConfig::default()
+            .write_buffer_size(32 * 1024)
+            .max_write_buffer_size(2 * 1024 * 1024)
+            .max_message_size(Some(2 * 1024 * 1024))
+            .max_frame_size(Some(512 * 1024));
+
+        // Write buffer is bounded (not usize::MAX)
+        assert_eq!(ws_config.write_buffer_size, 32 * 1024);
+        assert_eq!(ws_config.max_write_buffer_size, 2 * 1024 * 1024);
+        assert!(ws_config.max_write_buffer_size < usize::MAX);
+
+        // Message and frame sizes are bounded
+        assert_eq!(ws_config.max_message_size, Some(2 * 1024 * 1024));
+        assert_eq!(ws_config.max_frame_size, Some(512 * 1024));
+    }
+
+    #[test]
+    fn test_ws_config_defaults_are_unbounded() {
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        // Verify that tungstenite defaults are indeed unbounded -
+        // this is the root cause we're protecting against.
+        let defaults = WebSocketConfig::default();
+        assert_eq!(defaults.max_write_buffer_size, usize::MAX);
+    }
 }

@@ -251,4 +251,28 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn test_h2_window_sizes() {
+        // Stream window <= connection window
+        assert!(INITIAL_WINDOW_SIZE <= INITIAL_CONNECTION_WINDOW_SIZE);
+        // Connection window can serve multiple streams concurrently
+        assert!(INITIAL_CONNECTION_WINDOW_SIZE >= INITIAL_WINDOW_SIZE * 2);
+        // Match Go net/http2 defaults (1MB stream, 4MB connection)
+        assert_eq!(INITIAL_WINDOW_SIZE, 1024 * 1024);
+        assert_eq!(INITIAL_CONNECTION_WINDOW_SIZE, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_h2_max_concurrent_streams() {
+        // Memory bound: MAX_CONCURRENT_STREAMS × INITIAL_WINDOW_SIZE should be reasonable
+        let max_memory_per_conn =
+            MAX_CONCURRENT_STREAMS as u64 * INITIAL_WINDOW_SIZE as u64;
+        // With 100 streams × 1MB = 100MB per H2 connection (was 800MB with 8MB windows)
+        assert!(
+            max_memory_per_conn <= 256 * 1024 * 1024,
+            "per-connection memory bound too high: {}MB",
+            max_memory_per_conn / (1024 * 1024)
+        );
+    }
 }

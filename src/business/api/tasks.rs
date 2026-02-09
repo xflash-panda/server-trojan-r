@@ -7,6 +7,11 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
+/// Number of worker threads for the dedicated background task runtime.
+/// These tasks are mostly idle (interval-based) with brief gRPC I/O,
+/// so 2 threads is sufficient while providing isolation from proxy I/O.
+const BG_RUNTIME_WORKERS: usize = 2;
+
 use super::client::ApiManager;
 use super::user_manager::UserManager;
 use crate::business::stats::ApiStatsCollector;
@@ -75,6 +80,12 @@ pub struct BackgroundTasks {
 pub struct BackgroundTasksHandle {
     shutdown_tx: watch::Sender<bool>,
     handles: Vec<JoinHandle<()>>,
+    /// Dedicated runtime for background tasks - keeps it alive until shutdown.
+    /// Under high proxy load (65k+ connections), the main tokio runtime's worker
+    /// threads are saturated by proxy I/O, starving background API tasks and
+    /// causing gRPC timeouts. This dedicated runtime ensures API tasks always
+    /// have available threads.
+    _runtime: tokio::runtime::Runtime,
 }
 
 impl BackgroundTasksHandle {
@@ -115,28 +126,40 @@ impl BackgroundTasks {
     }
 
     /// Start all background tasks and return a handle for shutdown
+    ///
+    /// Creates a dedicated tokio runtime so background API tasks are not
+    /// starved by proxy connection I/O on the main runtime.
     pub fn start(self) -> BackgroundTasksHandle {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(BG_RUNTIME_WORKERS)
+            .thread_name("api-bg")
+            .enable_all()
+            .build()
+            .expect("Failed to create background task runtime");
+
+        let rt_handle = runtime.handle();
         let handles = vec![
-            self.start_fetch_users_task(),
-            self.start_report_traffic_task(),
-            self.start_heartbeat_task(),
+            self.start_fetch_users_task(rt_handle),
+            self.start_report_traffic_task(rt_handle),
+            self.start_heartbeat_task(rt_handle),
         ];
-        log::info!("Background tasks started");
+        log::info!("Background tasks started on dedicated runtime");
 
         BackgroundTasksHandle {
             shutdown_tx: self.shutdown_tx,
             handles,
+            _runtime: runtime,
         }
     }
 
     /// Start the fetch users task
-    fn start_fetch_users_task(&self) -> JoinHandle<()> {
+    fn start_fetch_users_task(&self, rt: &tokio::runtime::Handle) -> JoinHandle<()> {
         let api_manager = Arc::clone(&self.api_manager);
         let user_manager = Arc::clone(&self.user_manager);
         let interval_duration = self.config.fetch_users_interval;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
-        tokio::spawn(async move {
+        rt.spawn(async move {
             let mut interval = interval(interval_duration);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -157,13 +180,13 @@ impl BackgroundTasks {
     }
 
     /// Start the report traffic task
-    fn start_report_traffic_task(&self) -> JoinHandle<()> {
+    fn start_report_traffic_task(&self, rt: &tokio::runtime::Handle) -> JoinHandle<()> {
         let api_manager = Arc::clone(&self.api_manager);
         let stats_collector = Arc::clone(&self.stats_collector);
         let interval_duration = self.config.report_traffic_interval;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
-        tokio::spawn(async move {
+        rt.spawn(async move {
             let mut interval = interval(interval_duration);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -188,12 +211,12 @@ impl BackgroundTasks {
     }
 
     /// Start the heartbeat task
-    fn start_heartbeat_task(&self) -> JoinHandle<()> {
+    fn start_heartbeat_task(&self, rt: &tokio::runtime::Handle) -> JoinHandle<()> {
         let api_manager = Arc::clone(&self.api_manager);
         let interval_duration = self.config.heartbeat_interval;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
-        tokio::spawn(async move {
+        rt.spawn(async move {
             let mut interval = interval(interval_duration);
             // Use Delay instead of Skip to ensure heartbeat is sent as soon as possible
             // after a slow/failed request, rather than skipping the next tick
@@ -313,5 +336,101 @@ mod tests {
             config.report_traffic_interval
         );
         assert_eq!(cloned.heartbeat_interval, config.heartbeat_interval);
+    }
+
+    #[test]
+    fn test_bg_runtime_workers_reasonable() {
+        // Should be at least 1 and not wastefully large
+        assert!(BG_RUNTIME_WORKERS >= 1);
+        assert!(BG_RUNTIME_WORKERS <= 4);
+    }
+
+    #[test]
+    fn test_dedicated_runtime_creates_successfully() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(BG_RUNTIME_WORKERS)
+            .thread_name("test-bg")
+            .enable_all()
+            .build()
+            .expect("Failed to create background task runtime");
+
+        // Verify tasks can be spawned and completed on the dedicated runtime
+        let result = runtime.block_on(async {
+            let handle = tokio::spawn(async { 42 });
+            handle.await.unwrap()
+        });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_dedicated_runtime_tasks_complete_independently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bg_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(BG_RUNTIME_WORKERS)
+            .thread_name("test-bg")
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        // Spawn on dedicated runtime and verify it completes
+        bg_runtime.block_on(async move {
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                counter_clone.fetch_add(1, Ordering::Relaxed);
+            });
+            handle.await.unwrap();
+        });
+
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_dedicated_runtime_isolated_from_other_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Simulate the real setup: main runtime + dedicated bg runtime
+        let main_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("test-main")
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let bg_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("test-bg")
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = Arc::clone(&completed);
+
+        // Spawn task on bg runtime
+        let bg_handle = bg_runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            completed_clone.store(true, Ordering::Relaxed);
+        });
+
+        // Flood the main runtime with tasks
+        main_runtime.block_on(async {
+            let mut flood = vec![];
+            for _ in 0..200 {
+                flood.push(tokio::spawn(async {
+                    tokio::task::yield_now().await;
+                }));
+            }
+            for h in flood {
+                let _ = h.await;
+            }
+        });
+
+        // bg task should complete independently
+        bg_runtime.block_on(async { bg_handle.await.unwrap() });
+        assert!(completed.load(Ordering::Relaxed));
     }
 }
