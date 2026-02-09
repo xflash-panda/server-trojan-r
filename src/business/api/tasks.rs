@@ -247,7 +247,7 @@ async fn fetch_users_once(
 ) -> anyhow::Result<()> {
     let users = api_manager.fetch_users().await?;
     let total = users.len();
-    let (added, removed, uuid_changed, kicked) = user_manager.update(&users).await;
+    let (added, removed, uuid_changed, kicked) = user_manager.update(&users);
 
     log::info!(
         total = total,
