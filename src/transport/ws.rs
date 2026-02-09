@@ -152,7 +152,14 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.closed = true;
+        if !self.closed {
+            self.closed = true;
+            // Send WebSocket Close frame (best-effort, don't block on peer response)
+            let me = &mut *self;
+            if let Poll::Ready(Ok(())) = Sink::poll_ready(me.ws_stream.as_mut(), cx) {
+                let _ = Sink::start_send(me.ws_stream.as_mut(), Message::Close(None));
+            }
+        }
         self.as_mut().poll_flush(cx)
     }
 }

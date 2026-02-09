@@ -1,6 +1,6 @@
 [package]
 name = "server-trojan-r"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 
 [dependencies]
@@ -33,8 +33,7 @@ pin-project-lite = "0.2"
 tokio-util = "0.7"
 scopeguard = "1.2.0"
 dashmap = "6.1"
-moka = { version = "0.12", features = ["future"] }
-mimalloc = { version = "0.1", default-features = false }
+tikv-jemallocator = "0.6"
 async-trait = "0.1"
 arc-swap = "1"
 

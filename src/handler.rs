@@ -211,6 +211,9 @@ impl<'a> ConnectContext<'a> {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // Keep ownership of client_stream so we can shutdown after cancel
+        let mut client_stream = self.client_stream;
+
         // Write initial payload if any
         if !self.initial_payload.is_empty() {
             self.server
@@ -219,11 +222,13 @@ impl<'a> ConnectContext<'a> {
             remote_stream.write_all(&self.initial_payload).await?;
         }
 
-        // Relay data with stats tracking and cancellation support
+        // Relay data with stats tracking and cancellation support.
+        // Pass &mut so streams aren't moved into the future — this allows
+        // graceful shutdown even when cancel_token drops the relay future.
         let stats = Arc::clone(&self.server.stats);
         let relay_fut = copy_bidirectional_with_stats(
-            self.client_stream,
-            remote_stream,
+            &mut client_stream,
+            &mut remote_stream,
             self.server.conn_config.idle_timeout_secs(),
             self.server.conn_config.buffer_size,
             Some((self.user_id, stats)),
@@ -247,6 +252,11 @@ impl<'a> ConnectContext<'a> {
                 log::debug!(peer = %self.peer_addr, "Connection kicked");
             }
         }
+
+        // Graceful shutdown for both streams (covers cancel, timeout, and error paths).
+        // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
+        let _ = client_stream.shutdown().await;
+        let _ = remote_stream.shutdown().await;
 
         Ok(())
     }
@@ -528,6 +538,9 @@ async fn handle_udp_associate(
             }
         }
     }
+
+    // Graceful shutdown of the client TCP stream carrying UDP packets
+    let _ = client_stream.shutdown().await;
 
     Ok(())
 }
