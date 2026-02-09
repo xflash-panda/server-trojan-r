@@ -457,7 +457,9 @@ impl AclRouter {
 #[async_trait]
 impl crate::core::hooks::OutboundRouter for AclRouter {
     async fn route(&self, addr: &crate::core::Address) -> crate::core::hooks::OutboundType {
-        use std::net::{Ipv4Addr, Ipv6Addr};
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        let mut resolved_addr: Option<SocketAddr> = None;
 
         // Check for private IP if blocking is enabled
         if self.block_private_ip {
@@ -476,26 +478,25 @@ impl crate::core::hooks::OutboundRouter for AclRouter {
                         return crate::core::hooks::OutboundType::Reject;
                     }
                 }
-                crate::core::Address::Domain(domain, _) => {
-                    // Resolve domain and check if it resolves to private IP
-                    if let Some(reject) = self.check_domain_resolves_to_private(domain).await {
-                        return reject;
+                crate::core::Address::Domain(domain, port) => {
+                    match self.check_domain_private_and_resolve(domain, *port).await {
+                        (true, _) => return crate::core::hooks::OutboundType::Reject,
+                        (false, addr) => resolved_addr = addr,
                     }
                 }
             }
         }
 
-        // Extract host and port without allocating strings for IPs
+        // Extract host and port for ACL matching
         let (host, port) = match addr {
             crate::core::Address::IPv4(ip, port) => (Ipv4Addr::from(*ip).to_string(), *port),
             crate::core::Address::IPv6(ip, port) => (Ipv6Addr::from(*ip).to_string(), *port),
             crate::core::Address::Domain(domain, port) => {
-                // Domain already a String, just borrow it
-                return self.route_host(domain, *port);
+                return self.route_host_with_resolved(domain, *port, resolved_addr);
             }
         };
 
-        self.route_host(&host, port)
+        self.route_host_with_resolved(&host, port, resolved_addr)
     }
 }
 
@@ -503,54 +504,67 @@ impl crate::core::hooks::OutboundRouter for AclRouter {
 use crate::core::ip_filter::{is_private_ipv4, is_private_ipv6};
 
 impl AclRouter {
-    /// Check if a domain resolves to a private IP address
-    async fn check_domain_resolves_to_private(
+    /// Check if a domain resolves to a private IP address.
+    /// Returns (is_private, first_public_addr) so the resolved address can be reused.
+    async fn check_domain_private_and_resolve(
         &self,
         domain: &str,
-    ) -> Option<crate::core::hooks::OutboundType> {
+        port: u16,
+    ) -> (bool, Option<std::net::SocketAddr>) {
         use tokio::net::lookup_host;
 
-        let lookup = format!("{}:0", domain);
-        if let Ok(addrs) = lookup_host(&lookup).await {
-            for addr in addrs {
-                match addr.ip() {
-                    std::net::IpAddr::V4(ipv4) => {
-                        if is_private_ipv4(&ipv4) {
-                            log::debug!(
-                                domain = %domain,
-                                resolved_ip = %ipv4,
-                                "Blocked domain resolving to private IPv4"
-                            );
-                            return Some(crate::core::hooks::OutboundType::Reject);
-                        }
-                    }
-                    std::net::IpAddr::V6(ipv6) => {
-                        if is_private_ipv6(&ipv6) {
-                            log::debug!(
-                                domain = %domain,
-                                resolved_ip = %ipv6,
-                                "Blocked domain resolving to private IPv6"
-                            );
-                            return Some(crate::core::hooks::OutboundType::Reject);
-                        }
+        let lookup = format!("{}:{}", domain, port);
+        let resolved: Vec<std::net::SocketAddr> = match lookup_host(&lookup).await {
+            Ok(addrs) => addrs.collect(),
+            Err(_) => return (false, None),
+        };
+        let mut first_public: Option<std::net::SocketAddr> = None;
+        for addr in resolved {
+            match addr.ip() {
+                std::net::IpAddr::V4(ipv4) if is_private_ipv4(&ipv4) => {
+                    log::debug!(
+                        domain = %domain,
+                        resolved_ip = %ipv4,
+                        "Blocked domain resolving to private IPv4"
+                    );
+                    return (true, None);
+                }
+                std::net::IpAddr::V6(ipv6) if is_private_ipv6(&ipv6) => {
+                    log::debug!(
+                        domain = %domain,
+                        resolved_ip = %ipv6,
+                        "Blocked domain resolving to private IPv6"
+                    );
+                    return (true, None);
+                }
+                _ => {
+                    if first_public.is_none() {
+                        first_public = Some(addr);
                     }
                 }
             }
         }
-        None
+        (false, first_public)
     }
 
-    fn route_host(&self, host: &str, port: u16) -> crate::core::hooks::OutboundType {
+    /// Route host via ACL engine, passing through any pre-resolved address for Direct results.
+    fn route_host_with_resolved(
+        &self,
+        host: &str,
+        port: u16,
+        resolved: Option<std::net::SocketAddr>,
+    ) -> crate::core::hooks::OutboundType {
         match self.engine.match_host(host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
-                OutboundHandler::Direct(_) => crate::core::hooks::OutboundType::Direct,
+                OutboundHandler::Direct(_) => {
+                    crate::core::hooks::OutboundType::Direct(resolved)
+                }
                 OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
-                    // Return the proxy handler for core layer to use
                     crate::core::hooks::OutboundType::Proxy(handler)
                 }
                 OutboundHandler::Reject(_) => crate::core::hooks::OutboundType::Reject,
             },
-            None => crate::core::hooks::OutboundType::Direct,
+            None => crate::core::hooks::OutboundType::Direct(resolved),
         }
     }
 }
@@ -1198,7 +1212,7 @@ acl:
         // Test public IP should not be rejected
         let addr = Address::IPv4([8, 8, 8, 8], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, crate::core::hooks::OutboundType::Direct));
+        assert!(matches!(result, crate::core::hooks::OutboundType::Direct(_)));
     }
 
     #[tokio::test]
@@ -1231,6 +1245,6 @@ acl:
         // Private IP should be allowed when blocking is disabled
         let addr = Address::IPv4([127, 0, 0, 1], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, crate::core::hooks::OutboundType::Direct));
+        assert!(matches!(result, crate::core::hooks::OutboundType::Direct(_)));
     }
 }
