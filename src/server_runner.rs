@@ -102,9 +102,12 @@ where
         TransportType::Grpc => {
             let peer_addr_for_log = peer_addr.clone();
             log::debug!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
-            let grpc_conn =
-                GrpcConnection::with_service_name(stream, &network_settings.grpc_service_name)
-                    .await?;
+            let grpc_conn = GrpcConnection::with_config(
+                stream,
+                &network_settings.grpc_service_name,
+                server.conn_config.buffer_size,
+            )
+            .await?;
             let result = grpc_conn
                 .run(move |grpc_transport| {
                     let server = Arc::clone(&server);
@@ -141,11 +144,12 @@ where
             // max_write_buffer_size=usize::MAX) would allow tens of GB total.
             // Our WebSocketTransport layer handles backpressure via Poll::Pending,
             // but tungstenite's own buffers must also be bounded.
+            let buf_size = server.conn_config.buffer_size;
             let ws_config = WebSocketConfig::default()
-                .write_buffer_size(32 * 1024) // 32KB — matches relay buffer size
-                .max_write_buffer_size(128 * 1024) // 128KB (default usize::MAX!)
+                .write_buffer_size(buf_size) // matches relay buffer size
+                .max_write_buffer_size(buf_size * 4) // 4x buffer_size (default usize::MAX!)
                 .max_message_size(Some(1024 * 1024)) // 1MB (default 64MB)
-                .max_frame_size(Some(128 * 1024)); // 128KB (default 16MB)
+                .max_frame_size(Some(buf_size * 4)); // 4x buffer_size (default 16MB)
 
             // WebSocket handshake with path validation
             let ws_path = network_settings.ws_path.clone();
@@ -394,21 +398,22 @@ mod tests {
     fn test_ws_config_buffer_limits() {
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+        let buf_size: usize = 32 * 1024;
         let ws_config = WebSocketConfig::default()
-            .write_buffer_size(32 * 1024)
-            .max_write_buffer_size(128 * 1024)
+            .write_buffer_size(buf_size)
+            .max_write_buffer_size(buf_size * 4)
             .max_message_size(Some(1024 * 1024))
-            .max_frame_size(Some(128 * 1024));
+            .max_frame_size(Some(buf_size * 4));
 
-        // Write buffer matches relay buffer size
-        assert_eq!(ws_config.write_buffer_size, 32 * 1024);
-        // Max write buffer is bounded (not usize::MAX)
-        assert_eq!(ws_config.max_write_buffer_size, 128 * 1024);
+        // Write buffer matches configured buffer_size
+        assert_eq!(ws_config.write_buffer_size, buf_size);
+        // Max write buffer is 4x buffer_size and bounded (not usize::MAX)
+        assert_eq!(ws_config.max_write_buffer_size, buf_size * 4);
         assert!(ws_config.max_write_buffer_size < usize::MAX);
 
         // Message and frame sizes are bounded
         assert_eq!(ws_config.max_message_size, Some(1024 * 1024));
-        assert_eq!(ws_config.max_frame_size, Some(128 * 1024));
+        assert_eq!(ws_config.max_frame_size, Some(buf_size * 4));
     }
 
     #[test]
