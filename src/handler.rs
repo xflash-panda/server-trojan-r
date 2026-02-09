@@ -296,13 +296,8 @@ async fn handle_proxy_connect(
 ) -> Result<()> {
     use acl::{Addr as AclAddr, AsyncOutbound};
 
-    // Convert Address to ACL Addr
-    let (host, port) = match ctx.target {
-        Address::IPv4(ip, port) => (std::net::Ipv4Addr::from(*ip).to_string(), *port),
-        Address::IPv6(ip, port) => (std::net::Ipv6Addr::from(*ip).to_string(), *port),
-        Address::Domain(domain, port) => (domain.clone(), *port),
-    };
-    let mut acl_addr = AclAddr::new(&host, port);
+    // Convert Address to ACL Addr (Cow avoids clone for domains)
+    let mut acl_addr = AclAddr::new(ctx.target.host().into_owned(), ctx.target.port());
 
     // Connect via proxy with timeout
     let remote_stream = match tokio::time::timeout(
@@ -348,8 +343,9 @@ async fn handle_udp_associate(
         read_buf.extend_from_slice(&initial_payload);
     }
 
-    // Per-session route cache: avoids repeated router.route() + DNS for the same target
-    let mut route_cache: HashMap<Address, hooks::OutboundType> = HashMap::new();
+    // Per-session route cache: avoids repeated router.route() + DNS for the same target.
+    // Also caches the AclAddr for write_to() to avoid per-packet String allocation.
+    let mut route_cache: HashMap<Address, (hooks::OutboundType, AclAddr)> = HashMap::new();
 
     // UDP relay loop
     let mut temp_buf = vec![0u8; 65536];
@@ -391,13 +387,21 @@ async fn handle_udp_associate(
                         DecodeResult::Ok(packet, consumed) => {
                             let _ = read_buf.split_to(consumed);
 
-                            // Route the packet (use cache to avoid repeated DNS lookups)
-                            let outbound_type = match route_cache.get(&packet.addr) {
-                                Some(cached) => cached.clone(),
+                            // Route the packet (use cache to avoid repeated DNS lookups and String allocs)
+                            let (outbound_type, send_addr) = match route_cache.get(&packet.addr) {
+                                Some(cached) => (cached.0.clone(), &cached.1),
                                 None => {
                                     let result = server.router.route(&packet.addr).await;
-                                    route_cache.insert(packet.addr.clone(), result.clone());
-                                    result
+                                    // Pre-compute the AclAddr for write_to() once per unique target
+                                    let acl_addr = match &result {
+                                        hooks::OutboundType::Direct(Some(addr)) => {
+                                            AclAddr::new(addr.ip().to_string(), addr.port())
+                                        }
+                                        _ => AclAddr::new(packet.addr.host().into_owned(), packet.addr.port()),
+                                    };
+                                    route_cache.insert(packet.addr.clone(), (result.clone(), acl_addr));
+                                    let cached = route_cache.get(&packet.addr).unwrap();
+                                    (cached.0.clone(), &cached.1)
                                 }
                             };
 
@@ -406,7 +410,7 @@ async fn handle_udp_associate(
                                     log::debug!(peer = %peer_addr, target = %packet.addr, "UDP packet rejected by router");
                                     continue;
                                 }
-                                hooks::OutboundType::Direct(resolved) => {
+                                hooks::OutboundType::Direct(_) => {
                                     // For direct, we need to create a UDP connection if not exists
                                     if udp_conn.is_none() || current_handler.is_some() {
                                         // Explicitly drop old connection to release resources
@@ -416,12 +420,9 @@ async fn handle_udp_associate(
                                         current_handler = None;
 
                                         let direct = acl::Direct::new();
-                                        // Use pre-resolved address when available to skip DNS
-                                        let mut acl_addr = match resolved {
-                                            Some(addr) => AclAddr::new(addr.ip().to_string(), addr.port()),
-                                            None => AclAddr::new(packet.addr.host(), packet.addr.port()),
-                                        };
-                                        match direct.dial_udp(&mut acl_addr).await {
+                                        // Reuse cached AclAddr (avoids per-packet String allocation)
+                                        let mut dial_addr = send_addr.clone();
+                                        match direct.dial_udp(&mut dial_addr).await {
                                             Ok(conn) => {
                                                 udp_conn = Some(conn);
                                             }
@@ -451,8 +452,9 @@ async fn handle_udp_associate(
                                             drop(old_conn);
                                         }
 
-                                        let mut acl_addr = AclAddr::new(packet.addr.host(), packet.addr.port());
-                                        match handler.dial_udp(&mut acl_addr).await {
+                                        // Reuse cached AclAddr (avoids per-packet String allocation)
+                                        let mut dial_addr = send_addr.clone();
+                                        match handler.dial_udp(&mut dial_addr).await {
                                             Ok(conn) => {
                                                 udp_conn = Some(conn);
                                                 current_handler = Some(handler.clone());
@@ -466,15 +468,9 @@ async fn handle_udp_associate(
                                 }
                             }
 
-                            // Send UDP packet (use resolved IP for direct to skip DNS in write_to)
+                            // Send UDP packet using cached AclAddr (zero per-packet String allocation)
                             if let Some(ref conn) = udp_conn {
-                                let acl_addr = match &outbound_type {
-                                    hooks::OutboundType::Direct(Some(addr)) => {
-                                        AclAddr::new(addr.ip().to_string(), addr.port())
-                                    }
-                                    _ => AclAddr::new(packet.addr.host(), packet.addr.port()),
-                                };
-                                match conn.write_to(&packet.payload, &acl_addr).await {
+                                match conn.write_to(&packet.payload, send_addr).await {
                                     Ok(n) => {
                                         server.stats.record_upload(user_id, n as u64);
                                         log::trace!(peer = %peer_addr, target = %packet.addr, bytes = n, "UDP packet sent");

@@ -487,14 +487,9 @@ impl crate::core::hooks::OutboundRouter for AclRouter {
             }
         }
 
-        // Extract host and port for ACL matching
-        let (host, port) = match addr {
-            crate::core::Address::IPv4(ip, port) => (Ipv4Addr::from(*ip).to_string(), *port),
-            crate::core::Address::IPv6(ip, port) => (Ipv6Addr::from(*ip).to_string(), *port),
-            crate::core::Address::Domain(domain, port) => {
-                return self.route_host_with_resolved(domain, *port, resolved_addr);
-            }
-        };
+        // Extract host and port for ACL matching (Cow avoids alloc for domains)
+        let host = addr.host();
+        let port = addr.port();
 
         self.route_host_with_resolved(&host, port, resolved_addr)
     }
@@ -556,9 +551,7 @@ impl AclRouter {
     ) -> crate::core::hooks::OutboundType {
         match self.engine.match_host(host, port, Protocol::TCP) {
             Some(handler) => match &*handler {
-                OutboundHandler::Direct(_) => {
-                    crate::core::hooks::OutboundType::Direct(resolved)
-                }
+                OutboundHandler::Direct(_) => crate::core::hooks::OutboundType::Direct(resolved),
                 OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
                     crate::core::hooks::OutboundType::Proxy(handler)
                 }
@@ -1212,7 +1205,10 @@ acl:
         // Test public IP should not be rejected
         let addr = Address::IPv4([8, 8, 8, 8], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, crate::core::hooks::OutboundType::Direct(_)));
+        assert!(matches!(
+            result,
+            crate::core::hooks::OutboundType::Direct(_)
+        ));
     }
 
     #[tokio::test]
@@ -1245,6 +1241,9 @@ acl:
         // Private IP should be allowed when blocking is disabled
         let addr = Address::IPv4([127, 0, 0, 1], 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, crate::core::hooks::OutboundType::Direct(_)));
+        assert!(matches!(
+            result,
+            crate::core::hooks::OutboundType::Direct(_)
+        ));
     }
 }

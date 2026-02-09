@@ -101,9 +101,7 @@ impl OutboundRouter for DirectRouter {
 /// Check if an address is private/loopback/link-local.
 /// For domain addresses, also returns the first non-private resolved SocketAddr
 /// so callers can reuse it without a second DNS lookup.
-pub(crate) async fn check_private_and_resolve(
-    addr: &Address,
-) -> (bool, Option<SocketAddr>) {
+pub(crate) async fn check_private_and_resolve(addr: &Address) -> (bool, Option<SocketAddr>) {
     use super::ip_filter::{is_private_ipv4, is_private_ipv6};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -236,7 +234,10 @@ mod tests {
         let (is_private, resolved) = check_private_and_resolve(&addr).await;
         assert!(!is_private);
         // Should have a resolved address from the DNS lookup
-        assert!(resolved.is_some(), "public domain should return resolved addr");
+        assert!(
+            resolved.is_some(),
+            "public domain should return resolved addr"
+        );
         let socket_addr = resolved.unwrap();
         assert_eq!(socket_addr.port(), 80);
     }

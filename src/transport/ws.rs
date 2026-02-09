@@ -128,13 +128,15 @@ where
                 // No intermediate buffer needed: data comes from copy_bidirectional's
                 // 32KB relay buffer and goes straight to tungstenite.
                 let data = Bytes::copy_from_slice(buf);
-                Sink::start_send(me.ws_stream.as_mut(), Message::Binary(data))
-                    .map_err(|e| io::Error::other(format!("WebSocket send error: {}", e)))?;
+                Sink::start_send(me.ws_stream.as_mut(), Message::Binary(data)).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "WebSocket send error")
+                })?;
                 Poll::Ready(Ok(buf.len()))
             }
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))))
-            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WebSocket error",
+            ))),
             Poll::Pending => {
                 // Sink not ready — apply backpressure via Pending.
                 // Data stays in copy_bidirectional's relay buffer (no copy needed).
@@ -146,7 +148,7 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Sink::poll_flush(self.ws_stream.as_mut(), cx)
-            .map_err(|e| io::Error::other(format!("WebSocket flush error: {}", e)))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WebSocket flush error"))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
