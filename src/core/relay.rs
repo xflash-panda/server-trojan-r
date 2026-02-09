@@ -123,8 +123,8 @@ use super::hooks::{StatsCollector, UserId};
 /// Returns CopyResult with bytes transferred and completion status.
 /// Note: Traffic is tracked in real-time, even if the connection times out.
 pub async fn copy_bidirectional_with_stats<A, B>(
-    a: A,
-    b: B,
+    a: &mut A,
+    b: &mut B,
     idle_timeout_secs: u64,
     buffer_size: usize,
     stats: Option<(UserId, Arc<dyn StatsCollector>)>,
@@ -198,6 +198,13 @@ where
         _ = timeout_check => (false, None)
     };
 
+    // Graceful shutdown when relay didn't complete normally (timeout or error).
+    // Ensures WebSocket Close frames, gRPC trailers, and TCP FIN are sent.
+    if !completed {
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream_a).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream_b).await;
+    }
+
     // Always get accurate traffic data from counters (real-time tracked)
     let a_to_b = counters.a_to_b.load(Ordering::Relaxed);
     let b_to_a = counters.b_to_a.load(Ordering::Relaxed);
@@ -227,6 +234,7 @@ where
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
 
     #[tokio::test]
     async fn test_copy_result_clone() {
@@ -354,4 +362,158 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// Stream wrapper that tracks whether shutdown was called
+    struct ShutdownTracker<S> {
+        inner: S,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for ShutdownTracker<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for ShutdownTracker<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::Release);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A stream that always returns error on read (simulates broken connection)
+    struct AlwaysError;
+
+    impl AsyncRead for AlwaysError {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "test error",
+            )))
+        }
+    }
+
+    impl AsyncWrite for AlwaysError {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "test error",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Verify that streams are shut down when relay errors out.
+    /// This tests the `if !completed` shutdown path added to fix
+    /// connections being dropped without proper close frames/FIN.
+    #[tokio::test]
+    async fn test_shutdown_called_on_relay_error() {
+        let client_shutdown = Arc::new(AtomicBool::new(false));
+        let remote_shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut client = ShutdownTracker {
+            inner: AlwaysError,
+            shutdown_called: Arc::clone(&client_shutdown),
+        };
+        let mut remote = ShutdownTracker {
+            inner: Cursor::new(Vec::new()),
+            shutdown_called: Arc::clone(&remote_shutdown),
+        };
+
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300,
+            1024,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Should return error from broken stream");
+        assert!(
+            client_shutdown.load(Ordering::Acquire),
+            "Client stream should be shut down after error"
+        );
+        assert!(
+            remote_shutdown.load(Ordering::Acquire),
+            "Remote stream should be shut down after error"
+        );
+    }
+
+    /// Verify that the &mut reference pattern allows callers to
+    /// access and shutdown streams after relay completes.
+    /// This enables handler.rs to call shutdown after cancel_token fires.
+    #[tokio::test]
+    async fn test_mut_ref_allows_post_relay_shutdown() {
+        let data = b"hello";
+        let mut client = Cursor::new(data.to_vec());
+        let mut remote = Cursor::new(Vec::new());
+
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300,
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.completed);
+        assert!(result.a_to_b > 0);
+
+        // Key: streams are still accessible after relay (not moved into the future).
+        // This enables the caller to call shutdown after cancel or timeout.
+        tokio::io::AsyncWriteExt::shutdown(&mut client)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut remote)
+            .await
+            .unwrap();
+    }
+
 }
