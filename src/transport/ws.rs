@@ -3,6 +3,11 @@
 //! Provides WebSocket transport for Trojan protocol.
 //! Uses generic type parameter to work with any AsyncRead + AsyncWrite stream,
 //! including both plain TCP and TLS streams.
+//!
+//! Key design decisions for high-throughput + high-connection-count scenarios:
+//! - No intermediate write buffer — data goes directly from relay buffer to WS sink
+//! - Backpressure returns Poll::Pending (not Error) so connections survive slow peers
+//! - Data stays in copy_bidirectional's buffer when sink is not ready (zero extra copies)
 
 use bytes::Bytes;
 use futures_util::{Sink, Stream};
@@ -12,12 +17,6 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream as TungsteniteStream};
 
-/// Initial write buffer capacity (4KB - typical MTU size)
-const INITIAL_WRITE_BUFFER_CAPACITY: usize = 4 * 1024;
-
-/// Maximum write buffer size to prevent memory exhaustion (512KB)
-const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
-
 /// WebSocket transport wrapper
 ///
 /// Implements AsyncRead + AsyncWrite to provide a unified stream interface
@@ -26,8 +25,6 @@ pub struct WebSocketTransport<S> {
     ws_stream: Pin<Box<TungsteniteStream<S>>>,
     read_buffer: Bytes,
     read_pos: usize,
-    write_buffer: Vec<u8>,
-    write_pending: bool,
     closed: bool,
 }
 
@@ -41,8 +38,6 @@ where
             ws_stream: Box::pin(ws_stream),
             read_buffer: Bytes::new(),
             read_pos: 0,
-            write_buffer: Vec::with_capacity(INITIAL_WRITE_BUFFER_CAPACITY),
-            write_pending: false,
             closed: false,
         }
     }
@@ -124,97 +119,32 @@ where
             )));
         }
 
-        // If there's pending data, try to send it first
-        if self.write_pending {
-            match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
-                Poll::Ready(Ok(())) => {
-                    let data = std::mem::take(&mut self.write_buffer);
-                    match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
-                        Ok(()) => {
-                            self.write_pending = false;
-                        }
-                        Err(e) => {
-                            return Poll::Ready(Err(io::Error::other(format!(
-                                "WebSocket send error: {}",
-                                e
-                            ))));
-                        }
-                    }
-                }
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
+        let me = &mut *self;
 
-        // Check buffer size limit before adding new data
-        if self.write_buffer.len() + buf.len() > MAX_WRITE_BUFFER_SIZE {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "WebSocket write buffer exceeded limit",
-            )));
-        }
-
-        // Add new data to buffer
-        self.write_buffer.extend_from_slice(buf);
-
-        // Try to send immediately
-        match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
+        // Check if sink is ready to accept a message
+        match Sink::poll_ready(me.ws_stream.as_mut(), cx) {
             Poll::Ready(Ok(())) => {
-                let data = std::mem::take(&mut self.write_buffer);
-                match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::other(format!(
-                        "WebSocket send error: {}",
-                        e
-                    )))),
-                }
+                // Sink ready — send data directly as a single WS Binary message.
+                // No intermediate buffer needed: data comes from copy_bidirectional's
+                // 32KB relay buffer and goes straight to tungstenite.
+                let data = Bytes::copy_from_slice(buf);
+                Sink::start_send(me.ws_stream.as_mut(), Message::Binary(data))
+                    .map_err(|e| io::Error::other(format!("WebSocket send error: {}", e)))?;
+                Poll::Ready(Ok(buf.len()))
             }
             Poll::Ready(Err(e)) => {
                 Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))))
             }
             Poll::Pending => {
-                self.write_pending = true;
-                Poll::Ready(Ok(buf.len()))
+                // Sink not ready — apply backpressure via Pending.
+                // Data stays in copy_bidirectional's relay buffer (no copy needed).
+                // Waker is already registered by poll_ready above.
+                Poll::Pending
             }
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Ensure all pending data is sent
-        if self.write_pending {
-            match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
-                Poll::Ready(Ok(())) => {
-                    if !self.write_buffer.is_empty() {
-                        let data = std::mem::take(&mut self.write_buffer);
-                        match Sink::start_send(
-                            self.ws_stream.as_mut(),
-                            Message::Binary(data.into()),
-                        ) {
-                            Ok(()) => {
-                                self.write_pending = false;
-                            }
-                            Err(e) => {
-                                return Poll::Ready(Err(io::Error::other(format!(
-                                    "WebSocket send error: {}",
-                                    e
-                                ))));
-                            }
-                        }
-                    }
-                }
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::other(format!("WebSocket error: {}", e))));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
-
         Sink::poll_flush(self.ws_stream.as_mut(), cx)
             .map_err(|e| io::Error::other(format!("WebSocket flush error: {}", e)))
     }
@@ -222,23 +152,5 @@ where
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed = true;
         self.as_mut().poll_flush(cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Compile-time assertion to ensure MAX > INITIAL
-    const _: () = assert!(MAX_WRITE_BUFFER_SIZE > INITIAL_WRITE_BUFFER_CAPACITY);
-
-    #[test]
-    fn test_initial_buffer_capacity() {
-        assert_eq!(INITIAL_WRITE_BUFFER_CAPACITY, 4 * 1024);
-    }
-
-    #[test]
-    fn test_max_buffer_capacity() {
-        assert_eq!(MAX_WRITE_BUFFER_SIZE, 512 * 1024);
     }
 }

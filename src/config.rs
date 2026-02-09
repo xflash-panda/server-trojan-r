@@ -148,11 +148,11 @@ pub struct CliArgs {
     )]
     pub tcp_nodelay: bool,
 
-    /// Maximum concurrent connections, 0 means unlimited (default: 65535)
+    /// Maximum concurrent connections, 0 means unlimited (default: 0)
     #[arg(
         long,
         env = "X_PANDA_TROJAN_MAX_CONNECTIONS",
-        default_value_t = 65535,
+        default_value_t = 0,
         help_heading = "Performance"
     )]
     pub max_connections: usize,
@@ -401,7 +401,7 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            max_connections: 65535,
+            max_connections: 0,
             block_private_ip: true,
             refresh_geodata: false,
         }
@@ -438,7 +438,7 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            max_connections: 65535,
+            max_connections: 0,
         };
         (cli, temp_dir)
     }
@@ -516,18 +516,18 @@ mod tests {
     }
 
     #[test]
-    fn test_conn_config_from_cli_max_connections() {
+    fn test_conn_config_from_cli_max_connections_default_unlimited() {
         let cli = create_test_cli_args();
         let config = ConnConfig::from_cli(&cli);
-        assert_eq!(config.max_connections, 65535);
+        assert_eq!(config.max_connections, 0); // default: unlimited
     }
 
     #[test]
-    fn test_conn_config_from_cli_max_connections_unlimited() {
+    fn test_conn_config_from_cli_max_connections_custom() {
         let mut cli = create_test_cli_args();
-        cli.max_connections = 0;
+        cli.max_connections = 100000;
         let config = ConnConfig::from_cli(&cli);
-        assert_eq!(config.max_connections, 0);
+        assert_eq!(config.max_connections, 100000);
     }
 
     #[test]
