@@ -338,12 +338,9 @@ mod tests {
         assert_eq!(cloned.heartbeat_interval, config.heartbeat_interval);
     }
 
-    #[test]
-    fn test_bg_runtime_workers_reasonable() {
-        // Should be at least 1 and not wastefully large
-        assert!(BG_RUNTIME_WORKERS >= 1);
-        assert!(BG_RUNTIME_WORKERS <= 4);
-    }
+    // Compile-time assertion: BG_RUNTIME_WORKERS must be in [1, 4]
+    const _: () = assert!(BG_RUNTIME_WORKERS >= 1);
+    const _: () = assert!(BG_RUNTIME_WORKERS <= 4);
 
     #[test]
     fn test_dedicated_runtime_creates_successfully() {

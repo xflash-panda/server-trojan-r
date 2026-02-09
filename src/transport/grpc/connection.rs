@@ -252,12 +252,12 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
+    // Compile-time assertions for H2 window size relationships
+    const _: () = assert!(INITIAL_WINDOW_SIZE <= INITIAL_CONNECTION_WINDOW_SIZE);
+    const _: () = assert!(INITIAL_CONNECTION_WINDOW_SIZE >= INITIAL_WINDOW_SIZE * 2);
+
     #[test]
     fn test_h2_window_sizes() {
-        // Stream window <= connection window
-        assert!(INITIAL_WINDOW_SIZE <= INITIAL_CONNECTION_WINDOW_SIZE);
-        // Connection window can serve multiple streams concurrently
-        assert!(INITIAL_CONNECTION_WINDOW_SIZE >= INITIAL_WINDOW_SIZE * 2);
         // Match Go net/http2 defaults (1MB stream, 4MB connection)
         assert_eq!(INITIAL_WINDOW_SIZE, 1024 * 1024);
         assert_eq!(INITIAL_CONNECTION_WINDOW_SIZE, 4 * 1024 * 1024);
