@@ -90,6 +90,12 @@ pub struct NetworkSettings {
 /// Dead peers are detected in ~45s (3 probes × 15s).
 const TCP_KEEPALIVE_SECS: u64 = 15;
 
+/// Parse peer address string into SocketAddr, falling back to 0.0.0.0:0
+fn parse_peer_addr(addr: &str) -> std::net::SocketAddr {
+    addr.parse()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+}
+
 /// Accept and handle a connection with proper transport wrapping
 pub async fn accept_connection<S>(
     server: Arc<Server>,
@@ -120,9 +126,7 @@ where
                     async move {
                         let stream: TransportStream = Box::pin(grpc_transport);
                         let meta = ConnectionMeta {
-                            peer_addr: peer_addr
-                                .parse()
-                                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                            peer_addr: parse_peer_addr(&peer_addr),
                             transport_type: TransportType::Grpc,
                         };
                         process_connection(&server, stream, meta).await
@@ -162,9 +166,14 @@ where
                 stream,
                 |req: &Request, response: Response| {
                     let path = req.uri().path();
-                    if path != ws_path && !ws_path.is_empty() && ws_path != "/" {
+                    // For "/" or empty path, accept any path (Xray behavior)
+                    if !ws_path.is_empty() && ws_path != "/" && path != ws_path {
                         log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
-                        // For "/" or empty path, accept any path (Xray behavior)
+                        let reject = http::Response::builder()
+                            .status(http::StatusCode::NOT_FOUND)
+                            .body(None)
+                            .unwrap();
+                        return Err(reject);
                     }
                     Ok(response)
                 },
@@ -174,9 +183,7 @@ where
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
-                peer_addr: peer_addr
-                    .parse()
-                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                peer_addr: parse_peer_addr(&peer_addr),
                 transport_type: TransportType::WebSocket,
             };
             process_connection(&server, stream, meta).await
@@ -184,9 +191,7 @@ where
         TransportType::Tcp => {
             let stream: TransportStream = Box::pin(stream);
             let meta = ConnectionMeta {
-                peer_addr: peer_addr
-                    .parse()
-                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                peer_addr: parse_peer_addr(&peer_addr),
                 transport_type: TransportType::Tcp,
             };
             process_connection(&server, stream, meta).await
@@ -437,5 +442,67 @@ mod tests {
         // this is the root cause we're protecting against.
         let defaults = WebSocketConfig::default();
         assert_eq!(defaults.max_write_buffer_size, usize::MAX);
+    }
+
+    #[test]
+    fn test_parse_peer_addr_valid_ipv4() {
+        use super::parse_peer_addr;
+        let addr = parse_peer_addr("127.0.0.1:8080");
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_peer_addr_valid_ipv6() {
+        use super::parse_peer_addr;
+        let addr = parse_peer_addr("[::1]:443");
+        assert_eq!(addr.ip(), std::net::Ipv6Addr::LOCALHOST);
+        assert_eq!(addr.port(), 443);
+    }
+
+    #[test]
+    fn test_parse_peer_addr_invalid_falls_back() {
+        use super::parse_peer_addr;
+        let addr = parse_peer_addr("not-an-address");
+        assert_eq!(addr, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+    }
+
+    #[test]
+    fn test_parse_peer_addr_empty_falls_back() {
+        use super::parse_peer_addr;
+        let addr = parse_peer_addr("");
+        assert_eq!(addr, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+    }
+
+    #[test]
+    fn test_parse_peer_addr_missing_port_falls_back() {
+        use super::parse_peer_addr;
+        let addr = parse_peer_addr("127.0.0.1");
+        assert_eq!(addr, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+    }
+
+    /// Verify WS path validation logic: non-empty, non-"/" path should reject mismatch
+    #[test]
+    fn test_ws_path_validation_logic() {
+        // Simulates the condition used in accept_connection
+        let check_path = |ws_path: &str, request_path: &str| -> bool {
+            // Returns true if connection should be REJECTED
+            !ws_path.is_empty() && ws_path != "/" && request_path != ws_path
+        };
+
+        // Configured path "/secret", request path matches → accept
+        assert!(!check_path("/secret", "/secret"));
+
+        // Configured path "/secret", request path differs → reject
+        assert!(check_path("/secret", "/other"));
+        assert!(check_path("/secret", "/"));
+        assert!(check_path("/secret", ""));
+
+        // Configured path is "/" → accept all (Xray behavior)
+        assert!(!check_path("/", "/anything"));
+        assert!(!check_path("/", "/"));
+
+        // Configured path is empty → accept all (Xray behavior)
+        assert!(!check_path("", "/anything"));
+        assert!(!check_path("", ""));
     }
 }
