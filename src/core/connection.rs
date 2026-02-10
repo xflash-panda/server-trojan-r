@@ -4,6 +4,7 @@
 
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +20,7 @@ pub type ConnectionId = u64;
 struct ConnectionInfo {
     user_id: UserId,
     #[allow(dead_code)]
-    peer_addr: String,
+    peer_addr: SocketAddr,
     #[allow(dead_code)]
     connected_at: Instant,
 }
@@ -62,7 +63,7 @@ impl ConnectionManager {
     pub fn register(
         &self,
         user_id: UserId,
-        peer_addr: String,
+        peer_addr: SocketAddr,
     ) -> (ConnectionId, CancellationToken) {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let cancel_token = CancellationToken::new();
@@ -143,9 +144,9 @@ mod tests {
     #[test]
     fn test_connection_manager_register() {
         let manager = ConnectionManager::new();
-        let (conn_id1, _token1) = manager.register(1, "127.0.0.1:1234".to_string());
-        let (conn_id2, _token2) = manager.register(1, "127.0.0.1:1235".to_string());
-        let (conn_id3, _token3) = manager.register(2, "127.0.0.1:1236".to_string());
+        let (conn_id1, _token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+        let (conn_id2, _token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
+        let (conn_id3, _token3) = manager.register(2, "127.0.0.1:1236".parse().unwrap());
 
         assert_eq!(manager.connection_count(), 3);
         assert_eq!(manager.user_count(), 2);
@@ -156,7 +157,7 @@ mod tests {
     #[test]
     fn test_connection_manager_unregister() {
         let manager = ConnectionManager::new();
-        let (conn_id, _token) = manager.register(1, "127.0.0.1:1234".to_string());
+        let (conn_id, _token) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
         assert_eq!(manager.connection_count(), 1);
         assert_eq!(manager.user_count(), 1);
 
@@ -169,8 +170,8 @@ mod tests {
     #[test]
     fn test_connection_manager_unregister_partial() {
         let manager = ConnectionManager::new();
-        let (conn_id1, _token1) = manager.register(1, "127.0.0.1:1234".to_string());
-        let (conn_id2, _token2) = manager.register(1, "127.0.0.1:1235".to_string());
+        let (conn_id1, _token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+        let (conn_id2, _token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
 
         assert_eq!(manager.connection_count(), 2);
         assert_eq!(manager.user_count(), 1);
@@ -189,9 +190,9 @@ mod tests {
     #[test]
     fn test_connection_manager_kick_user() {
         let manager = ConnectionManager::new();
-        let (_, token1) = manager.register(1, "127.0.0.1:1234".to_string());
-        let (_, token2) = manager.register(1, "127.0.0.1:1235".to_string());
-        let (_, token3) = manager.register(2, "127.0.0.1:1236".to_string());
+        let (_, token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+        let (_, token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
+        let (_, token3) = manager.register(2, "127.0.0.1:1236".parse().unwrap());
 
         assert!(!token1.is_cancelled());
         assert!(!token2.is_cancelled());
@@ -216,7 +217,10 @@ mod tests {
                 let m = manager_clone.clone();
                 thread::spawn(move || {
                     for j in 0..100 {
-                        let (conn_id, _) = m.register(i % 3, format!("127.0.0.1:{}", i * 1000 + j));
+                        let (conn_id, _) = m.register(
+                            i % 3,
+                            SocketAddr::from(([127, 0, 0, 1], (i * 1000 + j) as u16)),
+                        );
                         std::thread::sleep(std::time::Duration::from_micros(10));
                         m.unregister(conn_id);
                     }
@@ -245,7 +249,7 @@ mod tests {
             let manager = ConnectionManager::new();
             let user_id: UserId = 42;
 
-            let (conn_id1, _token1) = manager.register(user_id, "127.0.0.1:1000".to_string());
+            let (conn_id1, _token1) = manager.register(user_id, "127.0.0.1:1000".parse().unwrap());
 
             let barrier = Arc::new(Barrier::new(2));
 
@@ -260,7 +264,7 @@ mod tests {
             let b_b = Arc::clone(&barrier);
             let handle_b = thread::spawn(move || {
                 b_b.wait();
-                m_b.register(user_id, "127.0.0.1:2000".to_string())
+                m_b.register(user_id, "127.0.0.1:2000".parse().unwrap())
             });
 
             handle_a.join().unwrap();
@@ -314,8 +318,10 @@ mod tests {
                     let m = manager.clone();
                     thread::spawn(move || {
                         for k in 0..100 {
-                            let (conn_id, _) =
-                                m.register(user_id, format!("127.0.0.1:{}", j * 1000 + k));
+                            let (conn_id, _) = m.register(
+                                user_id,
+                                SocketAddr::from(([127, 0, 0, 1], (j * 1000 + k) as u16)),
+                            );
                             std::thread::yield_now();
                             m.unregister(conn_id);
                         }
