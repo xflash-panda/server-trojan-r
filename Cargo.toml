@@ -48,7 +48,7 @@ hostname = "0.4"
 socket2 = "0.6"
 
 [[bin]]
-name = "server-trojan-agent"
+name = "server-trojan"
 path = "src/main.rs"
 
 [dev-dependencies]
