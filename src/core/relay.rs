@@ -17,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
+/// Shutdown timeout — prevents infinite hang when peer is unresponsive.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Result of bidirectional copy with traffic stats
 #[derive(Debug, Clone, Copy)]
 pub struct CopyResult {
@@ -240,8 +243,8 @@ where
     // Graceful shutdown for streams that didn't complete normally.
     // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
     if !completed {
-        let _ = tokio::io::AsyncWriteExt::shutdown(a).await;
-        let _ = tokio::io::AsyncWriteExt::shutdown(b).await;
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, tokio::io::AsyncWriteExt::shutdown(a)).await;
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, tokio::io::AsyncWriteExt::shutdown(b)).await;
     }
 
     // Always record traffic stats — regardless of success, timeout, or error
@@ -546,6 +549,11 @@ mod tests {
             result.a_to_b,
             "Upload stats should match bytes transferred"
         );
+    }
+
+    #[test]
+    fn test_shutdown_timeout_constant() {
+        assert_eq!(SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(5));
     }
 
     /// Verify that &mut reference pattern allows callers to access and
