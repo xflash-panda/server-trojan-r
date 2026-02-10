@@ -51,7 +51,6 @@ async fn main() -> Result<()> {
     logger::init_logger(&cli.log_mode);
 
     log::info!(
-        api = %cli.api,
         node = cli.node,
         "Starting Trojan server with layered architecture"
     );
