@@ -74,7 +74,7 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p ${{ matrix.artifact }}
-          cp target/${{ matrix.target }}/release/server-trojan ${{ matrix.artifact }}/
+          cp target/${{ matrix.target }}/release/server-trojan-agent ${{ matrix.artifact }}/server-trojan
           chmod +x ${{ matrix.artifact }}/server-trojan
           tar -czvf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
