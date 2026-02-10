@@ -2,7 +2,7 @@
 //!
 //! Implements AsyncRead + AsyncWrite for use as a TCP-like stream.
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use h2::{Reason, RecvStream, SendStream};
 use std::collections::VecDeque;
 use std::io;
@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 
-use super::codec::{encode_grpc_message, parse_grpc_message};
+use super::codec::{encode_grpc_message, parse_grpc_message_zerocopy};
 
 /// Initial read buffer size (start small, grow as needed)
 const INITIAL_READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -212,21 +212,20 @@ impl AsyncRead for GrpcTransport {
         }
 
         loop {
-            match parse_grpc_message(&self.read_pending) {
-                Ok(Some((consumed, payload))) => {
+            match parse_grpc_message_zerocopy(&mut self.read_pending) {
+                Ok(Some((payload, consumed))) => {
                     let to_copy = payload.len().min(buf.remaining());
                     buf.put_slice(&payload[..to_copy]);
 
                     if to_copy < payload.len() {
-                        self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
+                        self.read_buf = payload.slice(to_copy..);
                         self.read_pos = 0;
                     }
 
-                    self.read_pending.advance(consumed);
-
-                    // Reclaim memory: after advance(), the consumed bytes become
-                    // inaccessible "dead space" in the allocation. Replace with a
-                    // fresh small buffer so idle connections don't waste memory.
+                    // Reclaim memory: after split_to(), if all data was consumed,
+                    // the remaining buffer has near-zero usable capacity.
+                    // Replace with a fresh small buffer so idle connections
+                    // don't hold onto the old allocation.
                     if self.read_pending.is_empty() {
                         self.read_pending = BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE);
                     }

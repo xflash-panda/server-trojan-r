@@ -1,10 +1,10 @@
-//! Trojan proxy server with layered architecture (Agent version with gRPC)
+//! Trojan proxy server with layered architecture
 //!
 //! Architecture:
 //! - `core/`: Core proxy logic with hook traits for extensibility
 //! - `transport/`: Transport layer abstraction (TCP, WebSocket, gRPC)
-//! - `business/`: Business implementations (gRPC API, auth, stats)
-//! - `handler`: Connection handling and request processing
+//! - `business/`: Business implementations (API, auth, stats)
+//! - `handler`: Connection processing logic
 //! - `server_runner`: Server startup and accept loop
 
 mod acl;
@@ -34,7 +34,6 @@ use crate::business::{
     ApiAuthenticator, ApiManager, ApiStatsCollector, BackgroundTasks, TaskConfig, UserManager,
 };
 use crate::core::{ConnectionManager, Server};
-use crate::server_runner::build_router;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,10 +51,8 @@ async fn main() -> Result<()> {
     logger::init_logger(&cli.log_mode);
 
     log::info!(
-        grpc_host = %cli.server_host,
-        grpc_port = cli.port,
         node = cli.node,
-        "Starting Trojan server agent with gRPC"
+        "Starting Trojan server with layered architecture"
     );
 
     // Create connection manager (shared between core and business layers)
@@ -79,7 +76,7 @@ async fn main() -> Result<()> {
     user_manager.init(&users);
 
     // Build server config
-    let server_config = config::ServerConfig::from_remote(&remote_config, &cli, users)?;
+    let server_config = config::ServerConfig::from_remote(&remote_config, &cli)?;
 
     // Create authenticator using shared user map
     let authenticator = Arc::new(ApiAuthenticator::new(user_manager.get_users_arc()));
@@ -88,7 +85,7 @@ async fn main() -> Result<()> {
     let stats_collector = Arc::new(ApiStatsCollector::new());
 
     // Build router from ACL config
-    let router = build_router(&server_config, cli.refresh_geodata).await?;
+    let router = server_runner::build_router(&server_config, cli.refresh_geodata).await?;
 
     // Build connection config from CLI args
     let conn_config = config::ConnConfig::from_cli(&cli);
@@ -116,7 +113,7 @@ async fn main() -> Result<()> {
         Arc::clone(&user_manager),
         Arc::clone(&stats_collector),
     );
-    let tasks_handle = background_tasks.start();
+    let background_handle = background_tasks.start();
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
@@ -138,14 +135,42 @@ async fn main() -> Result<()> {
                 _ = sigterm.recv() => {
                     log::info!("SIGTERM received, shutting down...");
                 }
+                _ = cancel_token_clone.cancelled() => {}
             }
         }
 
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c().await.ok();
-            log::info!("Shutdown signal received...");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    log::info!("Shutdown signal received...");
+                }
+                _ = cancel_token_clone.cancelled() => {}
+            }
         }
+
+        cancel_token_clone.cancel();
+
+        // Return the api_manager for shutdown operations
+        api_for_shutdown
+    });
+
+    // Run server (will run until cancel_token is cancelled or error)
+    let server_result = tokio::select! {
+        result = server_runner::run_server(server, &server_config) => result,
+        _ = cancel_token.cancelled() => Ok(()),
+    };
+
+    // Ensure shutdown handler exits if server stopped without a signal
+    cancel_token.cancel();
+
+    // Graceful shutdown sequence
+    log::info!("Server stopped, performing graceful shutdown...");
+
+    // Wait for shutdown handler to complete and get api_manager
+    if let Ok(api_for_shutdown) = shutdown_handle.await {
+        // Shutdown background tasks first (ensures final traffic report is sent)
+        background_handle.shutdown().await;
 
         // Unregister node
         log::info!("Unregistering node...");
@@ -154,19 +179,8 @@ async fn main() -> Result<()> {
         } else {
             log::info!("Node unregistered successfully");
         }
+    }
 
-        cancel_token_clone.cancel();
-    });
-
-    // Run server until shutdown
-    let result = server_runner::run_server(server, &server_config).await;
-
-    // Wait for shutdown signal to complete
-    let _ = shutdown_handle.await;
-
-    // Gracefully shutdown background tasks
-    tasks_handle.shutdown().await;
-
-    log::info!("Server shutdown complete");
-    result
+    log::info!("Shutdown complete");
+    server_result
 }

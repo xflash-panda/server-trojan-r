@@ -74,51 +74,6 @@ pub enum DecodeResult<T> {
 }
 
 impl Address {
-    /// Encode address to buffer
-    pub fn encode(&self, buf: &mut Vec<u8>) -> usize {
-        match self {
-            Address::IPv4(ip, port) => {
-                buf.push(ATYP_IPV4);
-                buf.extend_from_slice(ip);
-                buf.extend_from_slice(&port.to_be_bytes());
-                7
-            }
-            Address::IPv6(ip, port) => {
-                buf.push(ATYP_IPV6);
-                buf.extend_from_slice(ip);
-                buf.extend_from_slice(&port.to_be_bytes());
-                19
-            }
-            Address::Domain(domain, port) => {
-                let domain_bytes = domain.as_bytes();
-                buf.push(ATYP_DOMAIN);
-                buf.push(domain_bytes.len() as u8);
-                buf.extend_from_slice(domain_bytes);
-                buf.extend_from_slice(&port.to_be_bytes());
-                1 + 1 + domain_bytes.len() + 2
-            }
-        }
-    }
-
-    /// Get the port number
-    pub fn port(&self) -> u16 {
-        match self {
-            Address::IPv4(_, port) | Address::IPv6(_, port) | Address::Domain(_, port) => *port,
-        }
-    }
-
-    /// Get the host as a borrowed or owned string.
-    ///
-    /// Returns `Cow::Borrowed` for domains (zero allocation) and
-    /// `Cow::Owned` for IP addresses (requires formatting).
-    pub fn host(&self) -> Cow<'_, str> {
-        match self {
-            Address::IPv4(ip, _) => Cow::Owned(Ipv4Addr::from(*ip).to_string()),
-            Address::IPv6(ip, _) => Cow::Owned(Ipv6Addr::from(*ip).to_string()),
-            Address::Domain(domain, _) => Cow::Borrowed(domain),
-        }
-    }
-
     /// Decode address from buffer
     pub fn decode(buf: &[u8]) -> DecodeResult<Self> {
         if buf.is_empty() {
@@ -165,6 +120,57 @@ impl Address {
                 DecodeResult::Ok(Address::Domain(domain, port), total_len)
             }
             _ => DecodeResult::Invalid("invalid address type"),
+        }
+    }
+
+    /// Encode address to buffer
+    /// Returns the number of bytes written
+    pub fn encode(&self, buf: &mut Vec<u8>) -> usize {
+        let start_len = buf.len();
+        match self {
+            Address::IPv4(ip, port) => {
+                buf.push(ATYP_IPV4);
+                buf.extend_from_slice(ip);
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+            Address::IPv6(ip, port) => {
+                buf.push(ATYP_IPV6);
+                buf.extend_from_slice(ip);
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+            Address::Domain(domain, port) => {
+                debug_assert!(
+                    domain.len() <= 255,
+                    "domain too long for Trojan protocol: {} bytes",
+                    domain.len()
+                );
+                buf.push(ATYP_DOMAIN);
+                buf.push(domain.len().min(255) as u8);
+                buf.extend_from_slice(&domain.as_bytes()[..domain.len().min(255)]);
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+        }
+        buf.len() - start_len
+    }
+
+    /// Get the port number
+    pub fn port(&self) -> u16 {
+        match self {
+            Address::IPv4(_, port) => *port,
+            Address::IPv6(_, port) => *port,
+            Address::Domain(_, port) => *port,
+        }
+    }
+
+    /// Get the host as a borrowed or owned string.
+    ///
+    /// Returns `Cow::Borrowed` for domains (zero allocation) and
+    /// `Cow::Owned` for IP addresses (requires formatting).
+    pub fn host(&self) -> Cow<'_, str> {
+        match self {
+            Address::IPv4(ip, _) => Cow::Owned(Ipv4Addr::from(*ip).to_string()),
+            Address::IPv6(ip, _) => Cow::Owned(Ipv6Addr::from(*ip).to_string()),
+            Address::Domain(domain, _) => Cow::Borrowed(domain),
         }
     }
 
@@ -304,79 +310,100 @@ impl TrojanRequest {
 
 /// Trojan UDP packet format (within TCP stream)
 ///
-/// Format: ATYP + DST.ADDR + DST.PORT + Length(2 bytes) + CRLF + Payload
+/// Format: ATYP(1) + DST.ADDR(variable) + DST.PORT(2) + Length(2) + CRLF(2) + Payload
 #[derive(Debug)]
 pub struct TrojanUdpPacket {
     /// Target address
     pub addr: Address,
-    /// UDP payload
+    /// Payload data
     pub payload: Bytes,
 }
 
 impl TrojanUdpPacket {
-    /// Minimum packet size: 1 (ATYP) + 4 (min addr) + 2 (port) + 2 (length) + 2 (CRLF) = 11
+    /// Minimum packet size: 1 (atyp) + 4 (min addr IPv4) + 2 (port) + 2 (length) + 2 (CRLF) = 11
     pub const MIN_SIZE: usize = 11;
 
-    /// Decode a single UDP packet from buffer
-    ///
-    /// Returns the decoded packet and consumed bytes count
+    /// Decode a single UDP packet from byte slice (copies payload).
+    /// Prefer `decode_zerocopy` for hot paths.
+    #[allow(dead_code)]
     pub fn decode(buf: &[u8]) -> DecodeResult<Self> {
         if buf.len() < Self::MIN_SIZE {
             return DecodeResult::NeedMoreData;
         }
 
         // Parse address
-        let (addr, addr_consumed) = match Address::decode(buf) {
-            DecodeResult::Ok(addr, consumed) => (addr, consumed),
+        let (addr, addr_len) = match Address::decode(buf) {
+            DecodeResult::Ok(addr, len) => (addr, len),
             DecodeResult::NeedMoreData => return DecodeResult::NeedMoreData,
             DecodeResult::Invalid(msg) => return DecodeResult::Invalid(msg),
         };
 
-        let length_pos = addr_consumed;
-
-        // Check if we have enough data for length + CRLF
-        if buf.len() < length_pos + 4 {
+        // Check we have length + CRLF
+        if buf.len() < addr_len + 4 {
             return DecodeResult::NeedMoreData;
         }
 
-        // Parse payload length (2 bytes, big-endian)
-        let payload_len = u16::from_be_bytes([buf[length_pos], buf[length_pos + 1]]) as usize;
+        // Parse payload length
+        let payload_len = u16::from_be_bytes([buf[addr_len], buf[addr_len + 1]]) as usize;
 
-        // Check CRLF after length
-        if buf[length_pos + 2] != b'\r' || buf[length_pos + 3] != b'\n' {
-            return DecodeResult::Invalid("missing CRLF after length");
+        // Check CRLF
+        if buf[addr_len + 2] != b'\r' || buf[addr_len + 3] != b'\n' {
+            return DecodeResult::Invalid("missing CRLF in UDP packet");
         }
 
-        let payload_start = length_pos + 4;
-        let total_len = payload_start + payload_len;
-
-        // Check if we have the complete payload
+        // Check we have full payload
+        let total_len = addr_len + 4 + payload_len;
         if buf.len() < total_len {
             return DecodeResult::NeedMoreData;
         }
 
-        let payload = Bytes::copy_from_slice(&buf[payload_start..total_len]);
+        let payload = Bytes::copy_from_slice(&buf[addr_len + 4..total_len]);
 
         DecodeResult::Ok(TrojanUdpPacket { addr, payload }, total_len)
     }
 
-    /// Encode a UDP packet to bytes
+    /// Decode a single UDP packet from BytesMut (zero-copy for payload)
+    pub fn decode_zerocopy(buf: &mut BytesMut) -> DecodeResult<Self> {
+        if buf.len() < Self::MIN_SIZE {
+            return DecodeResult::NeedMoreData;
+        }
+
+        let (addr, addr_len) = match Address::decode(buf) {
+            DecodeResult::Ok(addr, len) => (addr, len),
+            DecodeResult::NeedMoreData => return DecodeResult::NeedMoreData,
+            DecodeResult::Invalid(msg) => return DecodeResult::Invalid(msg),
+        };
+
+        if buf.len() < addr_len + 4 {
+            return DecodeResult::NeedMoreData;
+        }
+
+        let payload_len = u16::from_be_bytes([buf[addr_len], buf[addr_len + 1]]) as usize;
+
+        if buf[addr_len + 2] != b'\r' || buf[addr_len + 3] != b'\n' {
+            return DecodeResult::Invalid("missing CRLF in UDP packet");
+        }
+
+        let total_len = addr_len + 4 + payload_len;
+        if buf.len() < total_len {
+            return DecodeResult::NeedMoreData;
+        }
+
+        // Split header, then split payload as zero-copy Bytes
+        let header_len = addr_len + 4;
+        let _ = buf.split_to(header_len);
+        let payload = buf.split_to(payload_len).freeze();
+
+        DecodeResult::Ok(TrojanUdpPacket { addr, payload }, total_len)
+    }
+
+    /// Encode UDP packet to buffer
     pub fn encode(addr: &Address, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32 + payload.len());
-
-        // Encode address
         addr.encode(&mut buf);
-
-        // Add length (2 bytes, big-endian)
-        let payload_len = payload.len() as u16;
-        buf.extend_from_slice(&payload_len.to_be_bytes());
-
-        // Add CRLF
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         buf.extend_from_slice(b"\r\n");
-
-        // Add payload
         buf.extend_from_slice(payload);
-
         buf
     }
 }
@@ -592,44 +619,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Tests for Address helper methods
-
-    #[test]
-    fn test_address_host_ipv4() {
-        let addr = Address::IPv4([192, 168, 1, 1], 8080);
-        assert_eq!(addr.host(), "192.168.1.1");
-    }
-
-    #[test]
-    fn test_address_host_ipv6() {
-        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
-        assert_eq!(addr.host(), "::1");
-    }
-
-    #[test]
-    fn test_address_host_domain() {
-        let addr = Address::Domain("example.com".to_string(), 80);
-        assert_eq!(addr.host(), "example.com");
-    }
-
-    #[test]
-    fn test_address_port() {
-        let ipv4 = Address::IPv4([127, 0, 0, 1], 8080);
-        assert_eq!(ipv4.port(), 8080);
-
-        let ipv6 = Address::IPv6([0; 16], 443);
-        assert_eq!(ipv6.port(), 443);
-
-        let domain = Address::Domain("test.com".to_string(), 53);
-        assert_eq!(domain.port(), 53);
-    }
-
     #[test]
     fn test_address_encode_ipv4() {
         let addr = Address::IPv4([192, 168, 1, 1], 8080);
         let mut buf = Vec::new();
         let len = addr.encode(&mut buf);
-        assert_eq!(len, 7);
+        assert_eq!(len, 7); // 1 (atyp) + 4 (ip) + 2 (port)
         assert_eq!(buf, vec![1, 192, 168, 1, 1, 0x1F, 0x90]);
     }
 
@@ -638,25 +633,48 @@ mod tests {
         let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
         let mut buf = Vec::new();
         let len = addr.encode(&mut buf);
-        assert_eq!(len, 19);
+        assert_eq!(len, 19); // 1 (atyp) + 16 (ip) + 2 (port)
         assert_eq!(buf[0], 4); // ATYP_IPV6
-        assert_eq!(
-            &buf[1..17],
-            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-        );
-        assert_eq!(&buf[17..19], &[0x01, 0xBB]); // port 443
+        assert_eq!(buf[17..19], [0x01, 0xBB]); // port 443
     }
 
     #[test]
     fn test_address_encode_domain() {
-        let addr = Address::Domain("test.com".to_string(), 80);
+        let addr = Address::Domain("example.com".to_string(), 80);
         let mut buf = Vec::new();
         let len = addr.encode(&mut buf);
-        assert_eq!(len, 1 + 1 + 8 + 2); // ATYP + len + domain + port
+        assert_eq!(len, 15); // 1 (atyp) + 1 (len) + 11 (domain) + 2 (port)
         assert_eq!(buf[0], 3); // ATYP_DOMAIN
-        assert_eq!(buf[1], 8); // domain length
-        assert_eq!(&buf[2..10], b"test.com");
-        assert_eq!(&buf[10..12], &[0x00, 0x50]); // port 80
+        assert_eq!(buf[1], 11); // domain length
+        assert_eq!(&buf[2..13], b"example.com");
+        assert_eq!(buf[13..15], [0x00, 0x50]); // port 80
+    }
+
+    #[test]
+    fn test_address_port() {
+        assert_eq!(Address::IPv4([127, 0, 0, 1], 8080).port(), 8080);
+        assert_eq!(Address::IPv6([0; 16], 443).port(), 443);
+        assert_eq!(Address::Domain("example.com".to_string(), 80).port(), 80);
+    }
+
+    #[test]
+    fn test_address_host() {
+        assert_eq!(
+            Address::IPv4([192, 168, 1, 1], 8080).host().as_ref(),
+            "192.168.1.1"
+        );
+        assert_eq!(
+            Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443)
+                .host()
+                .as_ref(),
+            "::1"
+        );
+        assert_eq!(
+            Address::Domain("example.com".to_string(), 80)
+                .host()
+                .as_ref(),
+            "example.com"
+        );
     }
 
     /// Verify that host() returns Cow::Borrowed for domains (zero allocation)
@@ -704,34 +722,39 @@ mod tests {
 
     #[test]
     fn test_address_encode_decode_roundtrip() {
-        let original = Address::Domain("example.com".to_string(), 443);
-        let mut buf = Vec::new();
-        original.encode(&mut buf);
+        let addresses = vec![
+            Address::IPv4([192, 168, 1, 1], 8080),
+            Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443),
+            Address::Domain("example.com".to_string(), 80),
+        ];
 
-        match Address::decode(&buf) {
-            DecodeResult::Ok(decoded, _) => {
-                assert_eq!(decoded, original);
+        for original in addresses {
+            let mut buf = Vec::new();
+            original.encode(&mut buf);
+
+            match Address::decode(&buf) {
+                DecodeResult::Ok(decoded, _) => {
+                    assert_eq!(original, decoded);
+                }
+                _ => panic!("Failed to decode address"),
             }
-            _ => panic!("Failed to decode"),
         }
     }
 
-    // Tests for TrojanUdpPacket
-
     #[test]
     fn test_trojan_udp_packet_decode_ipv4() {
+        // Build a UDP packet: IPv4 addr + length + CRLF + payload
         let mut buf = Vec::new();
-        // IPv4 address: 8.8.8.8:53
         buf.push(1); // ATYP_IPV4
-        buf.extend_from_slice(&[8, 8, 8, 8]);
+        buf.extend_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
         buf.extend_from_slice(&[0x00, 0x35]); // port 53
-        buf.extend_from_slice(&[0x00, 0x05]); // length: 5 bytes
-        buf.extend_from_slice(b"\r\n"); // CRLF
-        buf.extend_from_slice(b"hello"); // Payload
+        buf.extend_from_slice(&[0x00, 0x05]); // length 5
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(b"hello");
 
         match TrojanUdpPacket::decode(&buf) {
             DecodeResult::Ok(packet, consumed) => {
-                assert_eq!(consumed, 7 + 2 + 2 + 5); // addr + length + crlf + payload
+                assert_eq!(consumed, buf.len());
                 assert!(matches!(packet.addr, Address::IPv4([8, 8, 8, 8], 53)));
                 assert_eq!(packet.payload.as_ref(), b"hello");
             }
@@ -742,20 +765,19 @@ mod tests {
     #[test]
     fn test_trojan_udp_packet_decode_domain() {
         let mut buf = Vec::new();
-        // Domain address: dns.google:53
         buf.push(3); // ATYP_DOMAIN
-        buf.push(10); // domain length
-        buf.extend_from_slice(b"dns.google");
+        buf.push(7); // domain length
+        buf.extend_from_slice(b"dns.com");
         buf.extend_from_slice(&[0x00, 0x35]); // port 53
-        buf.extend_from_slice(&[0x00, 0x04]); // length: 4 bytes
-        buf.extend_from_slice(b"\r\n"); // CRLF
-        buf.extend_from_slice(b"test"); // Payload
+        buf.extend_from_slice(&[0x00, 0x03]); // length 3
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(b"abc");
 
         match TrojanUdpPacket::decode(&buf) {
             DecodeResult::Ok(packet, consumed) => {
-                assert_eq!(consumed, 1 + 1 + 10 + 2 + 2 + 2 + 4);
-                assert!(matches!(packet.addr, Address::Domain(ref d, 53) if d == "dns.google"));
-                assert_eq!(packet.payload.as_ref(), b"test");
+                assert_eq!(consumed, buf.len());
+                assert!(matches!(packet.addr, Address::Domain(ref d, 53) if d == "dns.com"));
+                assert_eq!(packet.payload.as_ref(), b"abc");
             }
             _ => panic!("Expected successful decode"),
         }
@@ -763,8 +785,15 @@ mod tests {
 
     #[test]
     fn test_trojan_udp_packet_decode_need_more_data() {
-        // Too short
-        let buf = vec![1, 8, 8, 8, 8];
+        // Incomplete header
+        let buf = vec![1, 8, 8, 8]; // incomplete IPv4
+        assert!(matches!(
+            TrojanUdpPacket::decode(&buf),
+            DecodeResult::NeedMoreData
+        ));
+
+        // Complete address but missing length
+        let buf = vec![1, 8, 8, 8, 8, 0x00, 0x35]; // IPv4 + port, no length
         assert!(matches!(
             TrojanUdpPacket::decode(&buf),
             DecodeResult::NeedMoreData
@@ -773,12 +802,10 @@ mod tests {
         // Missing payload
         let mut buf = Vec::new();
         buf.push(1);
-        buf.extend_from_slice(&[8, 8, 8, 8]);
-        buf.extend_from_slice(&[0x00, 0x35]);
-        buf.extend_from_slice(&[0x00, 0x10]); // claims 16 bytes payload
+        buf.extend_from_slice(&[8, 8, 8, 8, 0x00, 0x35]); // addr
+        buf.extend_from_slice(&[0x00, 0x10]); // length 16
         buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(b"short"); // only 5 bytes
-
+        buf.extend_from_slice(b"short"); // only 5 bytes, need 16
         assert!(matches!(
             TrojanUdpPacket::decode(&buf),
             DecodeResult::NeedMoreData
@@ -789,10 +816,9 @@ mod tests {
     fn test_trojan_udp_packet_decode_invalid_crlf() {
         let mut buf = Vec::new();
         buf.push(1);
-        buf.extend_from_slice(&[8, 8, 8, 8]);
-        buf.extend_from_slice(&[0x00, 0x35]);
+        buf.extend_from_slice(&[8, 8, 8, 8, 0x00, 0x35]);
         buf.extend_from_slice(&[0x00, 0x05]);
-        buf.extend_from_slice(b"\n\r"); // Wrong order
+        buf.extend_from_slice(b"\n\r"); // wrong order
         buf.extend_from_slice(b"hello");
 
         assert!(matches!(
@@ -807,18 +833,19 @@ mod tests {
         let payload = b"hello";
         let encoded = TrojanUdpPacket::encode(&addr, payload);
 
-        // Verify structure: addr(7) + length(2) + crlf(2) + payload(5) = 16
-        assert_eq!(encoded.len(), 16);
-        assert_eq!(&encoded[0..7], &[1, 8, 8, 8, 8, 0x00, 0x35]);
-        assert_eq!(&encoded[7..9], &[0x00, 0x05]); // length
-        assert_eq!(&encoded[9..11], b"\r\n");
-        assert_eq!(&encoded[11..16], b"hello");
+        // Verify structure
+        assert_eq!(encoded[0], 1); // ATYP_IPV4
+        assert_eq!(&encoded[1..5], &[8, 8, 8, 8]); // IP
+        assert_eq!(&encoded[5..7], &[0x00, 0x35]); // port 53
+        assert_eq!(&encoded[7..9], &[0x00, 0x05]); // length 5
+        assert_eq!(&encoded[9..11], b"\r\n"); // CRLF
+        assert_eq!(&encoded[11..], b"hello"); // payload
     }
 
     #[test]
     fn test_trojan_udp_packet_encode_decode_roundtrip() {
-        let addr = Address::Domain("example.com".to_string(), 443);
-        let payload = b"test payload data";
+        let addr = Address::Domain("test.example.com".to_string(), 443);
+        let payload = b"test data packet";
 
         let encoded = TrojanUdpPacket::encode(&addr, payload);
 
@@ -828,38 +855,237 @@ mod tests {
                 assert_eq!(packet.addr, addr);
                 assert_eq!(packet.payload.as_ref(), payload);
             }
-            _ => panic!("Failed to decode"),
+            _ => panic!("Failed to decode encoded packet"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_decode_multiple_packets() {
+        // Create two packets in one buffer
+        let addr1 = Address::IPv4([1, 1, 1, 1], 53);
+        let addr2 = Address::IPv4([8, 8, 8, 8], 53);
+        let packet1 = TrojanUdpPacket::encode(&addr1, b"first");
+        let packet2 = TrojanUdpPacket::encode(&addr2, b"second");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&packet1);
+        buf.extend_from_slice(&packet2);
+
+        // Decode first packet
+        match TrojanUdpPacket::decode(&buf) {
+            DecodeResult::Ok(p1, consumed1) => {
+                assert!(matches!(p1.addr, Address::IPv4([1, 1, 1, 1], 53)));
+                assert_eq!(p1.payload.as_ref(), b"first");
+
+                // Decode second packet
+                match TrojanUdpPacket::decode(&buf[consumed1..]) {
+                    DecodeResult::Ok(p2, _) => {
+                        assert!(matches!(p2.addr, Address::IPv4([8, 8, 8, 8], 53)));
+                        assert_eq!(p2.payload.as_ref(), b"second");
+                    }
+                    _ => panic!("Failed to decode second packet"),
+                }
+            }
+            _ => panic!("Failed to decode first packet"),
         }
     }
 
     #[test]
     fn test_trojan_udp_packet_empty_payload() {
-        let addr = Address::IPv4([1, 2, 3, 4], 80);
-        let payload: &[u8] = &[];
-
-        let encoded = TrojanUdpPacket::encode(&addr, payload);
+        let addr = Address::IPv4([127, 0, 0, 1], 8080);
+        let encoded = TrojanUdpPacket::encode(&addr, b"");
 
         match TrojanUdpPacket::decode(&encoded) {
             DecodeResult::Ok(packet, _) => {
                 assert!(packet.payload.is_empty());
             }
-            _ => panic!("Failed to decode"),
+            _ => panic!("Failed to decode empty payload packet"),
         }
     }
 
+    // --- decode_zerocopy tests ---
+
     #[test]
-    fn test_trojan_udp_packet_large_payload() {
-        let addr = Address::IPv4([1, 2, 3, 4], 80);
-        let payload = vec![0xAB; 1000];
+    fn test_udp_decode_zerocopy_ipv4() {
+        let addr = Address::IPv4([8, 8, 8, 8], 53);
+        let encoded = TrojanUdpPacket::encode(&addr, b"hello");
+        let mut buf = BytesMut::from(&encoded[..]);
 
-        let encoded = TrojanUdpPacket::encode(&addr, &payload);
-
-        match TrojanUdpPacket::decode(&encoded) {
-            DecodeResult::Ok(packet, _) => {
-                assert_eq!(packet.payload.len(), 1000);
-                assert!(packet.payload.iter().all(|&b| b == 0xAB));
+        match TrojanUdpPacket::decode_zerocopy(&mut buf) {
+            DecodeResult::Ok(packet, consumed) => {
+                assert_eq!(consumed, encoded.len());
+                assert!(matches!(packet.addr, Address::IPv4([8, 8, 8, 8], 53)));
+                assert_eq!(packet.payload.as_ref(), b"hello");
             }
-            _ => panic!("Failed to decode"),
+            _ => panic!("Expected successful zerocopy decode"),
         }
+        // Buffer should be fully consumed
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_udp_decode_zerocopy_domain() {
+        let addr = Address::Domain("dns.example.com".to_string(), 53);
+        let encoded = TrojanUdpPacket::encode(&addr, b"query");
+        let mut buf = BytesMut::from(&encoded[..]);
+
+        match TrojanUdpPacket::decode_zerocopy(&mut buf) {
+            DecodeResult::Ok(packet, _) => {
+                assert!(
+                    matches!(packet.addr, Address::Domain(ref d, 53) if d == "dns.example.com")
+                );
+                assert_eq!(packet.payload.as_ref(), b"query");
+            }
+            _ => panic!("Expected successful zerocopy decode"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_udp_decode_zerocopy_empty_payload() {
+        let addr = Address::IPv4([1, 2, 3, 4], 80);
+        let encoded = TrojanUdpPacket::encode(&addr, b"");
+        let mut buf = BytesMut::from(&encoded[..]);
+
+        match TrojanUdpPacket::decode_zerocopy(&mut buf) {
+            DecodeResult::Ok(packet, _) => {
+                assert!(packet.payload.is_empty());
+            }
+            _ => panic!("Expected successful zerocopy decode"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_udp_decode_zerocopy_need_more_data() {
+        // Incomplete packet
+        let mut buf = BytesMut::from(&[1u8, 8, 8, 8][..]);
+        assert!(matches!(
+            TrojanUdpPacket::decode_zerocopy(&mut buf),
+            DecodeResult::NeedMoreData
+        ));
+        // Buffer should be unchanged on NeedMoreData
+        assert_eq!(buf.len(), 4);
+    }
+
+    #[test]
+    fn test_udp_decode_zerocopy_invalid_crlf() {
+        let mut raw = Vec::new();
+        raw.push(1); // ATYP_IPV4
+        raw.extend_from_slice(&[8, 8, 8, 8, 0x00, 0x35]); // addr
+        raw.extend_from_slice(&[0x00, 0x05]); // length
+        raw.extend_from_slice(b"\n\r"); // wrong CRLF order
+        raw.extend_from_slice(b"hello");
+
+        let mut buf = BytesMut::from(&raw[..]);
+        assert!(matches!(
+            TrojanUdpPacket::decode_zerocopy(&mut buf),
+            DecodeResult::Invalid(_)
+        ));
+    }
+
+    /// Verify decode_zerocopy processes multiple packets from a single BytesMut,
+    /// consuming data progressively — this is the pattern used in handle_udp_associate.
+    #[test]
+    fn test_udp_decode_zerocopy_multiple_packets() {
+        let addr1 = Address::IPv4([1, 1, 1, 1], 53);
+        let addr2 = Address::Domain("test.com".to_string(), 443);
+        let pkt1 = TrojanUdpPacket::encode(&addr1, b"first");
+        let pkt2 = TrojanUdpPacket::encode(&addr2, b"second");
+
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&pkt1);
+        buf.extend_from_slice(&pkt2);
+
+        let original_len = buf.len();
+
+        // Decode first packet
+        match TrojanUdpPacket::decode_zerocopy(&mut buf) {
+            DecodeResult::Ok(p, _) => {
+                assert!(matches!(p.addr, Address::IPv4([1, 1, 1, 1], 53)));
+                assert_eq!(p.payload.as_ref(), b"first");
+            }
+            _ => panic!("Failed to decode first packet"),
+        }
+        assert_eq!(buf.len(), original_len - pkt1.len());
+
+        // Decode second packet
+        match TrojanUdpPacket::decode_zerocopy(&mut buf) {
+            DecodeResult::Ok(p, _) => {
+                assert!(matches!(p.addr, Address::Domain(ref d, 443) if d == "test.com"));
+                assert_eq!(p.payload.as_ref(), b"second");
+            }
+            _ => panic!("Failed to decode second packet"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    /// Verify zerocopy decode produces same result as copy-based decode
+    #[test]
+    fn test_udp_decode_zerocopy_matches_decode() {
+        let test_cases = vec![
+            (Address::IPv4([10, 0, 0, 1], 80), b"ipv4 payload".to_vec()),
+            (
+                Address::IPv6([0; 16], 443),
+                b"ipv6 payload with more data".to_vec(),
+            ),
+            (
+                Address::Domain("example.org".to_string(), 8080),
+                b"domain".to_vec(),
+            ),
+            (Address::IPv4([255, 255, 255, 0], 1), vec![0xAB; 512]),
+        ];
+
+        for (addr, payload) in test_cases {
+            let encoded = TrojanUdpPacket::encode(&addr, &payload);
+
+            // Decode with copy-based method
+            let copy_result = TrojanUdpPacket::decode(&encoded);
+
+            // Decode with zerocopy method
+            let mut buf = BytesMut::from(&encoded[..]);
+            let zc_result = TrojanUdpPacket::decode_zerocopy(&mut buf);
+
+            match (copy_result, zc_result) {
+                (DecodeResult::Ok(p1, c1), DecodeResult::Ok(p2, c2)) => {
+                    assert_eq!(p1.addr, p2.addr, "Addresses must match");
+                    assert_eq!(p1.payload, p2.payload, "Payloads must match");
+                    assert_eq!(c1, c2, "Consumed bytes must match");
+                }
+                _ => panic!("Both decode methods should succeed for addr={}", addr),
+            }
+        }
+    }
+
+    // --- Address::encode domain length protection tests ---
+
+    #[test]
+    fn test_address_encode_max_length_domain() {
+        // 255 byte domain — maximum valid length
+        let domain = "a".repeat(255);
+        let addr = Address::Domain(domain.clone(), 80);
+        let mut buf = Vec::new();
+        let len = addr.encode(&mut buf);
+
+        assert_eq!(len, 1 + 1 + 255 + 2); // atyp + len + domain + port
+        assert_eq!(buf[1], 255); // length byte should be 255
+
+        // Roundtrip: decode should recover the same domain
+        match Address::decode(&buf) {
+            DecodeResult::Ok(decoded, _) => {
+                assert_eq!(decoded, addr);
+            }
+            _ => panic!("Failed to roundtrip 255-byte domain"),
+        }
+    }
+
+    /// In debug builds, encoding a >255 byte domain panics via debug_assert.
+    #[test]
+    #[should_panic(expected = "domain too long for Trojan protocol")]
+    fn test_address_encode_overlong_domain_panics_in_debug() {
+        let domain = "b".repeat(300);
+        let addr = Address::Domain(domain, 443);
+        let mut buf = Vec::new();
+        addr.encode(&mut buf);
     }
 }

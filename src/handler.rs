@@ -3,13 +3,12 @@
 //! This module contains the request processing and connection relay logic.
 
 use crate::acl;
-use crate::config;
 use crate::core::{
     copy_bidirectional_with_stats, hooks, Address, DecodeResult, Server, TrojanCmd, TrojanRequest,
     TrojanUdpPacket, UserId,
 };
 use crate::logger::log;
-use crate::transport::{ConnectionMeta, TransportStream};
+use crate::transport::TransportStream;
 
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
@@ -19,8 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-/// Maximum UDP read buffer size to prevent memory exhaustion
-const UDP_MAX_READ_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+use crate::transport::ConnectionMeta;
 
 /// Maximum entries in per-session UDP route cache
 const UDP_MAX_ROUTE_CACHE_ENTRIES: usize = 256;
@@ -38,11 +36,8 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub async fn read_trojan_request(
     stream: &mut TransportStream,
     buf: &mut BytesMut,
-    conn_config: &config::ConnConfig,
+    buffer_size: usize,
 ) -> Result<TrojanRequest> {
-    let buffer_size = conn_config.buffer_size;
-    let mut temp_buf = vec![0u8; buffer_size];
-
     loop {
         // Try to decode with current buffer (check completeness first to avoid clone)
         if buf.len() >= TrojanRequest::MIN_SIZE {
@@ -71,8 +66,9 @@ pub async fn read_trojan_request(
             }
         }
 
-        // Read more data
-        let n = stream.read(&mut temp_buf).await?;
+        // Read directly into BytesMut spare capacity (avoids separate heap allocation)
+        buf.reserve(buffer_size);
+        let n = stream.read_buf(buf).await?;
         if n == 0 {
             if buf.is_empty() {
                 return Err(anyhow!("Connection closed before receiving request"));
@@ -80,8 +76,6 @@ pub async fn read_trojan_request(
                 return Err(anyhow!("Connection closed with incomplete request"));
             }
         }
-
-        buf.extend_from_slice(&temp_buf[..n]);
 
         // Prevent buffer from growing too large (protection against malicious clients)
         if buf.len() > buffer_size * 2 {
@@ -102,7 +96,7 @@ pub async fn process_connection(
 
     let request = tokio::time::timeout(
         server.conn_config.request_timeout,
-        read_trojan_request(&mut stream, &mut buf, &server.conn_config),
+        read_trojan_request(&mut stream, &mut buf, buffer_size),
     )
     .await
     .map_err(|_| anyhow!("Request read timeout"))??;
@@ -206,8 +200,8 @@ async fn handle_connect(
     // Connect based on outbound type
     match outbound_type {
         hooks::OutboundType::Direct(resolved) => handle_direct_connect(ctx, resolved).await,
-        hooks::OutboundType::Reject => Ok(()), // Already handled above
         hooks::OutboundType::Proxy(handler) => handle_proxy_connect(ctx, handler).await,
+        hooks::OutboundType::Reject => Ok(()), // Already handled above
     }
 }
 
@@ -253,7 +247,7 @@ impl<'a> ConnectContext<'a> {
             Some((self.user_id, stats)),
         );
 
-        tokio::select! {
+        let cancelled = tokio::select! {
             result = relay_fut => {
                 match result {
                     Ok(r) if r.completed => {
@@ -266,17 +260,19 @@ impl<'a> ConnectContext<'a> {
                         log::debug!(peer = %self.peer_addr, error = %e, "Relay error");
                     }
                 }
+                false
             }
             _ = self.cancel_token.cancelled() => {
                 log::debug!(peer = %self.peer_addr, "Connection kicked");
+                true
             }
-        }
+        };
 
-        // Graceful shutdown for both streams (covers cancel, timeout, and error paths).
-        // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
-        // Timeout prevents infinite hang when peer is unresponsive.
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, remote_stream.shutdown()).await;
+        // Only shutdown on cancel — relay already handles shutdown on completion/timeout/error.
+        if cancelled {
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, remote_stream.shutdown()).await;
+        }
 
         Ok(())
     }
@@ -324,16 +320,17 @@ async fn handle_direct_connect(
     ctx.relay(remote_stream).await
 }
 
-/// Handle proxy connection via ACL outbound handler
+/// Handle proxy connection via ACL engine outbound handler
 async fn handle_proxy_connect(
     ctx: ConnectContext<'_>,
     handler: Arc<acl::OutboundHandler>,
 ) -> Result<()> {
-    use acl_engine_r::outbound::{Addr as AclAddr, AsyncOutbound};
+    use acl::{Addr as AclAddr, AsyncOutbound};
 
     // Convert Address to ACL Addr (Cow avoids clone for domains)
     let mut acl_addr = AclAddr::new(ctx.target.host().into_owned(), ctx.target.port());
 
+    // Connect via proxy with timeout
     let remote_stream = match tokio::time::timeout(
         ctx.server.conn_config.connect_timeout,
         handler.dial_tcp(&mut acl_addr),
@@ -351,14 +348,14 @@ async fn handle_proxy_connect(
         }
     };
 
-    log::debug!(peer = %ctx.peer_addr, target = %ctx.target, handler = ?handler, "Connected via proxy");
+    log::debug!(peer = %ctx.peer_addr, target = %ctx.target, handler = ?handler, "Connected to remote (proxy)");
     ctx.relay(remote_stream).await
 }
 
+/// Maximum UDP read buffer size to prevent memory exhaustion
+const UDP_MAX_READ_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+
 /// Handle UDP ASSOCIATE command
-///
-/// Trojan UDP packet format (within TCP stream):
-/// ATYP + DST.ADDR + DST.PORT + Length(2 bytes) + CRLF + Payload
 async fn handle_udp_associate(
     server: &Server,
     mut client_stream: TransportStream,
@@ -368,228 +365,215 @@ async fn handle_udp_associate(
     user_id: UserId,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    use acl_engine_r::outbound::{Addr as AclAddr, AsyncOutbound, AsyncUdpConn};
+    use acl::{Addr as AclAddr, AsyncOutbound, AsyncUdpConn};
     use std::collections::HashMap;
 
-    log::debug!(peer = %peer_addr, "UDP associate started");
-
-    // Idle timeout tracking
-    let idle_timeout_secs = server.conn_config.idle_timeout_secs();
-    let start_time = tokio::time::Instant::now();
-    let mut last_activity_secs = 0u64;
-    let mut idle_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    idle_interval.tick().await; // consume the immediate first tick
-
-    // Buffer for reading from client
-    let buffer_size = server.conn_config.buffer_size;
-    let mut read_buf = vec![0u8; buffer_size];
-    let mut pending_data = BytesMut::new();
-
-    // Process initial payload if any
+    // Buffer for reading UDP packets from TCP stream (with size limit)
+    let mut read_buf = BytesMut::with_capacity(8 * 1024); // Start with 8KB
     if !initial_payload.is_empty() {
-        pending_data.extend_from_slice(&initial_payload);
+        read_buf.extend_from_slice(&initial_payload);
     }
 
     // Per-session route cache: avoids repeated router.route() + DNS for the same target.
     // Also caches the AclAddr for write_to() to avoid per-packet String allocation.
     let mut route_cache: HashMap<Address, (hooks::OutboundType, AclAddr)> = HashMap::new();
 
-    // UDP connection state - reuse connection when possible
+    // UDP relay loop
+    let mut udp_recv_buf = vec![0u8; 65536];
     let mut udp_conn: Option<Box<dyn AsyncUdpConn>> = None;
     let mut current_handler: Option<Arc<acl::OutboundHandler>> = None;
 
-    // Buffer for receiving UDP responses
-    let mut recv_buf = vec![0u8; 65535];
+    // Idle timeout tracking (same mechanism as TCP relay)
+    let idle_timeout_secs = server.conn_config.idle_timeout_secs();
+    let start_time = std::time::Instant::now();
+    let mut last_activity_secs: u64 = 0;
+    let mut idle_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
-            // Read from client (TCP stream with Trojan UDP packets)
-            read_result = client_stream.read(&mut read_buf) => {
-                match read_result {
+            // Read from client TCP stream directly into BytesMut (avoids temp buffer)
+            result = async {
+                // Check buffer size limit before reading
+                if read_buf.len() >= UDP_MAX_READ_BUFFER_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::OutOfMemory,
+                        "UDP read buffer exceeded limit",
+                    ));
+                }
+                read_buf.reserve(8 * 1024);
+                client_stream.read_buf(&mut read_buf).await
+            } => {
+                let n = match result {
                     Ok(0) => {
                         log::debug!(peer = %peer_addr, "UDP client disconnected");
                         break;
                     }
-                    Ok(n) => {
-                        last_activity_secs = start_time.elapsed().as_secs();
-
-                        // Check buffer size limit to prevent memory exhaustion
-                        if pending_data.len() + n > UDP_MAX_READ_BUFFER_SIZE {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::OutOfMemory {
                             log::warn!(
                                 peer = %peer_addr,
-                                buffer_size = pending_data.len(),
+                                buffer_size = read_buf.len(),
                                 "UDP read buffer exceeded limit, closing connection"
                             );
-                            break;
+                        } else {
+                            log::debug!(peer = %peer_addr, error = %e, "UDP read error");
                         }
+                        break;
+                    }
+                };
+                let _ = n;
+                last_activity_secs = start_time.elapsed().as_secs();
 
-                        pending_data.extend_from_slice(&read_buf[..n]);
+                // Process all complete UDP packets in buffer (zero-copy)
+                while !read_buf.is_empty() {
+                    match TrojanUdpPacket::decode_zerocopy(&mut read_buf) {
+                        DecodeResult::Ok(packet, _consumed) => {
 
-                        // Process all complete UDP packets in buffer
-                        while pending_data.len() >= TrojanUdpPacket::MIN_SIZE {
-                            match TrojanUdpPacket::decode(&pending_data) {
-                                DecodeResult::Ok(packet, consumed) => {
-                                    // Remove consumed bytes from buffer
-                                    let _ = pending_data.split_to(consumed);
-
-                                    // Route the packet (use cache to avoid repeated DNS lookups and String allocs)
-                                    let (outbound_type, send_addr) = match route_cache.get(&packet.addr) {
-                                        Some(cached) => (cached.0.clone(), &cached.1),
-                                        None => {
-                                            let result = server.router.route(&packet.addr).await;
-                                            // Pre-compute the AclAddr for write_to() once per unique target
-                                            let acl_addr = match &result {
-                                                hooks::OutboundType::Direct(Some(addr)) => {
-                                                    AclAddr::new(addr.ip().to_string(), addr.port())
-                                                }
-                                                _ => AclAddr::new(packet.addr.host().into_owned(), packet.addr.port()),
-                                            };
-                                            // Evict all entries when cache is full to bound memory
-                                            if route_cache.len() >= UDP_MAX_ROUTE_CACHE_ENTRIES {
-                                                route_cache.clear();
-                                            }
-                                            route_cache.insert(packet.addr.clone(), (result.clone(), acl_addr));
-                                            let cached = route_cache.get(&packet.addr).unwrap();
-                                            (cached.0.clone(), &cached.1)
+                            // Route the packet (use cache to avoid repeated DNS lookups and String allocs)
+                            let (outbound_type, send_addr) = match route_cache.get(&packet.addr) {
+                                Some(cached) => (cached.0.clone(), &cached.1),
+                                None => {
+                                    let result = server.router.route(&packet.addr).await;
+                                    // Pre-compute the AclAddr for write_to() once per unique target
+                                    let acl_addr = match &result {
+                                        hooks::OutboundType::Direct(Some(addr)) => {
+                                            AclAddr::new(addr.ip().to_string(), addr.port())
                                         }
+                                        _ => AclAddr::new(packet.addr.host().into_owned(), packet.addr.port()),
                                     };
-
-                                    match &outbound_type {
-                                        hooks::OutboundType::Reject => {
-                                            log::debug!(peer = %peer_addr, target = %packet.addr, "UDP packet rejected by router");
-                                            continue;
-                                        }
-                                        hooks::OutboundType::Direct(_) => {
-                                            // For direct, we need to create a UDP connection if not exists
-                                            if udp_conn.is_none() || current_handler.is_some() {
-                                                // Explicitly drop old connection to release resources
-                                                if let Some(old_conn) = udp_conn.take() {
-                                                    drop(old_conn);
-                                                }
-                                                current_handler = None;
-
-                                                let direct = acl::Direct::new();
-                                                // Reuse cached AclAddr (avoids per-packet String allocation)
-                                                let mut dial_addr = send_addr.clone();
-                                                match direct.dial_udp(&mut dial_addr).await {
-                                                    Ok(conn) => {
-                                                        udp_conn = Some(conn);
-                                                    }
-                                                    Err(e) => {
-                                                        log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create direct UDP connection");
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        hooks::OutboundType::Proxy(handler) => {
-                                            if !handler.allows_udp() {
-                                                log::debug!(peer = %peer_addr, target = %packet.addr, "Proxy handler does not support UDP, rejecting");
-                                                continue;
-                                            }
-
-                                            // Create new UDP connection if handler changed or not exists
-                                            let need_new_conn = match &current_handler {
-                                                None => true,
-                                                Some(h) => !Arc::ptr_eq(h, handler),
-                                            };
-
-                                            if need_new_conn {
-                                                // Explicitly drop old connection to release resources
-                                                if let Some(old_conn) = udp_conn.take() {
-                                                    drop(old_conn);
-                                                }
-
-                                                // Reuse cached AclAddr (avoids per-packet String allocation)
-                                                let mut dial_addr = send_addr.clone();
-                                                match handler.dial_udp(&mut dial_addr).await {
-                                                    Ok(conn) => {
-                                                        udp_conn = Some(conn);
-                                                        current_handler = Some(handler.clone());
-                                                    }
-                                                    Err(e) => {
-                                                        log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create proxy UDP connection");
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    // Evict all entries when cache is full to bound memory
+                                    if route_cache.len() >= UDP_MAX_ROUTE_CACHE_ENTRIES {
+                                        route_cache.clear();
                                     }
+                                    route_cache.insert(packet.addr.clone(), (result.clone(), acl_addr));
+                                    let cached = route_cache.get(&packet.addr).unwrap();
+                                    (cached.0.clone(), &cached.1)
+                                }
+                            };
 
-                                    // Send UDP packet using cached AclAddr (zero per-packet String allocation)
-                                    if let Some(ref conn) = udp_conn {
-                                        match conn.write_to(&packet.payload, send_addr).await {
-                                            Ok(n) => {
-                                                server.stats.record_upload(user_id, n as u64);
-                                                log::trace!(peer = %peer_addr, target = %packet.addr, bytes = n, "UDP packet sent");
+                            match &outbound_type {
+                                hooks::OutboundType::Reject => {
+                                    log::debug!(peer = %peer_addr, target = %packet.addr, "UDP packet rejected by router");
+                                    continue;
+                                }
+                                hooks::OutboundType::Direct(_) => {
+                                    // For direct, we need to create a UDP connection if not exists
+                                    if udp_conn.is_none() || current_handler.is_some() {
+                                        // Explicitly drop old connection to release resources
+                                        if let Some(old_conn) = udp_conn.take() {
+                                            drop(old_conn);
+                                        }
+                                        current_handler = None;
+
+                                        let direct = acl::Direct::new();
+                                        // Reuse cached AclAddr (avoids per-packet String allocation)
+                                        let mut dial_addr = send_addr.clone();
+                                        match direct.dial_udp(&mut dial_addr).await {
+                                            Ok(conn) => {
+                                                udp_conn = Some(conn);
                                             }
                                             Err(e) => {
-                                                log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "UDP send error");
+                                                log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create direct UDP connection");
+                                                continue;
                                             }
                                         }
                                     }
                                 }
-                                DecodeResult::NeedMoreData => break,
-                                DecodeResult::Invalid(e) => {
-                                    log::debug!(peer = %peer_addr, error = %e, "Invalid UDP packet");
-                                    // Clear buffer and continue
-                                    pending_data.clear();
-                                    break;
+                                hooks::OutboundType::Proxy(handler) => {
+                                    // Check if handler supports UDP
+                                    if !handler.allows_udp() {
+                                        log::debug!(peer = %peer_addr, target = %packet.addr, "UDP not allowed by outbound handler");
+                                        continue;
+                                    }
+
+                                    // Create new UDP connection if handler changed or not exists
+                                    let need_new_conn = match &current_handler {
+                                        None => true,
+                                        Some(h) => !Arc::ptr_eq(h, handler),
+                                    };
+
+                                    if need_new_conn {
+                                        // Explicitly drop old connection to release resources
+                                        if let Some(old_conn) = udp_conn.take() {
+                                            drop(old_conn);
+                                        }
+
+                                        // Reuse cached AclAddr (avoids per-packet String allocation)
+                                        let mut dial_addr = send_addr.clone();
+                                        match handler.dial_udp(&mut dial_addr).await {
+                                            Ok(conn) => {
+                                                udp_conn = Some(conn);
+                                                current_handler = Some(handler.clone());
+                                            }
+                                            Err(e) => {
+                                                log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "Failed to create proxy UDP connection");
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Send UDP packet using cached AclAddr (zero per-packet String allocation)
+                            if let Some(ref conn) = udp_conn {
+                                match conn.write_to(&packet.payload, send_addr).await {
+                                    Ok(n) => {
+                                        server.stats.record_upload(user_id, n as u64);
+                                        log::trace!(peer = %peer_addr, target = %packet.addr, bytes = n, "UDP packet sent");
+                                    }
+                                    Err(e) => {
+                                        log::debug!(peer = %peer_addr, target = %packet.addr, error = %e, "UDP send error");
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        log::debug!(peer = %peer_addr, error = %e, "UDP read error");
-                        break;
+                        DecodeResult::NeedMoreData => break,
+                        DecodeResult::Invalid(msg) => {
+                            log::debug!(peer = %peer_addr, error = %msg, "Invalid UDP packet");
+                            read_buf.clear();
+                            break;
+                        }
                     }
                 }
             }
 
-            // Read from UDP connection (responses)
-            recv_result = async {
+            // Read from UDP connection (if exists), reusing pre-allocated buffer
+            result = async {
                 if let Some(ref conn) = udp_conn {
-                    recv_buf.iter_mut().for_each(|b| *b = 0);
-                    conn.read_from(&mut recv_buf).await
+                    conn.read_from(&mut udp_recv_buf).await
                 } else {
-                    // No connection, wait forever
-                    std::future::pending().await
+                    // No UDP connection, wait forever
+                    std::future::pending::<acl_engine_r::Result<(usize, AclAddr)>>().await
                 }
             } => {
-                match recv_result {
+                match result {
                     Ok((n, from_addr)) => {
                         last_activity_secs = start_time.elapsed().as_secs();
 
-                        // Convert acl::Addr to Address
+                        // Convert AclAddr back to Address
                         let addr = acl_addr_to_address(&from_addr);
 
-                        // Encode response as Trojan UDP packet
-                        let response = TrojanUdpPacket::encode(&addr, &recv_buf[..n]);
-
-                        // Send back to client
-                        match client_stream.write_all(&response).await {
-                            Ok(()) => {
-                                server.stats.record_download(user_id, n as u64);
-                                log::trace!(peer = %peer_addr, from = %addr, bytes = n, "UDP response sent");
-                            }
-                            Err(e) => {
-                                log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP response");
-                                break;
-                            }
+                        // Encode and send back to client
+                        let response = TrojanUdpPacket::encode(&addr, &udp_recv_buf[..n]);
+                        if let Err(e) = client_stream.write_all(&response).await {
+                            log::debug!(peer = %peer_addr, error = %e, "Failed to write UDP response");
+                            break;
                         }
+                        server.stats.record_download(user_id, n as u64);
+                        log::trace!(peer = %peer_addr, from = %from_addr, bytes = n, "UDP packet received");
                     }
                     Err(e) => {
                         log::debug!(peer = %peer_addr, error = %e, "UDP recv error");
-                        // Don't break, just log the error
                     }
                 }
             }
 
-            // Idle timeout check
+            // Idle timeout check (every 30s)
             _ = idle_interval.tick() => {
-                let elapsed = start_time.elapsed().as_secs();
-                if elapsed - last_activity_secs >= idle_timeout_secs {
-                    log::debug!(peer = %peer_addr, idle_secs = elapsed - last_activity_secs, "UDP idle timeout");
+                let idle_secs = start_time.elapsed().as_secs().saturating_sub(last_activity_secs);
+                if idle_secs >= idle_timeout_secs {
+                    log::debug!(peer = %peer_addr, idle_secs = idle_secs, "UDP connection idle timeout");
                     break;
                 }
             }
@@ -605,19 +589,17 @@ async fn handle_udp_associate(
     // Graceful shutdown of the client TCP stream carrying UDP packets
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
 
-    log::debug!(peer = %peer_addr, "UDP associate ended");
     Ok(())
 }
 
-/// Convert acl::Addr to core::Address
-fn acl_addr_to_address(addr: &acl_engine_r::outbound::Addr) -> Address {
+/// Convert AclAddr to Address
+fn acl_addr_to_address(addr: &acl::Addr) -> Address {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    // Try to parse as IPv4
+    // Try to parse as IP address first
     if let Ok(ipv4) = addr.host.parse::<Ipv4Addr>() {
         return Address::IPv4(ipv4.octets(), addr.port);
     }
-    // Try to parse as IPv6
     if let Ok(ipv6) = addr.host.parse::<Ipv6Addr>() {
         return Address::IPv6(ipv6.octets(), addr.port);
     }
@@ -628,60 +610,40 @@ fn acl_addr_to_address(addr: &acl_engine_r::outbound::Addr) -> Address {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_udp_recv_buf_reuse_no_stale_data() {
-        let mut buf = vec![0u8; 1024];
-
-        // Simulate first recv: write some data
-        buf[..5].copy_from_slice(b"hello");
-        let n1 = 5;
-        assert_eq!(&buf[..n1], b"hello");
-
-        // Simulate clearing before second recv (same as production code)
-        buf.iter_mut().for_each(|b| *b = 0);
-
-        // Simulate second recv: shorter data
-        buf[..2].copy_from_slice(b"hi");
-        let n2 = 2;
-
-        // Only n2 bytes should be valid; bytes after should be zero
-        assert_eq!(&buf[..n2], b"hi");
-        assert_eq!(buf[n2], 0, "byte after recv data should be zero, not stale");
-    }
+    use acl::Addr as AclAddr;
 
     #[test]
     fn test_acl_addr_to_address_ipv4() {
-        let addr = acl_engine_r::outbound::Addr::new("192.168.1.1", 80);
-        let result = acl_addr_to_address(&addr);
-        assert!(matches!(result, Address::IPv4(_, 80)));
+        let acl_addr = AclAddr::new("192.168.1.1", 8080);
+        let addr = acl_addr_to_address(&acl_addr);
+        assert!(matches!(addr, Address::IPv4([192, 168, 1, 1], 8080)));
     }
 
     #[test]
     fn test_acl_addr_to_address_ipv6() {
-        let addr = acl_engine_r::outbound::Addr::new("::1", 443);
-        let result = acl_addr_to_address(&addr);
-        assert!(matches!(result, Address::IPv6(_, 443)));
+        let acl_addr = AclAddr::new("::1", 443);
+        let addr = acl_addr_to_address(&acl_addr);
+        match addr {
+            Address::IPv6(ip, port) => {
+                assert_eq!(port, 443);
+                assert_eq!(ip, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            }
+            _ => panic!("Expected IPv6 address"),
+        }
     }
 
     #[test]
     fn test_acl_addr_to_address_ipv6_full() {
-        let addr = acl_engine_r::outbound::Addr::new("2001:db8::1", 8080);
-        let result = acl_addr_to_address(&addr);
-        assert!(matches!(result, Address::IPv6(_, 8080)));
+        let acl_addr = AclAddr::new("2001:db8::1", 80);
+        let addr = acl_addr_to_address(&acl_addr);
+        assert!(matches!(addr, Address::IPv6(_, 80)));
     }
 
     #[test]
     fn test_acl_addr_to_address_domain() {
-        let addr = acl_engine_r::outbound::Addr::new("example.com", 443);
-        let result = acl_addr_to_address(&addr);
-        match result {
-            Address::Domain(host, port) => {
-                assert_eq!(host, "example.com");
-                assert_eq!(port, 443);
-            }
-            _ => panic!("Expected Domain address"),
-        }
+        let acl_addr = AclAddr::new("example.com", 80);
+        let addr = acl_addr_to_address(&acl_addr);
+        assert!(matches!(addr, Address::Domain(ref d, 80) if d == "example.com"));
     }
 
     #[test]
@@ -692,14 +654,177 @@ mod tests {
 
     #[test]
     fn test_acl_addr_to_address_domain_with_subdomain() {
-        let addr = acl_engine_r::outbound::Addr::new("sub.example.com", 8443);
-        let result = acl_addr_to_address(&addr);
-        match result {
-            Address::Domain(host, port) => {
-                assert_eq!(host, "sub.example.com");
-                assert_eq!(port, 8443);
+        let acl_addr = AclAddr::new("sub.example.com", 443);
+        let addr = acl_addr_to_address(&acl_addr);
+        assert!(matches!(addr, Address::Domain(ref d, 443) if d == "sub.example.com"));
+    }
+
+    /// Build a valid Trojan CONNECT request as raw bytes
+    fn build_trojan_request(password: &[u8; 56], addr: &Address, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(password);
+        buf.extend_from_slice(b"\r\n");
+        buf.push(1); // CONNECT
+        addr.encode(&mut buf);
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_complete_in_one_read() {
+        let password = [b'a'; 56];
+        let addr = Address::IPv4([127, 0, 0, 1], 8080);
+        let raw = build_trojan_request(&password, &addr, b"hello");
+
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(raw));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let req = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap();
+        assert_eq!(req.password, password);
+        assert_eq!(req.cmd, TrojanCmd::Connect);
+        assert!(matches!(req.addr, Address::IPv4([127, 0, 0, 1], 8080)));
+        assert_eq!(req.payload.as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_empty_connection() {
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(Vec::new()));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let err = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("closed before receiving"),
+            "Expected 'closed before receiving' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_incomplete_connection() {
+        // Send partial password then EOF
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(vec![b'a'; 30]));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let err = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete request"),
+            "Expected 'incomplete request' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_too_large() {
+        // Craft a request that looks like it needs more data (valid password + CRLF
+        // + valid command + domain ATYP with large length), so the parser keeps
+        // reading until the buffer exceeds the size limit.
+        let buffer_size = 128;
+        let mut data = Vec::new();
+        data.extend_from_slice(&[b'a'; 56]); // valid password
+        data.extend_from_slice(b"\r\n"); // valid first CRLF
+        data.push(1); // CONNECT
+        data.push(3); // ATYP_DOMAIN
+        data.push(255); // domain length = 255 (will need more data to complete)
+                        // Feed enough to exceed buffer_size * 2 without ever completing the domain
+        data.extend_from_slice(&vec![b'x'; buffer_size * 2]);
+
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(data));
+        let mut buf = BytesMut::with_capacity(buffer_size);
+
+        let err = read_trojan_request(&mut stream, &mut buf, buffer_size)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "Expected 'too large' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_no_payload() {
+        let password = [b'z'; 56];
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let raw = build_trojan_request(&password, &addr, b"");
+
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(raw));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let req = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap();
+        assert_eq!(req.password, password);
+        assert!(matches!(
+            req.addr,
+            Address::Domain(ref d, 443) if d == "example.com"
+        ));
+        assert!(req.payload.is_empty());
+    }
+
+    /// Verify that reusing a pre-allocated buffer for UDP recv produces correct
+    /// TrojanUdpPacket encoding — stale data beyond `n` bytes must not leak
+    /// into the encoded packet.
+    #[test]
+    fn test_udp_recv_buf_reuse_no_stale_data() {
+        // Simulate a reused 64KB buffer (like udp_recv_buf in handle_udp_associate)
+        let mut recv_buf = vec![0xFFu8; 65536]; // filled with 0xFF "stale" data
+
+        // --- First "read": 5 bytes ---
+        let data1 = b"hello";
+        recv_buf[..data1.len()].copy_from_slice(data1);
+        let n1 = data1.len();
+
+        let addr1 = Address::IPv4([8, 8, 8, 8], 53);
+        let encoded1 = TrojanUdpPacket::encode(&addr1, &recv_buf[..n1]);
+
+        // Decode and verify only "hello" is in the payload, no stale 0xFF
+        match TrojanUdpPacket::decode(&encoded1) {
+            DecodeResult::Ok(pkt, _) => {
+                assert_eq!(pkt.payload.as_ref(), b"hello");
+                assert_eq!(pkt.payload.len(), 5);
             }
-            _ => panic!("Expected Domain address"),
+            _ => panic!("Failed to decode first packet"),
+        }
+
+        // --- Second "read": 3 bytes (shorter than first) ---
+        // Bytes 3..5 still contain 'l','o' from the first read — stale data
+        let data2 = b"bye";
+        recv_buf[..data2.len()].copy_from_slice(data2);
+        let n2 = data2.len();
+
+        let addr2 = Address::Domain("dns.example.com".to_string(), 53);
+        let encoded2 = TrojanUdpPacket::encode(&addr2, &recv_buf[..n2]);
+
+        match TrojanUdpPacket::decode(&encoded2) {
+            DecodeResult::Ok(pkt, _) => {
+                // Must be "bye" only, NOT "byelo" or anything longer
+                assert_eq!(pkt.payload.as_ref(), b"bye");
+                assert_eq!(pkt.payload.len(), 3);
+            }
+            _ => panic!("Failed to decode second packet"),
+        }
+
+        // --- Third "read": large payload ---
+        let data3 = vec![0xABu8; 1024];
+        recv_buf[..data3.len()].copy_from_slice(&data3);
+        let n3 = data3.len();
+
+        let addr3 = Address::IPv4([1, 1, 1, 1], 443);
+        let encoded3 = TrojanUdpPacket::encode(&addr3, &recv_buf[..n3]);
+
+        match TrojanUdpPacket::decode(&encoded3) {
+            DecodeResult::Ok(pkt, _) => {
+                assert_eq!(pkt.payload.len(), 1024);
+                assert!(pkt.payload.iter().all(|&b| b == 0xAB));
+            }
+            _ => panic!("Failed to decode third packet"),
         }
     }
 }

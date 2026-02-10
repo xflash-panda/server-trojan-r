@@ -2,12 +2,13 @@
 //!
 //! Encodes and decodes gRPC frames compatible with v2ray format.
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::io;
 
 /// Parse gRPC message frame (v2ray compatible format)
 ///
 /// Format: 5-byte gRPC header + protobuf header + data
+#[allow(dead_code)]
 pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> {
     if buf.len() < 6 {
         return Ok(None);
@@ -52,6 +53,59 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     let consumed = 5 + grpc_frame_len;
 
     Ok(Some((consumed, payload)))
+}
+
+/// Zero-copy variant of parse_grpc_message.
+///
+/// Consumes the gRPC frame from `buf` via `split_to` and returns the payload as
+/// a `Bytes` handle that shares the underlying allocation (no memcpy).
+/// Also returns the number of bytes consumed (for HTTP/2 flow control).
+pub fn parse_grpc_message_zerocopy(buf: &mut BytesMut) -> io::Result<Option<(Bytes, usize)>> {
+    if buf.len() < 6 {
+        return Ok(None);
+    }
+
+    if buf[0] != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed gRPC not supported",
+        ));
+    }
+
+    let grpc_frame_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+
+    if buf.len() < 5 + grpc_frame_len {
+        return Ok(None);
+    }
+
+    if buf[5] != 0x0A {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected protobuf tag: 0x{:02X}, expected 0x0A", buf[5]),
+        ));
+    }
+
+    let (payload_len_u64, varint_bytes) = decode_varint(&buf[6..])?;
+    let payload_len = payload_len_u64 as usize;
+    let data_start = 6 + varint_bytes;
+    let data_end = data_start + payload_len;
+
+    if data_end > 5 + grpc_frame_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "payload length {} exceeds gRPC frame length {}",
+                payload_len, grpc_frame_len
+            ),
+        ));
+    }
+
+    let consumed = 5 + grpc_frame_len;
+    // split_to consumes the frame from buf; freeze + slice yields a zero-copy Bytes
+    let frame = buf.split_to(consumed).freeze();
+    let payload = frame.slice(data_start..data_end);
+
+    Ok(Some((payload, consumed)))
 }
 
 /// Encode gRPC message frame (single allocation)
@@ -205,6 +259,28 @@ mod tests {
         let (val, bytes) = decode_varint(&[0x80, 0x01]).unwrap();
         assert_eq!(val, 128);
         assert_eq!(bytes, 2);
+    }
+
+    #[test]
+    fn test_parse_grpc_message_zerocopy_roundtrip() {
+        let payload = b"zero-copy test data";
+        let encoded = encode_grpc_message(payload);
+
+        let mut buf = BytesMut::from(&encoded[..]);
+        let (parsed_payload, consumed) = parse_grpc_message_zerocopy(&mut buf).unwrap().unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(&parsed_payload[..], &payload[..]);
+        // buf should be empty after split_to consumed the frame
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_parse_grpc_message_zerocopy_incomplete() {
+        let mut buf = BytesMut::from(&[0x00, 0x00, 0x00][..]);
+        assert!(parse_grpc_message_zerocopy(&mut buf).unwrap().is_none());
+        // buf should be unchanged since nothing was consumed
+        assert_eq!(buf.len(), 3);
     }
 
     #[test]
