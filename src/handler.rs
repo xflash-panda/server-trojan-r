@@ -13,6 +13,7 @@ use crate::transport::TransportStream;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use socket2::{SockRef, TcpKeepalive};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -105,13 +106,13 @@ pub async fn process_connection(
     // Saves 32KB per connection during the relay phase.
     drop(buf);
 
-    let peer_addr = meta.peer_addr.to_string();
+    let peer_addr = meta.peer_addr;
 
     // Authenticate user
-    let user_id = match server.authenticator.authenticate(&request.password).await {
+    let user_id = match server.authenticator.authenticate(&request.password) {
         Some(id) => id,
         None => {
-            log::authentication(&peer_addr, false);
+            log::authentication(peer_addr, false);
             log::debug!(
                 peer = %peer_addr,
                 transport = %meta.transport_type,
@@ -121,11 +122,11 @@ pub async fn process_connection(
         }
     };
 
-    log::authentication(&peer_addr, true);
+    log::authentication(peer_addr, true);
     log::debug!(peer = %peer_addr, user_id = user_id, "User authenticated");
 
     // Register connection for tracking and kick-off capability
-    let (conn_id, cancel_token) = server.conn_manager.register(user_id, peer_addr.clone());
+    let (conn_id, cancel_token) = server.conn_manager.register(user_id, peer_addr);
     log::debug!(peer = %peer_addr, user_id = user_id, conn_id = conn_id, "Connection registered");
 
     // Ensure connection is unregistered when done
@@ -171,7 +172,7 @@ async fn handle_connect(
     client_stream: TransportStream,
     target: Address,
     initial_payload: bytes::Bytes,
-    peer_addr: String,
+    peer_addr: SocketAddr,
     user_id: UserId,
     cancel_token: CancellationToken,
 ) -> Result<()> {
@@ -192,7 +193,7 @@ async fn handle_connect(
         client_stream,
         target: &target,
         initial_payload,
-        peer_addr: &peer_addr,
+        peer_addr,
         user_id,
         cancel_token,
     };
@@ -211,7 +212,7 @@ struct ConnectContext<'a> {
     client_stream: TransportStream,
     target: &'a Address,
     initial_payload: bytes::Bytes,
-    peer_addr: &'a str,
+    peer_addr: SocketAddr,
     user_id: UserId,
     cancel_token: CancellationToken,
 }
@@ -361,7 +362,7 @@ async fn handle_udp_associate(
     mut client_stream: TransportStream,
     _initial_target: Address,
     initial_payload: bytes::Bytes,
-    peer_addr: String,
+    peer_addr: SocketAddr,
     user_id: UserId,
     cancel_token: CancellationToken,
 ) -> Result<()> {

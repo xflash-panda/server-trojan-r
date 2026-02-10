@@ -100,16 +100,16 @@ pub mod log {
     pub use tracing::{debug, error, info, trace, warn};
 
     /// Log connection events
-    pub fn connection(addr: &str, event: &str) {
-        debug!(peer = addr, event = event, "Connection");
+    pub fn connection(addr: std::net::SocketAddr, event: &str) {
+        debug!(peer = %addr, event = event, "Connection");
     }
 
     /// Log authentication events
-    pub fn authentication(addr: &str, success: bool) {
+    pub fn authentication(addr: std::net::SocketAddr, success: bool) {
         if success {
-            debug!(peer = addr, "Authentication successful");
+            debug!(peer = %addr, "Authentication successful");
         } else {
-            debug!(peer = addr, "Authentication failed");
+            debug!(peer = %addr, "Authentication failed");
         }
     }
 

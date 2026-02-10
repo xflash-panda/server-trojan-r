@@ -11,7 +11,6 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
-use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::hooks::{StatsCollector, UserId};
@@ -159,14 +158,15 @@ where
     let mut a_to_b = DirectionalBuffer::new(buffer_size);
     let mut b_to_a = DirectionalBuffer::new(buffer_size);
 
-    let start_time = Instant::now();
-    let mut last_activity_secs: u64 = 0;
-
     // Half-close deadline: set when one direction completes, fires after timeout
     let mut half_close_deadline: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
-    // Idle check every 30 seconds (same granularity as before)
-    let mut idle_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+    // Idle timeout: single Sleep that resets on every data transfer.
+    // Unlike interval(30s), this avoids waking active connections every 30s
+    // and fires precisely at idle_timeout instead of ±30s granularity.
+    let mut idle_deadline = Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(
+        idle_timeout_secs,
+    )));
 
     let result: io::Result<bool> = std::future::poll_fn(|cx| {
         let bytes_before = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
@@ -203,10 +203,12 @@ where
             }
         }
 
-        // Track activity based on byte progress
+        // Reset idle deadline on data activity
         let bytes_after = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
         if bytes_after > bytes_before {
-            last_activity_secs = start_time.elapsed().as_secs();
+            idle_deadline.as_mut().reset(
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(idle_timeout_secs),
+            );
         }
 
         // Both directions done → completed normally
@@ -221,13 +223,9 @@ where
             }
         }
 
-        // Idle timeout check (every 30s)
-        if idle_interval.poll_tick(cx).is_ready() {
-            let current_elapsed = start_time.elapsed().as_secs();
-            let idle_secs = current_elapsed.saturating_sub(last_activity_secs);
-            if idle_secs >= idle_timeout_secs {
-                return Poll::Ready(Ok(false));
-            }
+        // Idle timeout: fires precisely after idle_timeout_secs of inactivity
+        if idle_deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(false));
         }
 
         Poll::Pending

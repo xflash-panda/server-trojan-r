@@ -228,7 +228,7 @@ mod tests {
         let conn_manager = ConnectionManager::new();
 
         // Register a connection for user 1
-        let (_, _token) = conn_manager.register(1, "127.0.0.1:1234".to_string());
+        let (_, _token) = conn_manager.register(1, "127.0.0.1:1234".parse().unwrap());
 
         let user_manager = UserManager::new(conn_manager);
 
@@ -264,7 +264,7 @@ mod tests {
         let conn_manager = ConnectionManager::new();
 
         // Register a connection for user 1
-        let (_, _token) = conn_manager.register(1, "127.0.0.1:1234".to_string());
+        let (_, _token) = conn_manager.register(1, "127.0.0.1:1234".parse().unwrap());
 
         let user_manager = UserManager::new(conn_manager);
 

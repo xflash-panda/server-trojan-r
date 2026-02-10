@@ -11,10 +11,13 @@ use std::net::SocketAddr;
 pub type UserId = i64;
 
 /// Authenticator trait for user authentication
-#[async_trait]
+///
+/// Synchronous by design: authentication is a hash-table lookup (ArcSwap),
+/// not an I/O operation. Eliminating `async_trait` avoids one `Box<dyn Future>`
+/// heap allocation per connection on the hot path.
 pub trait Authenticator: Send + Sync {
     /// Authenticate user by password hash, returns user_id if successful
-    async fn authenticate(&self, password: &[u8; 56]) -> Option<UserId>;
+    fn authenticate(&self, password: &[u8; 56]) -> Option<UserId>;
 }
 
 /// Statistics collector trait for traffic tracking
