@@ -4,11 +4,17 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// Check if an IPv4 address is private/loopback/link-local
+/// Check if an IPv4 address is private/loopback/link-local/reserved
 pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    ip.is_loopback()           // 127.0.0.0/8
-        || ip.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-        || ip.is_link_local() // 169.254.0.0/16
+    let octets = ip.octets();
+    ip.is_loopback()                   // 127.0.0.0/8
+        || ip.is_private()             // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+        || ip.is_link_local()          // 169.254.0.0/16
+        || octets[0] == 0             // 0.0.0.0/8 ("this network")
+        || (octets[0] == 100 && (octets[1] & 0xC0) == 64)  // 100.64.0.0/10 (CGN, RFC 6598)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)  // 192.0.0.0/24 (IETF protocol)
+        || ip.is_broadcast()           // 255.255.255.255
+        || ip.is_multicast() // 224.0.0.0/4
 }
 
 /// Check if an IPv6 address is private/loopback/link-local/ULA
@@ -98,5 +104,36 @@ mod tests {
     fn test_is_private_ipv6_public() {
         assert!(!is_private_ipv6(&"2001:4860:4860::8888".parse().unwrap())); // Google DNS
         assert!(!is_private_ipv6(&"2606:4700:4700::1111".parse().unwrap())); // Cloudflare
+    }
+
+    #[test]
+    fn test_is_private_ipv4_this_network() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(0, 255, 255, 255)));
+    }
+
+    #[test]
+    fn test_is_private_ipv4_cgn() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(100, 127, 255, 255)));
+        assert!(!is_private_ipv4(&Ipv4Addr::new(100, 128, 0, 1))); // Outside CGN range
+    }
+
+    #[test]
+    fn test_is_private_ipv4_ietf_protocol() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(192, 0, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(192, 0, 0, 255)));
+        assert!(!is_private_ipv4(&Ipv4Addr::new(192, 0, 1, 1))); // Outside range
+    }
+
+    #[test]
+    fn test_is_private_ipv4_broadcast() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(255, 255, 255, 255)));
+    }
+
+    #[test]
+    fn test_is_private_ipv4_multicast() {
+        assert!(is_private_ipv4(&Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(is_private_ipv4(&Ipv4Addr::new(239, 255, 255, 255)));
     }
 }
