@@ -1,15 +1,44 @@
 # Server Trojan-R
 
-高性能 Rust 实现的 Trojan 代理服务器节点，
+高性能 Rust 实现的 Trojan 代理服务器节点，通过 HTTP API 与面板通信，支持用户同步、流量上报和心跳保活。
 
 ## 特性
 
-- **高性能**: 基于 Rust + Tokio 异步运行时
-- **多传输模式**: TCP / WebSocket / gRPC
-- **ACL 规则引擎**: 支持 Direct、SOCKS5、HTTP、Reject 出站
-- **GeoIP/GeoSite**: 支持 MaxMind MMDB 和 Sing-box 规则格式
-- **SSRF 防护**: 默认阻止访问私有/回环地址
-- **API 集成**: 自动同步用户、上报流量、心跳保活
+- **高性能**: Rust + Tokio 异步运行时，零 GC 暂停
+- **多传输模式**: TCP / WebSocket / gRPC (HTTP/2)
+- **TLS**: 基于 rustls，支持 Session Tickets 降低握手延迟
+- **ACL 规则引擎**: 支持 Direct、SOCKS5、HTTP、Reject 出站，集成 GeoIP/GeoSite
+- **SSRF 防护**: 默认阻止私有/回环地址，检测 DNS 重绑定攻击
+- **API 面板集成**: 自动同步用户、上报流量、心跳保活
+- **优雅关闭**: 信号处理 + 最终流量上报 + 节点注销
+
+## 架构
+
+```
+src/
+├── main.rs              # 入口，信号处理，优雅关闭
+├── config.rs            # CLI 参数与配置
+├── server_runner.rs     # 服务器启动与连接接受
+├── handler.rs           # 连接处理调度
+├── acl.rs               # ACL 规则引擎集成
+├── logger.rs            # 日志初始化
+├── error.rs             # 错误类型定义
+├── core/
+│   ├── server.rs        # 核心服务器 (Builder 模式)
+│   ├── protocol.rs      # Trojan 协议解析
+│   ├── relay.rs         # 双向数据转发 (带流量统计)
+│   ├── connection.rs    # 连接管理器
+│   ├── hooks.rs         # 认证/统计/路由 Hook 接口
+│   └── ip_filter.rs     # IP 过滤
+├── transport/
+│   ├── tls.rs           # TLS 配置与证书加载
+│   ├── ws.rs            # WebSocket 传输
+│   └── grpc/            # gRPC 传输 (编解码/连接/心跳)
+└── business/
+    ├── auth.rs          # 用户认证
+    ├── stats.rs         # 流量统计收集
+    └── api/             # 面板 API (用户管理/后台任务)
+```
 
 ## 安装
 
@@ -57,7 +86,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ### 启动示例
 
 ```bash
-# 基本启动 (使用默认证书路径 /root/.cert/server.crt 和 /root/.cert/server.key)
+# 基本启动
 server-trojan \
   --api https://panel.example.com/api \
   --token your_api_token \
@@ -129,9 +158,7 @@ outbound(matcher, protocol/port)
 - IPv4: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`
 - IPv6: `::1`, `fc00::/7`, `fe80::/10`
 
-同时检测域名解析结果，防止 DNS 重绑定攻击。
-
-可通过 `--block_private_ip=false` 禁用。
+同时检测域名解析结果，防止 DNS 重绑定攻击。可通过 `--block_private_ip=false` 禁用。
 
 ## 协议支持
 
@@ -140,41 +167,31 @@ outbound(matcher, protocol/port)
 - IPv4 / IPv6
 - 域名解析
 
-## 性能优势
+## 技术栈
 
-相比 Go 实现的代理服务器（如 Xray），本项目具有以下性能优势：
+| 组件 | 技术 | 说明 |
+|------|------|------|
+| 异步运行时 | Tokio 1.49 | 多线程异步 I/O |
+| TLS | rustls 0.23 + ring | 纯 Rust TLS，支持 Session Tickets |
+| WebSocket | tokio-tungstenite 0.28 | WS 传输层 |
+| HTTP/2 | h2 0.4 | gRPC 底层传输 |
+| 内存分配器 | jemalloc (tikv) | 高并发下主动归还内存给 OS |
+| 并发容器 | DashMap 6 | 分片锁，无全局锁竞争 |
+| 零拷贝 | Bytes 1.11 | 协议解析与转发无内存拷贝 |
+| ACL 引擎 | acl-engine-r | GeoIP/GeoSite 规则匹配 |
 
-### 核心优化
+## 性能特点
 
 | 技术 | 说明 |
 |------|------|
 | **零 GC 暂停** | Rust 无垃圾回收，延迟稳定可预测 |
-| **MiMalloc 分配器** | 微软开源的高性能内存分配器，高并发下优于系统 malloc |
+| **jemalloc 分配器** | 高并发下主动归还内存，RSS 不会单调增长 |
 | **DashMap 无锁并发** | 分片锁设计，避免连接管理的全局锁竞争 |
 | **零拷贝数据转发** | 使用 `Bytes` 类型，协议解析和转发过程无内存拷贝 |
 | **原生异步 TLS** | rustls 无需 FFI 调用，握手不阻塞线程池 |
-
-### 预期性能提升
-
-| 并发规模 | 吞吐提升 | 说明 |
-|----------|----------|------|
-| < 1,000 连接 | 5-10% | 小规模差距不大 |
-| 1,000 - 10,000 连接 | 15-25% | 内存分配和 GC 压力差异体现 |
-| 10,000+ 连接 | 30-50% | P99 延迟可降低 2-5 倍 |
-
-### 内存效率
-
-- 单连接开销：~4-8 KB（Go 实现通常 8-16 KB）
-- 无 GC 导致的周期性内存压力
-- 高并发下内存占用更稳定
-
-### 适用场景
-
-性能优势在以下场景更明显：
-
-- **高并发节点**：云服务商的大流量节点
-- **低延迟敏感**：游戏加速、实时通信
-- **资源受限**：小内存 VPS 环境
+| **TLS Session Tickets** | 恢复连接免完整握手，降低延迟 |
+| **TCP Keepalive** | 入站/出站连接均启用，及时检测死连接 |
+| **优雅关闭** | 信号处理 → 停止后台任务 → 最终流量上报 → 节点注销 |
 
 ## 许可证
 
