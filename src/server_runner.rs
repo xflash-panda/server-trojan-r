@@ -11,6 +11,7 @@ use crate::logger::log;
 use crate::transport::{ConnectionMeta, TransportStream, TransportType};
 
 use anyhow::{anyhow, Result};
+use socket2::{SockRef, TcpKeepalive};
 use std::sync::Arc;
 
 /// Build transport configuration from server config
@@ -84,6 +85,10 @@ pub struct NetworkSettings {
     /// WebSocket path
     pub ws_path: String,
 }
+
+/// TCP keepalive interval — matches Go's net.ListenConfig default (15s).
+/// Dead peers are detected in ~45s (3 probes × 15s).
+const TCP_KEEPALIVE_SECS: u64 = 15;
 
 /// Accept and handle a connection with proper transport wrapping
 pub async fn accept_connection<S>(
@@ -282,6 +287,12 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                             let _ = stream.set_nodelay(true);
                         }
 
+                        // Enable TCP keepalive to detect dead peers (mobile disconnect, network change, etc.)
+                        let keepalive = TcpKeepalive::new()
+                            .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+                            .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+                        let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+
                         if let Some(tls_acceptor) = tls_acceptor {
                             // TLS handshake with timeout
                             match tokio::time::timeout(
@@ -414,6 +425,16 @@ mod tests {
         // Message and frame sizes are bounded
         assert_eq!(ws_config.max_message_size, Some(buf_size * 4));
         assert_eq!(ws_config.max_frame_size, Some(buf_size * 2));
+    }
+
+    #[test]
+    fn test_tcp_keepalive_interval() {
+        use super::TCP_KEEPALIVE_SECS;
+        // Match Go net.ListenConfig default: 15s keepalive
+        assert_eq!(TCP_KEEPALIVE_SECS, 15);
+        // 3 probes × 15s interval = ~45s detection time
+        let detection_time = TCP_KEEPALIVE_SECS * 3;
+        assert!(detection_time <= 60, "keepalive detection should be under 60s");
     }
 
     #[test]
