@@ -110,9 +110,8 @@ mod tests {
     // Simple test implementations
     struct TestAuthenticator;
 
-    #[async_trait::async_trait]
     impl Authenticator for TestAuthenticator {
-        async fn authenticate(&self, _password: &[u8; 56]) -> Option<UserId> {
+        fn authenticate(&self, _password: &[u8; 56]) -> Option<UserId> {
             Some(1)
         }
     }

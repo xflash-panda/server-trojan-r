@@ -90,17 +90,11 @@ pub struct NetworkSettings {
 /// Dead peers are detected in ~45s (3 probes × 15s).
 const TCP_KEEPALIVE_SECS: u64 = 15;
 
-/// Parse peer address string into SocketAddr, falling back to 0.0.0.0:0
-fn parse_peer_addr(addr: &str) -> std::net::SocketAddr {
-    addr.parse()
-        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
-}
-
 /// Accept and handle a connection with proper transport wrapping
 pub async fn accept_connection<S>(
     server: Arc<Server>,
     stream: S,
-    peer_addr: String,
+    peer_addr: std::net::SocketAddr,
     transport_type: TransportType,
     network_settings: NetworkSettings,
 ) -> Result<()>
@@ -111,8 +105,7 @@ where
 
     match transport_type {
         TransportType::Grpc => {
-            let peer_addr_for_log = peer_addr.clone();
-            log::debug!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
+            log::debug!(peer = %peer_addr, "gRPC connection established, waiting for streams");
             let grpc_conn = GrpcConnection::with_config(
                 stream,
                 &network_settings.grpc_service_name,
@@ -122,11 +115,10 @@ where
             let result = grpc_conn
                 .run(move |grpc_transport| {
                     let server = Arc::clone(&server);
-                    let peer_addr = peer_addr.clone();
                     async move {
                         let stream: TransportStream = Box::pin(grpc_transport);
                         let meta = ConnectionMeta {
-                            peer_addr: parse_peer_addr(&peer_addr),
+                            peer_addr,
                             transport_type: TransportType::Grpc,
                         };
                         process_connection(&server, stream, meta).await
@@ -136,10 +128,10 @@ where
 
             match &result {
                 Ok(()) => {
-                    log::debug!(peer = %peer_addr_for_log, "gRPC connection closed normally");
+                    log::debug!(peer = %peer_addr, "gRPC connection closed normally");
                 }
                 Err(e) => {
-                    log::debug!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
+                    log::debug!(peer = %peer_addr, error = %e, "gRPC connection closed with error");
                 }
             }
             result
@@ -183,7 +175,7 @@ where
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
-                peer_addr: parse_peer_addr(&peer_addr),
+                peer_addr,
                 transport_type: TransportType::WebSocket,
             };
             process_connection(&server, stream, meta).await
@@ -191,7 +183,7 @@ where
         TransportType::Tcp => {
             let stream: TransportStream = Box::pin(stream);
             let meta = ConnectionMeta {
-                peer_addr: parse_peer_addr(&peer_addr),
+                peer_addr,
                 transport_type: TransportType::Tcp,
             };
             process_connection(&server, stream, meta).await
@@ -263,8 +255,8 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                let peer_addr = addr.to_string();
-                log::connection(&peer_addr, "new");
+                let peer_addr = addr;
+                log::connection(peer_addr, "new");
 
                 // Acquire connection permit (backpressure when at limit)
                 let _permit = if let Some(ref limiter) = conn_limiter {
@@ -308,7 +300,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                             {
                                 Ok(Ok(tls_stream)) => {
                                     log::debug!(peer = %peer_addr, "TLS handshake successful");
-                                    accept_connection(server, tls_stream, peer_addr.clone(), transport_type, network_settings).await
+                                    accept_connection(server, tls_stream, peer_addr, transport_type, network_settings).await
                                 }
                                 Ok(Err(e)) => {
                                     log::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
@@ -320,7 +312,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                                 }
                             }
                         } else {
-                            accept_connection(server, stream, peer_addr.clone(), transport_type, network_settings).await
+                            accept_connection(server, stream, peer_addr, transport_type, network_settings).await
                         }
                     }
                     .await;
@@ -328,7 +320,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                     if let Err(e) = result {
                         log::debug!(peer = %peer_addr, error = %e, "Connection error");
                     }
-                    log::connection(&peer_addr, "closed");
+                    log::connection(peer_addr, "closed");
                 });
             }
             Err(e) => {
@@ -453,42 +445,6 @@ mod tests {
         // this is the root cause we're protecting against.
         let defaults = WebSocketConfig::default();
         assert_eq!(defaults.max_write_buffer_size, usize::MAX);
-    }
-
-    #[test]
-    fn test_parse_peer_addr_valid_ipv4() {
-        use super::parse_peer_addr;
-        let addr = parse_peer_addr("127.0.0.1:8080");
-        assert_eq!(addr.to_string(), "127.0.0.1:8080");
-    }
-
-    #[test]
-    fn test_parse_peer_addr_valid_ipv6() {
-        use super::parse_peer_addr;
-        let addr = parse_peer_addr("[::1]:443");
-        assert_eq!(addr.ip(), std::net::Ipv6Addr::LOCALHOST);
-        assert_eq!(addr.port(), 443);
-    }
-
-    #[test]
-    fn test_parse_peer_addr_invalid_falls_back() {
-        use super::parse_peer_addr;
-        let addr = parse_peer_addr("not-an-address");
-        assert_eq!(addr, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-    }
-
-    #[test]
-    fn test_parse_peer_addr_empty_falls_back() {
-        use super::parse_peer_addr;
-        let addr = parse_peer_addr("");
-        assert_eq!(addr, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-    }
-
-    #[test]
-    fn test_parse_peer_addr_missing_port_falls_back() {
-        use super::parse_peer_addr;
-        let addr = parse_peer_addr("127.0.0.1");
-        assert_eq!(addr, std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
     }
 
     /// Verify WS path validation logic: non-empty, non-"/" path should reject mismatch
