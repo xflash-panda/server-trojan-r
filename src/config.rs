@@ -343,11 +343,7 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Build ServerConfig from remote TrojanConfig and CLI args
-    pub fn from_remote(
-        remote: &server_r_client::TrojanConfig,
-        cli: &CliArgs,
-        _users: Vec<User>,
-    ) -> Result<Self> {
+    pub fn from_remote(remote: &server_r_client::TrojanConfig, cli: &CliArgs) -> Result<Self> {
         // Determine transport mode from remote config
         let network = remote.network.as_deref().unwrap_or("tcp");
         let (enable_ws, enable_grpc) = match network.to_lowercase().as_str() {
@@ -613,12 +609,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![User {
-            id: 1,
-            uuid: "uuid-1".to_string(),
-        }];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.port, 443);
         assert!(!config.enable_ws);
@@ -637,9 +628,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert!(config.enable_ws);
         assert!(!config.enable_grpc);
@@ -657,9 +646,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert!(config.enable_ws);
         assert!(!config.enable_grpc);
@@ -677,9 +664,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert!(!config.enable_ws);
         assert!(config.enable_grpc);
@@ -697,9 +682,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert!(config.enable_grpc);
     }
@@ -716,9 +699,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.cert, Some(PathBuf::from("/path/to/cert.pem")));
         assert_eq!(config.key, Some(PathBuf::from("/path/to/key.pem")));
@@ -737,9 +718,7 @@ mod tests {
         };
         let mut cli = create_test_cli_args();
         cli.acl_conf_file = Some(PathBuf::from("/path/to/acl.yaml"));
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(
             config.acl_conf_file,
@@ -759,9 +738,7 @@ mod tests {
             grpc_config: None,
         };
         let cli = create_test_cli_args();
-        let users = vec![];
-
-        let config = ServerConfig::from_remote(&remote, &cli, users).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.host, "0.0.0.0");
     }
@@ -779,7 +756,7 @@ mod tests {
         };
         let cli = create_test_cli_args();
 
-        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.ws_path, DEFAULT_WS_PATH);
         assert_eq!(config.ws_path, "/");
@@ -802,7 +779,7 @@ mod tests {
         };
         let cli = create_test_cli_args();
 
-        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.ws_path, "/custom/path");
     }
@@ -820,7 +797,7 @@ mod tests {
         };
         let cli = create_test_cli_args();
 
-        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.grpc_service_name, DEFAULT_GRPC_SERVICE_NAME);
         assert_eq!(config.grpc_service_name, "GunService");
@@ -842,7 +819,7 @@ mod tests {
         };
         let cli = create_test_cli_args();
 
-        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.grpc_service_name, "MyCustomService");
         assert_eq!(config.grpc_path(), "/MyCustomService/Tun");
@@ -864,7 +841,7 @@ mod tests {
         };
         let cli = create_test_cli_args();
 
-        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         // Should fall back to default
         assert_eq!(config.ws_path, DEFAULT_WS_PATH);
@@ -885,7 +862,7 @@ mod tests {
         };
         let cli = create_test_cli_args();
 
-        let config = ServerConfig::from_remote(&remote, &cli, vec![]).unwrap();
+        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         // Should fall back to default
         assert_eq!(config.grpc_service_name, DEFAULT_GRPC_SERVICE_NAME);

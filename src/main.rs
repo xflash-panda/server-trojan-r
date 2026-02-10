@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     user_manager.init(&users);
 
     // Build server config
-    let server_config = config::ServerConfig::from_remote(&remote_config, &cli, users)?;
+    let server_config = config::ServerConfig::from_remote(&remote_config, &cli)?;
 
     // Create authenticator using shared user map
     let authenticator = Arc::new(ApiAuthenticator::new(user_manager.get_users_arc()));
@@ -136,13 +136,18 @@ async fn main() -> Result<()> {
                 _ = sigterm.recv() => {
                     log::info!("SIGTERM received, shutting down...");
                 }
+                _ = cancel_token_clone.cancelled() => {}
             }
         }
 
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c().await.ok();
-            log::info!("Shutdown signal received...");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    log::info!("Shutdown signal received...");
+                }
+                _ = cancel_token_clone.cancelled() => {}
+            }
         }
 
         cancel_token_clone.cancel();
@@ -156,6 +161,9 @@ async fn main() -> Result<()> {
         result = server_runner::run_server(server, &server_config) => result,
         _ = cancel_token.cancelled() => Ok(()),
     };
+
+    // Ensure shutdown handler exits if server stopped without a signal
+    cancel_token.cancel();
 
     // Graceful shutdown sequence
     log::info!("Server stopped, performing graceful shutdown...");
