@@ -140,6 +140,8 @@ mod tests {
     fn test_conn_config() -> ConnConfig {
         ConnConfig {
             idle_timeout: Duration::from_secs(300),
+            uplink_only_timeout: Duration::from_secs(2),
+            downlink_only_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),

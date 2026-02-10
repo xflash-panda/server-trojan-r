@@ -1,22 +1,21 @@
-//! Bidirectional relay with traffic statistics
+//! Bidirectional relay with idle timeout, half-close timeout, and traffic statistics
 //!
-//! Provides copy_bidirectional with idle timeout detection and optional traffic stats.
+//! Custom poll-based bidirectional copy that replaces tokio's `copy_bidirectional`
+//! with support for:
+//! - Idle timeout: disconnect if no data flows in either direction
+//! - Half-close timeout: after one direction finishes (EOF), give the other
+//!   direction a short deadline before closing (like Xray's uplinkOnly/downlinkOnly)
+//! - Per-direction traffic byte counting
 
-use pin_project_lite::pin_project;
+use std::future::Future;
+use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Shared traffic counters for tracking bytes during relay
-struct TrafficCounters {
-    /// Bytes transferred from A to B (upload)
-    a_to_b: Arc<AtomicU64>,
-    /// Bytes transferred from B to A (download)
-    b_to_a: Arc<AtomicU64>,
-}
+use super::hooks::{StatsCollector, UserId};
+use std::sync::Arc;
 
 /// Result of bidirectional copy with traffic stats
 #[derive(Debug, Clone, Copy)]
@@ -29,204 +28,239 @@ pub struct CopyResult {
     pub completed: bool,
 }
 
-pin_project! {
-    /// A stream wrapper that tracks the last activity time and bytes transferred
-    struct TimedStream<S> {
-        #[pin]
-        inner: S,
-        start_time: Instant,
-        last_activity: Arc<AtomicU64>,
-        // Counter for bytes read from this stream
-        read_bytes: Arc<AtomicU64>,
-        // Counter for bytes written to this stream
-        write_bytes: Arc<AtomicU64>,
-    }
+/// Buffer for one direction of a bidirectional copy.
+///
+/// State machine: Read → Write → Flush → (loop) or EOF → Shutdown → Done
+struct DirectionalBuffer {
+    buf: Vec<u8>,
+    /// Start of unwritten data in buf
+    pos: usize,
+    /// End of valid data in buf
+    cap: usize,
+    /// Total bytes written to destination
+    amt: u64,
+    /// Reader returned EOF
+    read_done: bool,
+    /// Writer needs flush
+    need_flush: bool,
+    /// Writer shutdown complete — this direction is fully done
+    shutdown_done: bool,
 }
 
-impl<S> TimedStream<S> {
-    fn new(
-        inner: S,
-        start_time: Instant,
-        last_activity: Arc<AtomicU64>,
-        read_bytes: Arc<AtomicU64>,
-        write_bytes: Arc<AtomicU64>,
-    ) -> Self {
+impl DirectionalBuffer {
+    fn new(buf_size: usize) -> Self {
         Self {
-            inner,
-            start_time,
-            last_activity,
-            read_bytes,
-            write_bytes,
+            buf: vec![0u8; buf_size],
+            pos: 0,
+            cap: 0,
+            amt: 0,
+            read_done: false,
+            need_flush: false,
+            shutdown_done: false,
         }
     }
-}
 
-impl<S: AsyncRead> AsyncRead for TimedStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
+    fn is_done(&self) -> bool {
+        self.shutdown_done
+    }
+
+    fn bytes_transferred(&self) -> u64 {
+        self.amt
+    }
+
+    /// Try to make maximum progress on this direction.
+    ///
+    /// Returns:
+    /// - `Poll::Ready(Ok(()))` — direction fully complete (EOF + flush + shutdown)
+    /// - `Poll::Ready(Err(e))` — I/O error
+    /// - `Poll::Pending` — blocked on I/O, waker registered
+    fn poll_copy<R: AsyncRead, W: AsyncWrite>(
+        &mut self,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.project();
-        let before_len = buf.filled().len();
-        let result = this.inner.poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &result {
-            let bytes_read = buf.filled().len() - before_len;
-            if bytes_read > 0 {
-                this.last_activity
-                    .store(this.start_time.elapsed().as_secs(), Ordering::Release);
-                this.read_bytes
-                    .fetch_add(bytes_read as u64, Ordering::Relaxed);
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<io::Result<()>> {
+        if self.shutdown_done {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            // Step 1: Write buffered data
+            while self.pos < self.cap {
+                let i = ready!(writer
+                    .as_mut()
+                    .poll_write(cx, &self.buf[self.pos..self.cap]))?;
+                if i == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero bytes",
+                    )));
+                }
+                self.pos += i;
+                self.amt += i as u64;
+                self.need_flush = true;
+            }
+
+            // Step 2: Flush after writing
+            if self.need_flush {
+                ready!(writer.as_mut().poll_flush(cx))?;
+                self.need_flush = false;
+            }
+
+            // Step 3: If reader hit EOF, shutdown writer
+            if self.read_done {
+                // Ignore shutdown errors (peer may have already closed)
+                let _ = ready!(writer.as_mut().poll_shutdown(cx));
+                self.shutdown_done = true;
+                return Poll::Ready(Ok(()));
+            }
+
+            // Step 4: Read more data
+            let mut buf = ReadBuf::new(&mut self.buf);
+            ready!(reader.as_mut().poll_read(cx, &mut buf))?;
+            let n = buf.filled().len();
+            if n == 0 {
+                self.read_done = true;
+                // Loop back to step 3 for shutdown
+            } else {
+                self.pos = 0;
+                self.cap = n;
+                // Loop back to step 1 for writing
             }
         }
-        result
     }
 }
 
-impl<S: AsyncWrite> AsyncWrite for TimedStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.project();
-        let result = this.inner.poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &result {
-            if *n > 0 {
-                this.last_activity
-                    .store(this.start_time.elapsed().as_secs(), Ordering::Release);
-                this.write_bytes.fetch_add(*n as u64, Ordering::Relaxed);
-            }
-        }
-        result
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
-    }
-}
-
-use super::hooks::{StatsCollector, UserId};
-
-/// Bidirectional copy with idle timeout detection and optional traffic statistics
+/// Bidirectional copy with idle timeout, per-direction half-close timeouts, and optional traffic statistics
 ///
 /// - `a`: Client stream
 /// - `b`: Remote/outbound stream
-/// - `idle_timeout_secs`: Idle timeout in seconds
+/// - `idle_timeout_secs`: Disconnect if no data flows for this many seconds
+/// - `uplink_only_secs`: After client EOF (a→b done), wait this long for remote (b→a) to finish (Xray: uplinkOnly=2s)
+/// - `downlink_only_secs`: After remote EOF (b→a done), wait this long for client (a→b) to finish (Xray: downlinkOnly=5s)
 /// - `buffer_size`: Buffer size for each direction of the relay
-/// - `stats`: Optional tuple of (user_id, stats_collector) for traffic tracking
-///
-/// Returns CopyResult with bytes transferred and completion status.
-/// Note: Traffic is tracked in real-time, even if the connection times out.
+/// - `stats`: Optional (user_id, stats_collector) for traffic tracking
 pub async fn copy_bidirectional_with_stats<A, B>(
     a: &mut A,
     b: &mut B,
     idle_timeout_secs: u64,
+    uplink_only_secs: u64,
+    downlink_only_secs: u64,
     buffer_size: usize,
     stats: Option<(UserId, Arc<dyn StatsCollector>)>,
-) -> std::io::Result<CopyResult>
+) -> io::Result<CopyResult>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut a_to_b = DirectionalBuffer::new(buffer_size);
+    let mut b_to_a = DirectionalBuffer::new(buffer_size);
+
     let start_time = Instant::now();
-    let last_activity = Arc::new(AtomicU64::new(0));
+    let mut last_activity_secs: u64 = 0;
 
-    // Shared counters to track traffic even during timeout
-    // a_to_b: read from A, write to B (upload from client perspective)
-    // b_to_a: read from B, write to A (download from client perspective)
-    let counters = TrafficCounters {
-        a_to_b: Arc::new(AtomicU64::new(0)),
-        b_to_a: Arc::new(AtomicU64::new(0)),
-    };
+    // Half-close deadline: set when one direction completes, fires after timeout
+    let mut half_close_deadline: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
-    // stream_a reads from client, writes to client
-    // When we read from A, that's data going A->B (upload)
-    // When we write to A, that's data coming B->A (download)
-    let mut stream_a = TimedStream::new(
-        a,
-        start_time,
-        Arc::clone(&last_activity),
-        Arc::clone(&counters.a_to_b), // reads from A = upload
-        Arc::clone(&counters.b_to_a), // writes to A = download (not used by copy_bidirectional for counting)
-    );
+    // Idle check every 30 seconds (same granularity as before)
+    let mut idle_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
-    // stream_b reads from remote, writes to remote
-    // When we read from B, that's data going B->A (download)
-    // When we write to B, that's data coming A->B (upload, not used by copy_bidirectional for counting)
-    let mut stream_b = TimedStream::new(
-        b,
-        start_time,
-        Arc::clone(&last_activity),
-        Arc::clone(&counters.b_to_a), // reads from B = download
-        Arc::clone(&counters.a_to_b), // writes to B = upload (not used by copy_bidirectional for counting)
-    );
+    let result: io::Result<bool> = std::future::poll_fn(|cx| {
+        let bytes_before = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
 
-    let copy_task = tokio::io::copy_bidirectional_with_sizes(
-        &mut stream_a,
-        &mut stream_b,
-        buffer_size,
-        buffer_size,
-    );
+        // Poll a→b (upload: read from client, write to remote)
+        if !a_to_b.is_done() {
+            match a_to_b.poll_copy(cx, Pin::new(&mut *a), Pin::new(&mut *b)) {
+                Poll::Ready(Ok(())) => {
+                    // Client closed (upload EOF) → use uplinkOnly timeout for remaining download
+                    if !b_to_a.is_done() && half_close_deadline.is_none() {
+                        half_close_deadline = Some(Box::pin(tokio::time::sleep(
+                            tokio::time::Duration::from_secs(uplink_only_secs),
+                        )));
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
 
-    let timeout_check = async {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let last_active = last_activity.load(Ordering::Acquire);
+        // Poll b→a (download: read from remote, write to client)
+        if !b_to_a.is_done() {
+            match b_to_a.poll_copy(cx, Pin::new(&mut *b), Pin::new(&mut *a)) {
+                Poll::Ready(Ok(())) => {
+                    // Remote closed (download EOF) → use downlinkOnly timeout for remaining upload
+                    if !a_to_b.is_done() && half_close_deadline.is_none() {
+                        half_close_deadline = Some(Box::pin(tokio::time::sleep(
+                            tokio::time::Duration::from_secs(downlink_only_secs),
+                        )));
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+
+        // Track activity based on byte progress
+        let bytes_after = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
+        if bytes_after > bytes_before {
+            last_activity_secs = start_time.elapsed().as_secs();
+        }
+
+        // Both directions done → completed normally
+        if a_to_b.is_done() && b_to_a.is_done() {
+            return Poll::Ready(Ok(true));
+        }
+
+        // Half-close timeout
+        if let Some(ref mut sleep) = half_close_deadline {
+            if sleep.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(false));
+            }
+        }
+
+        // Idle timeout check (every 30s)
+        if idle_interval.poll_tick(cx).is_ready() {
             let current_elapsed = start_time.elapsed().as_secs();
-            let idle_secs = current_elapsed.saturating_sub(last_active);
+            let idle_secs = current_elapsed.saturating_sub(last_activity_secs);
             if idle_secs >= idle_timeout_secs {
-                return idle_secs;
+                return Poll::Ready(Ok(false));
             }
         }
-    };
 
-    // Execute relay and capture result (success, timeout, or error)
-    let (completed, io_error) = tokio::select! {
-        result = copy_task => {
-            match result {
-                Ok(_) => (true, None),
-                Err(e) => (false, Some(e)),
-            }
-        }
-        _ = timeout_check => (false, None)
-    };
+        Poll::Pending
+    })
+    .await;
 
-    // Graceful shutdown when relay didn't complete normally (timeout or error).
-    // Ensures WebSocket Close frames, gRPC trailers, and TCP FIN are sent.
+    // Collect stats before any cleanup
+    let a_to_b_bytes = a_to_b.bytes_transferred();
+    let b_to_a_bytes = b_to_a.bytes_transferred();
+
+    let completed = matches!(result, Ok(true));
+
+    // Graceful shutdown for streams that didn't complete normally.
+    // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
     if !completed {
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream_a).await;
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream_b).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(a).await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(b).await;
     }
 
-    // Always get accurate traffic data from counters (real-time tracked)
-    let a_to_b = counters.a_to_b.load(Ordering::Relaxed);
-    let b_to_a = counters.b_to_a.load(Ordering::Relaxed);
-
-    // Always record traffic stats - regardless of success, timeout, or error
+    // Always record traffic stats — regardless of success, timeout, or error
     if let Some((user_id, collector)) = stats {
-        if a_to_b > 0 {
-            collector.record_upload(user_id, a_to_b);
+        if a_to_b_bytes > 0 {
+            collector.record_upload(user_id, a_to_b_bytes);
         }
-        if b_to_a > 0 {
-            collector.record_download(user_id, b_to_a);
+        if b_to_a_bytes > 0 {
+            collector.record_download(user_id, b_to_a_bytes);
         }
     }
 
-    // Return result based on execution outcome
-    match io_error {
-        Some(e) => Err(e),
-        None => Ok(CopyResult {
-            a_to_b,
-            b_to_a,
+    match result {
+        Ok(completed) => Ok(CopyResult {
+            a_to_b: a_to_b_bytes,
+            b_to_a: b_to_a_bytes,
             completed,
         }),
+        Err(e) => Err(e),
     }
 }
 
@@ -234,7 +268,7 @@ where
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn test_copy_result_clone() {
@@ -250,117 +284,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_timed_stream_read_updates_activity() {
+    async fn test_basic_bidirectional_copy() {
         let data = b"hello world";
-        let cursor = Cursor::new(data.to_vec());
-        let start_time = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-        let read_bytes = Arc::new(AtomicU64::new(0));
-        let write_bytes = Arc::new(AtomicU64::new(0));
+        let mut client = Cursor::new(data.to_vec());
+        let mut remote = Cursor::new(Vec::new());
 
-        let mut stream = TimedStream::new(
-            cursor,
-            start_time,
-            Arc::clone(&last_activity),
-            read_bytes.clone(),
-            write_bytes,
-        );
-
-        let mut buf = [0u8; 5];
-        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 2, 5, 1024, None)
             .await
             .unwrap();
 
-        assert_eq!(n, 5);
-        assert_eq!(&buf, b"hello");
-        assert_eq!(read_bytes.load(Ordering::Relaxed), 5);
-    }
-
-    #[tokio::test]
-    async fn test_timed_stream_write_updates_activity() {
-        let cursor = Cursor::new(Vec::new());
-        let start_time = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-        let read_bytes = Arc::new(AtomicU64::new(0));
-        let write_bytes = Arc::new(AtomicU64::new(0));
-
-        let mut stream = TimedStream::new(
-            cursor,
-            start_time,
-            Arc::clone(&last_activity),
-            read_bytes,
-            write_bytes.clone(),
-        );
-
-        let n = tokio::io::AsyncWriteExt::write(&mut stream, b"test")
-            .await
-            .unwrap();
-        assert_eq!(n, 4);
-        assert_eq!(write_bytes.load(Ordering::Relaxed), 4);
-    }
-
-    #[tokio::test]
-    async fn test_timed_stream_activity_updates_on_read() {
-        let data = b"hello world";
-        let cursor = Cursor::new(data.to_vec());
-        let start_time = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-        let read_bytes = Arc::new(AtomicU64::new(0));
-        let write_bytes = Arc::new(AtomicU64::new(0));
-
-        let mut stream = TimedStream::new(
-            cursor,
-            start_time,
-            Arc::clone(&last_activity),
-            read_bytes,
-            write_bytes,
-        );
-
-        // Initial activity should be 0
-        assert_eq!(last_activity.load(Ordering::Acquire), 0);
-
-        // Wait a bit and then read
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        let mut buf = [0u8; 5];
-        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-            .await
-            .unwrap();
-
-        // Activity should be updated to >= 1
-        assert!(last_activity.load(Ordering::Acquire) >= 1);
-    }
-
-    #[tokio::test]
-    async fn test_timed_stream_flush() {
-        let cursor = Cursor::new(Vec::new());
-        let start_time = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-        let read_bytes = Arc::new(AtomicU64::new(0));
-        let write_bytes = Arc::new(AtomicU64::new(0));
-
-        let mut stream =
-            TimedStream::new(cursor, start_time, last_activity, read_bytes, write_bytes);
-
-        // Flush should not panic
-        tokio::io::AsyncWriteExt::flush(&mut stream).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_timed_stream_shutdown() {
-        let cursor = Cursor::new(Vec::new());
-        let start_time = Instant::now();
-        let last_activity = Arc::new(AtomicU64::new(0));
-        let read_bytes = Arc::new(AtomicU64::new(0));
-        let write_bytes = Arc::new(AtomicU64::new(0));
-
-        let mut stream =
-            TimedStream::new(cursor, start_time, last_activity, read_bytes, write_bytes);
-
-        // Shutdown should not panic
-        tokio::io::AsyncWriteExt::shutdown(&mut stream)
-            .await
-            .unwrap();
+        assert!(result.completed);
+        assert!(result.a_to_b > 0);
     }
 
     /// Stream wrapper that tracks whether shutdown was called
@@ -374,7 +308,7 @@ mod tests {
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        ) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_read(cx, buf)
         }
     }
@@ -384,18 +318,15 @@ mod tests {
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
             buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
+        ) -> Poll<io::Result<usize>> {
             Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
         }
 
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.shutdown_called.store(true, Ordering::Release);
             Pin::new(&mut self.inner).poll_shutdown(cx)
         }
@@ -409,9 +340,9 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             _buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
                 "test error",
             )))
         }
@@ -422,25 +353,23 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             _buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
                 "test error",
             )))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
 
     /// Verify that streams are shut down when relay errors out.
-    /// This tests the `if !completed` shutdown path added to fix
-    /// connections being dropped without proper close frames/FIN.
     #[tokio::test]
     async fn test_shutdown_called_on_relay_error() {
         let client_shutdown = Arc::new(AtomicBool::new(false));
@@ -455,7 +384,8 @@ mod tests {
             shutdown_called: Arc::clone(&remote_shutdown),
         };
 
-        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1024, None).await;
+        let result =
+            copy_bidirectional_with_stats(&mut client, &mut remote, 300, 2, 5, 1024, None).await;
 
         assert!(result.is_err(), "Should return error from broken stream");
         assert!(
@@ -468,16 +398,165 @@ mod tests {
         );
     }
 
-    /// Verify that the &mut reference pattern allows callers to
-    /// access and shutdown streams after relay completes.
-    /// This enables handler.rs to call shutdown after cancel_token fires.
+    /// A stream that accepts writes but never returns data on read.
+    /// Simulates a peer that keeps the connection open without sending EOF.
+    struct NeverEofSink;
+
+    impl AsyncRead for NeverEofSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Never return data or EOF — peer keeps connection open.
+            // The half-close timer will wake the task, so no waker needed here.
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NeverEofSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// When client sends EOF first (a→b done), uplink_only timeout should apply.
+    /// Uses asymmetric timeouts (1s vs 100s) to verify the correct one fires.
+    #[tokio::test(start_paused = true)]
+    async fn test_uplink_only_timeout_on_client_eof() {
+        let mut client = Cursor::new(b"hello".to_vec()); // Will EOF after data
+        let mut remote = NeverEofSink; // Never sends EOF back
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout (high, won't trigger)
+            1,   // uplink_only = 1s (THIS should fire)
+            100, // downlink_only = 100s (should NOT fire)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.completed, "Should timeout, not complete normally");
+        assert!(result.a_to_b > 0, "Client data should have been relayed");
+        // With paused time, mocked clock should advance to uplink_only (1s)
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(1),
+            "Should wait at least uplink_only timeout"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Should NOT wait for downlink_only (100s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// When remote sends EOF first (b→a done), downlink_only timeout should apply.
+    /// Uses asymmetric timeouts (100s vs 1s) to verify the correct one fires.
+    #[tokio::test(start_paused = true)]
+    async fn test_downlink_only_timeout_on_remote_eof() {
+        let mut client = NeverEofSink; // Never sends EOF
+        let mut remote = Cursor::new(b"world".to_vec()); // Will EOF after data
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout (high, won't trigger)
+            100, // uplink_only = 100s (should NOT fire)
+            1,   // downlink_only = 1s (THIS should fire)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.completed, "Should timeout, not complete normally");
+        assert!(result.b_to_a > 0, "Remote data should have been relayed");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(1),
+            "Should wait at least downlink_only timeout"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Should NOT wait for uplink_only (100s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Verify stats are recorded even when relay ends via half-close timeout
+    #[tokio::test(start_paused = true)]
+    async fn test_stats_recorded_on_half_close_timeout() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct RecordingCollector {
+            upload: AtomicU64,
+            download: AtomicU64,
+        }
+        impl StatsCollector for RecordingCollector {
+            fn record_request(&self, _: UserId) {}
+            fn record_upload(&self, _: UserId, bytes: u64) {
+                self.upload.fetch_add(bytes, AtomicOrdering::Relaxed);
+            }
+            fn record_download(&self, _: UserId, bytes: u64) {
+                self.download.fetch_add(bytes, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let collector = Arc::new(RecordingCollector {
+            upload: AtomicU64::new(0),
+            download: AtomicU64::new(0),
+        });
+
+        let mut client = Cursor::new(b"upload-data".to_vec());
+        let mut remote = NeverEofSink;
+
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300,
+            1, // uplink_only = 1s
+            5, // downlink_only = 5s
+            1024,
+            Some((42, Arc::clone(&collector) as Arc<dyn StatsCollector>)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.completed);
+        assert_eq!(
+            collector.upload.load(AtomicOrdering::Relaxed),
+            result.a_to_b,
+            "Upload stats should match bytes transferred"
+        );
+    }
+
+    /// Verify that &mut reference pattern allows callers to access and
+    /// shutdown streams after relay completes (enables cancel_token pattern).
     #[tokio::test]
     async fn test_mut_ref_allows_post_relay_shutdown() {
         let data = b"hello";
         let mut client = Cursor::new(data.to_vec());
         let mut remote = Cursor::new(Vec::new());
 
-        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 1024, None)
+        let result = copy_bidirectional_with_stats(&mut client, &mut remote, 300, 2, 5, 1024, None)
             .await
             .unwrap();
 
@@ -485,7 +564,6 @@ mod tests {
         assert!(result.a_to_b > 0);
 
         // Key: streams are still accessible after relay (not moved into the future).
-        // This enables the caller to call shutdown after cancel or timeout.
         tokio::io::AsyncWriteExt::shutdown(&mut client)
             .await
             .unwrap();
