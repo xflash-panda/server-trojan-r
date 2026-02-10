@@ -48,12 +48,6 @@ impl From<anyhow::Error> for TrojanError {
     }
 }
 
-impl From<toml::de::Error> for TrojanError {
-    fn from(err: toml::de::Error) -> Self {
-        TrojanError::Config(format!("TOML parse error: {}", err))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

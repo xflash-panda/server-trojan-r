@@ -38,8 +38,6 @@ pub async fn read_trojan_request(
     buf: &mut BytesMut,
     buffer_size: usize,
 ) -> Result<TrojanRequest> {
-    let mut temp_buf = vec![0u8; buffer_size];
-
     loop {
         // Try to decode with current buffer (check completeness first to avoid clone)
         if buf.len() >= TrojanRequest::MIN_SIZE {
@@ -68,8 +66,9 @@ pub async fn read_trojan_request(
             }
         }
 
-        // Read more data
-        let n = stream.read(&mut temp_buf).await?;
+        // Read directly into BytesMut spare capacity (avoids separate heap allocation)
+        buf.reserve(buffer_size);
+        let n = stream.read_buf(buf).await?;
         if n == 0 {
             if buf.is_empty() {
                 return Err(anyhow!("Connection closed before receiving request"));
@@ -77,8 +76,6 @@ pub async fn read_trojan_request(
                 return Err(anyhow!("Connection closed with incomplete request"));
             }
         }
-
-        buf.extend_from_slice(&temp_buf[..n]);
 
         // Prevent buffer from growing too large (protection against malicious clients)
         if buf.len() > buffer_size * 2 {
@@ -250,7 +247,7 @@ impl<'a> ConnectContext<'a> {
             Some((self.user_id, stats)),
         );
 
-        tokio::select! {
+        let cancelled = tokio::select! {
             result = relay_fut => {
                 match result {
                     Ok(r) if r.completed => {
@@ -263,17 +260,19 @@ impl<'a> ConnectContext<'a> {
                         log::debug!(peer = %self.peer_addr, error = %e, "Relay error");
                     }
                 }
+                false
             }
             _ = self.cancel_token.cancelled() => {
                 log::debug!(peer = %self.peer_addr, "Connection kicked");
+                true
             }
-        }
+        };
 
-        // Graceful shutdown for both streams (covers cancel, timeout, and error paths).
-        // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
-        // Timeout prevents infinite hang when peer is unresponsive.
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, remote_stream.shutdown()).await;
+        // Only shutdown on cancel — relay already handles shutdown on completion/timeout/error.
+        if cancelled {
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, remote_stream.shutdown()).await;
+        }
 
         Ok(())
     }
@@ -380,7 +379,6 @@ async fn handle_udp_associate(
     let mut route_cache: HashMap<Address, (hooks::OutboundType, AclAddr)> = HashMap::new();
 
     // UDP relay loop
-    let mut temp_buf = vec![0u8; 65536];
     let mut udp_recv_buf = vec![0u8; 65536];
     let mut udp_conn: Option<Box<dyn AsyncUdpConn>> = None;
     let mut current_handler: Option<Arc<acl::OutboundHandler>> = None;
@@ -393,8 +391,18 @@ async fn handle_udp_associate(
 
     loop {
         tokio::select! {
-            // Read from client TCP stream
-            result = client_stream.read(&mut temp_buf) => {
+            // Read from client TCP stream directly into BytesMut (avoids temp buffer)
+            result = async {
+                // Check buffer size limit before reading
+                if read_buf.len() >= UDP_MAX_READ_BUFFER_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::OutOfMemory,
+                        "UDP read buffer exceeded limit",
+                    ));
+                }
+                read_buf.reserve(8 * 1024);
+                client_stream.read_buf(&mut read_buf).await
+            } => {
                 let n = match result {
                     Ok(0) => {
                         log::debug!(peer = %peer_addr, "UDP client disconnected");
@@ -402,29 +410,25 @@ async fn handle_udp_associate(
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        log::debug!(peer = %peer_addr, error = %e, "UDP read error");
+                        if e.kind() == std::io::ErrorKind::OutOfMemory {
+                            log::warn!(
+                                peer = %peer_addr,
+                                buffer_size = read_buf.len(),
+                                "UDP read buffer exceeded limit, closing connection"
+                            );
+                        } else {
+                            log::debug!(peer = %peer_addr, error = %e, "UDP read error");
+                        }
                         break;
                     }
                 };
+                let _ = n;
                 last_activity_secs = start_time.elapsed().as_secs();
 
-                // Check buffer size limit to prevent memory exhaustion
-                if read_buf.len() + n > UDP_MAX_READ_BUFFER_SIZE {
-                    log::warn!(
-                        peer = %peer_addr,
-                        buffer_size = read_buf.len(),
-                        "UDP read buffer exceeded limit, closing connection"
-                    );
-                    break;
-                }
-
-                read_buf.extend_from_slice(&temp_buf[..n]);
-
-                // Process all complete UDP packets in buffer
+                // Process all complete UDP packets in buffer (zero-copy)
                 while !read_buf.is_empty() {
-                    match TrojanUdpPacket::decode(&read_buf) {
-                        DecodeResult::Ok(packet, consumed) => {
-                            let _ = read_buf.split_to(consumed);
+                    match TrojanUdpPacket::decode_zerocopy(&mut read_buf) {
+                        DecodeResult::Ok(packet, _consumed) => {
 
                             // Route the packet (use cache to avoid repeated DNS lookups and String allocs)
                             let (outbound_type, send_addr) = match route_cache.get(&packet.addr) {
@@ -653,6 +657,115 @@ mod tests {
         let acl_addr = AclAddr::new("sub.example.com", 443);
         let addr = acl_addr_to_address(&acl_addr);
         assert!(matches!(addr, Address::Domain(ref d, 443) if d == "sub.example.com"));
+    }
+
+    /// Build a valid Trojan CONNECT request as raw bytes
+    fn build_trojan_request(password: &[u8; 56], addr: &Address, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(password);
+        buf.extend_from_slice(b"\r\n");
+        buf.push(1); // CONNECT
+        addr.encode(&mut buf);
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_complete_in_one_read() {
+        let password = [b'a'; 56];
+        let addr = Address::IPv4([127, 0, 0, 1], 8080);
+        let raw = build_trojan_request(&password, &addr, b"hello");
+
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(raw));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let req = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap();
+        assert_eq!(req.password, password);
+        assert_eq!(req.cmd, TrojanCmd::Connect);
+        assert!(matches!(req.addr, Address::IPv4([127, 0, 0, 1], 8080)));
+        assert_eq!(req.payload.as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_empty_connection() {
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(Vec::new()));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let err = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("closed before receiving"),
+            "Expected 'closed before receiving' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_incomplete_connection() {
+        // Send partial password then EOF
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(vec![b'a'; 30]));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let err = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete request"),
+            "Expected 'incomplete request' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_too_large() {
+        // Craft a request that looks like it needs more data (valid password + CRLF
+        // + valid command + domain ATYP with large length), so the parser keeps
+        // reading until the buffer exceeds the size limit.
+        let buffer_size = 128;
+        let mut data = Vec::new();
+        data.extend_from_slice(&[b'a'; 56]); // valid password
+        data.extend_from_slice(b"\r\n"); // valid first CRLF
+        data.push(1); // CONNECT
+        data.push(3); // ATYP_DOMAIN
+        data.push(255); // domain length = 255 (will need more data to complete)
+                        // Feed enough to exceed buffer_size * 2 without ever completing the domain
+        data.extend_from_slice(&vec![b'x'; buffer_size * 2]);
+
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(data));
+        let mut buf = BytesMut::with_capacity(buffer_size);
+
+        let err = read_trojan_request(&mut stream, &mut buf, buffer_size)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "Expected 'too large' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_trojan_request_no_payload() {
+        let password = [b'z'; 56];
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let raw = build_trojan_request(&password, &addr, b"");
+
+        let mut stream: TransportStream = Box::pin(std::io::Cursor::new(raw));
+        let mut buf = BytesMut::with_capacity(1024);
+
+        let req = read_trojan_request(&mut stream, &mut buf, 1024)
+            .await
+            .unwrap();
+        assert_eq!(req.password, password);
+        assert!(matches!(
+            req.addr,
+            Address::Domain(ref d, 443) if d == "example.com"
+        ));
+        assert!(req.payload.is_empty());
     }
 
     /// Verify that reusing a pre-allocated buffer for UDP recv produces correct
