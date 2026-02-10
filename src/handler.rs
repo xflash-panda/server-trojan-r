@@ -237,6 +237,8 @@ impl<'a> ConnectContext<'a> {
             &mut client_stream,
             &mut remote_stream,
             self.server.conn_config.idle_timeout_secs(),
+            self.server.conn_config.uplink_only_timeout_secs(),
+            self.server.conn_config.downlink_only_timeout_secs(),
             self.server.conn_config.buffer_size,
             Some((self.user_id, stats)),
         );
@@ -371,6 +373,12 @@ async fn handle_udp_associate(
     let mut udp_conn: Option<Box<dyn AsyncUdpConn>> = None;
     let mut current_handler: Option<Arc<acl::OutboundHandler>> = None;
 
+    // Idle timeout tracking (same mechanism as TCP relay)
+    let idle_timeout_secs = server.conn_config.idle_timeout_secs();
+    let start_time = std::time::Instant::now();
+    let mut last_activity_secs: u64 = 0;
+    let mut idle_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+
     loop {
         tokio::select! {
             // Read from client TCP stream
@@ -386,6 +394,7 @@ async fn handle_udp_associate(
                         break;
                     }
                 };
+                last_activity_secs = start_time.elapsed().as_secs();
 
                 // Check buffer size limit to prevent memory exhaustion
                 if read_buf.len() + n > UDP_MAX_READ_BUFFER_SIZE {
@@ -524,6 +533,8 @@ async fn handle_udp_associate(
             } => {
                 match result {
                     Ok((n, from_addr)) => {
+                        last_activity_secs = start_time.elapsed().as_secs();
+
                         // Convert AclAddr back to Address
                         let addr = acl_addr_to_address(&from_addr);
 
@@ -539,6 +550,15 @@ async fn handle_udp_associate(
                     Err(e) => {
                         log::debug!(peer = %peer_addr, error = %e, "UDP recv error");
                     }
+                }
+            }
+
+            // Idle timeout check (every 30s)
+            _ = idle_interval.tick() => {
+                let idle_secs = start_time.elapsed().as_secs().saturating_sub(last_activity_secs);
+                if idle_secs >= idle_timeout_secs {
+                    log::debug!(peer = %peer_addr, idle_secs = idle_secs, "UDP connection idle timeout");
+                    break;
                 }
             }
 

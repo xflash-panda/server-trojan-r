@@ -132,6 +132,14 @@ pub struct CliArgs {
     )]
     pub tcp_nodelay: bool,
 
+    /// After client closes (upload EOF), wait this long for remote to finish (like Xray uplinkOnly, default: 2s)
+    #[arg(long, env = "X_PANDA_TROJAN_UPLINK_ONLY_TIMEOUT", default_value = "2s", value_parser = parse_duration, help_heading = "Performance")]
+    pub uplink_only_timeout: Duration,
+
+    /// After remote closes (download EOF), wait this long for client to finish (like Xray downlinkOnly, default: 5s)
+    #[arg(long, env = "X_PANDA_TROJAN_DOWNLINK_ONLY_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
+    pub downlink_only_timeout: Duration,
+
     /// Maximum concurrent connections, 0 means unlimited (default: 0)
     #[arg(
         long,
@@ -253,6 +261,10 @@ pub const DEFAULT_WS_PATH: &str = "/";
 pub struct ConnConfig {
     /// Connection idle timeout
     pub idle_timeout: Duration,
+    /// After client closes (upload EOF), wait for remote (like Xray uplinkOnly)
+    pub uplink_only_timeout: Duration,
+    /// After remote closes (download EOF), wait for client (like Xray downlinkOnly)
+    pub downlink_only_timeout: Duration,
     /// TCP connect timeout
     pub connect_timeout: Duration,
     /// Request read timeout
@@ -274,6 +286,8 @@ impl ConnConfig {
     pub fn from_cli(cli: &CliArgs) -> Self {
         Self {
             idle_timeout: cli.conn_idle_timeout,
+            uplink_only_timeout: cli.uplink_only_timeout,
+            downlink_only_timeout: cli.downlink_only_timeout,
             connect_timeout: cli.tcp_connect_timeout,
             request_timeout: cli.request_timeout,
             tls_handshake_timeout: cli.tls_handshake_timeout,
@@ -287,6 +301,16 @@ impl ConnConfig {
     /// Get connection idle timeout in seconds (for relay function)
     pub fn idle_timeout_secs(&self) -> u64 {
         self.idle_timeout.as_secs()
+    }
+
+    /// Get uplink-only timeout in seconds (client closed → wait for remote)
+    pub fn uplink_only_timeout_secs(&self) -> u64 {
+        self.uplink_only_timeout.as_secs()
+    }
+
+    /// Get downlink-only timeout in seconds (remote closed → wait for client)
+    pub fn downlink_only_timeout_secs(&self) -> u64 {
+        self.downlink_only_timeout.as_secs()
     }
 }
 
@@ -391,6 +415,8 @@ mod tests {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
             conn_idle_timeout: Duration::from_secs(300),
+            uplink_only_timeout: Duration::from_secs(2),
+            downlink_only_timeout: Duration::from_secs(5),
             tcp_connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
@@ -427,6 +453,8 @@ mod tests {
             acl_conf_file: None,
             block_private_ip: true,
             conn_idle_timeout: Duration::from_secs(300),
+            uplink_only_timeout: Duration::from_secs(2),
+            downlink_only_timeout: Duration::from_secs(5),
             tcp_connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
@@ -876,5 +904,43 @@ mod tests {
         cli.max_connections = 100000;
         let config = ConnConfig::from_cli(&cli);
         assert_eq!(config.max_connections, 100000);
+    }
+
+    #[test]
+    fn test_conn_config_uplink_only_timeout_default() {
+        let cli = create_test_cli_args();
+        let config = ConnConfig::from_cli(&cli);
+        assert_eq!(config.uplink_only_timeout, Duration::from_secs(2));
+        assert_eq!(config.uplink_only_timeout_secs(), 2);
+    }
+
+    #[test]
+    fn test_conn_config_downlink_only_timeout_default() {
+        let cli = create_test_cli_args();
+        let config = ConnConfig::from_cli(&cli);
+        assert_eq!(config.downlink_only_timeout, Duration::from_secs(5));
+        assert_eq!(config.downlink_only_timeout_secs(), 5);
+    }
+
+    #[test]
+    fn test_conn_config_uplink_downlink_timeout_custom() {
+        let mut cli = create_test_cli_args();
+        cli.uplink_only_timeout = Duration::from_secs(10);
+        cli.downlink_only_timeout = Duration::from_secs(30);
+        let config = ConnConfig::from_cli(&cli);
+        assert_eq!(config.uplink_only_timeout_secs(), 10);
+        assert_eq!(config.downlink_only_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn test_conn_config_uplink_downlink_independent() {
+        let mut cli = create_test_cli_args();
+        // Verify the two timeouts are independent fields
+        cli.uplink_only_timeout = Duration::from_secs(1);
+        cli.downlink_only_timeout = Duration::from_secs(99);
+        let config = ConnConfig::from_cli(&cli);
+        assert_ne!(config.uplink_only_timeout, config.downlink_only_timeout);
+        assert_eq!(config.uplink_only_timeout_secs(), 1);
+        assert_eq!(config.downlink_only_timeout_secs(), 99);
     }
 }
