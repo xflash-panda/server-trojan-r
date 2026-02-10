@@ -434,7 +434,10 @@ mod tests {
         assert_eq!(TCP_KEEPALIVE_SECS, 15);
         // 3 probes × 15s interval = ~45s detection time
         let detection_time = TCP_KEEPALIVE_SECS * 3;
-        assert!(detection_time <= 60, "keepalive detection should be under 60s");
+        assert!(
+            detection_time <= 60,
+            "keepalive detection should be under 60s"
+        );
     }
 
     #[test]
