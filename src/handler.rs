@@ -13,6 +13,7 @@ use crate::transport::{ConnectionMeta, TransportStream};
 
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
+use socket2::{SockRef, TcpKeepalive};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,6 +24,12 @@ const UDP_MAX_READ_BUFFER_SIZE: usize = 64 * 1024; // 64KB
 
 /// Maximum entries in per-session UDP route cache
 const UDP_MAX_ROUTE_CACHE_ENTRIES: usize = 256;
+
+/// TCP keepalive interval for outbound connections (matches Go default)
+const TCP_KEEPALIVE_SECS: u64 = 15;
+
+/// Shutdown timeout — prevents infinite hang when peer is unresponsive
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Read and decode a complete Trojan request from the stream
 ///
@@ -267,8 +274,9 @@ impl<'a> ConnectContext<'a> {
 
         // Graceful shutdown for both streams (covers cancel, timeout, and error paths).
         // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
-        let _ = client_stream.shutdown().await;
-        let _ = remote_stream.shutdown().await;
+        // Timeout prevents infinite hang when peer is unresponsive.
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, remote_stream.shutdown()).await;
 
         Ok(())
     }
@@ -296,6 +304,10 @@ async fn handle_direct_connect(
             if ctx.server.conn_config.tcp_nodelay {
                 let _ = stream.set_nodelay(true);
             }
+            let keepalive = TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+                .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+            let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
             stream
         }
         Ok(Err(e)) => {
@@ -591,7 +603,7 @@ async fn handle_udp_associate(
     }
 
     // Graceful shutdown of the client TCP stream carrying UDP packets
-    let _ = client_stream.shutdown().await;
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, client_stream.shutdown()).await;
 
     log::debug!(peer = %peer_addr, "UDP associate ended");
     Ok(())
@@ -670,6 +682,12 @@ mod tests {
             }
             _ => panic!("Expected Domain address"),
         }
+    }
+
+    #[test]
+    fn test_keepalive_and_shutdown_constants() {
+        assert_eq!(TCP_KEEPALIVE_SECS, 15);
+        assert_eq!(SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(5));
     }
 
     #[test]
