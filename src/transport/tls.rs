@@ -39,10 +39,17 @@ impl TlsTransportListener {
         })?;
 
         // Build TLS config
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // Enable TLS session tickets for faster reconnection.
+        // Clients that reconnect skip the full handshake, saving ~1 RTT.
+        // Keys are automatically rotated by rustls's TicketSwitcher.
+        if let Ok(ticketer) = rustls::crypto::ring::Ticketer::new() {
+            config.ticketer = ticketer;
+        }
 
         Ok(Arc::new(config))
     }
