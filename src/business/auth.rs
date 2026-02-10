@@ -1,7 +1,6 @@
 //! API-based authentication implementation
 
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,9 +29,8 @@ impl ApiAuthenticator {
     }
 }
 
-#[async_trait]
 impl Authenticator for ApiAuthenticator {
-    async fn authenticate(&self, password: &[u8; 56]) -> Option<UserId> {
+    fn authenticate(&self, password: &[u8; 56]) -> Option<UserId> {
         self.users.load().get(password).copied()
     }
 }
@@ -41,15 +39,15 @@ impl Authenticator for ApiAuthenticator {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_api_authenticator_new() {
+    #[test]
+    fn test_api_authenticator_new() {
         let users = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         let auth = ApiAuthenticator::new(users);
         assert_eq!(auth.user_count(), 0);
     }
 
-    #[tokio::test]
-    async fn test_api_authenticator_authenticate_success() {
+    #[test]
+    fn test_api_authenticator_authenticate_success() {
         let mut map = HashMap::new();
         let password = [b'a'; 56];
         map.insert(password, 42 as UserId);
@@ -57,27 +55,27 @@ mod tests {
         let users = Arc::new(ArcSwap::from_pointee(map));
         let auth = ApiAuthenticator::new(users);
 
-        assert_eq!(auth.authenticate(&password).await, Some(42));
+        assert_eq!(auth.authenticate(&password), Some(42));
     }
 
-    #[tokio::test]
-    async fn test_api_authenticator_authenticate_failure() {
+    #[test]
+    fn test_api_authenticator_authenticate_failure() {
         let users = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         let auth = ApiAuthenticator::new(users);
 
         let password = [b'x'; 56];
-        assert_eq!(auth.authenticate(&password).await, None);
+        assert_eq!(auth.authenticate(&password), None);
     }
 
-    #[tokio::test]
-    async fn test_api_authenticator_shared_update() {
+    #[test]
+    fn test_api_authenticator_shared_update() {
         let users = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         let auth = ApiAuthenticator::new(Arc::clone(&users));
 
         let password = [b'b'; 56];
 
         // Initially not found
-        assert_eq!(auth.authenticate(&password).await, None);
+        assert_eq!(auth.authenticate(&password), None);
 
         // Update shared map via atomic swap
         let mut new_map = HashMap::new();
@@ -85,7 +83,7 @@ mod tests {
         users.store(Arc::new(new_map));
 
         // Now found
-        assert_eq!(auth.authenticate(&password).await, Some(100));
+        assert_eq!(auth.authenticate(&password), Some(100));
         assert_eq!(auth.user_count(), 1);
     }
 
