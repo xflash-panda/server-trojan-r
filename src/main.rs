@@ -37,9 +37,9 @@ use crate::core::{ConnectionManager, Server};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install ring as the default crypto provider for rustls
+    // Install aws-lc-rs as the default crypto provider for rustls
     // This must be done before any TLS operations
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
