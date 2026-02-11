@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::heartbeat::H2Heartbeat;
@@ -97,6 +98,10 @@ where
     }
 
     /// Run the connection, calling the handler for each accepted stream
+    ///
+    /// When the H2 connection closes (error, heartbeat timeout, or graceful),
+    /// all spawned handler tasks are cancelled via a shared CancellationToken
+    /// to prevent orphaned tasks from holding resources until their idle timeout.
     pub async fn run<F, Fut>(self, handler: F) -> Result<()>
     where
         F: Fn(GrpcTransport) -> Fut + Send + Sync + 'static,
@@ -108,9 +113,13 @@ where
         let active_count = self.active_count;
         let buffer_size = self.buffer_size;
 
+        // Shared token: cancelled when this H2 connection closes,
+        // causing all spawned handler tasks to abort promptly.
+        let conn_cancel = CancellationToken::new();
+
         let mut heartbeat = H2Heartbeat::new(h2_conn.ping_pong());
 
-        loop {
+        let result = loop {
             tokio::select! {
                 result = h2_conn.accept() => {
                     match result {
@@ -182,41 +191,53 @@ where
 
                             let handler_clone = Arc::clone(&handler);
                             let active_count_clone = Arc::clone(&active_count);
+                            let task_cancel = conn_cancel.child_token();
                             active_count_clone.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 let _guard = scopeguard::guard((), |_| {
                                     active_count_clone.fetch_sub(1, Ordering::Relaxed);
                                 });
-                                let _ = handler_clone(transport).await;
+                                tokio::select! {
+                                    result = handler_clone(transport) => { let _ = result; }
+                                    _ = task_cancel.cancelled() => {
+                                        debug!("gRPC stream handler cancelled (connection closed)");
+                                    }
+                                }
                             });
                         }
                         Some(Err(e)) => {
                             warn!(error = %e, "gRPC connection error");
-                            return Err(anyhow::anyhow!("gRPC connection error: {}", e));
+                            break Err(anyhow::anyhow!("gRPC connection error: {}", e));
                         }
                         None => {
                             debug!("gRPC connection closed normally");
-                            break;
+                            break Ok(());
                         }
                     }
                 }
 
                 result = heartbeat.poll() => {
                     if let Err(e) = result {
-                        return Err(anyhow::anyhow!("gRPC {}", e));
+                        break Err(anyhow::anyhow!("gRPC {}", e));
                     }
                 }
             }
-        }
-        Ok(())
+        };
+
+        // Cancel all handler tasks spawned on this H2 connection.
+        // Tasks will drop their GrpcTransport, relay buffers, and
+        // ConnectionManager registrations via scopeguard.
+        conn_cancel.cancel();
+
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[tokio::test]
     async fn test_scopeguard_decrements_on_panic() {
@@ -297,5 +318,125 @@ mod tests {
             "per-connection memory bound too high: {}MB",
             max_memory_per_conn / (1024 * 1024)
         );
+    }
+
+    /// Verify that conn_cancel token cancels spawned handler tasks when
+    /// the H2 connection closes, preventing orphaned tasks.
+    #[tokio::test]
+    async fn test_conn_cancel_token_cancels_handlers() {
+        let conn_cancel = CancellationToken::new();
+        let task_started = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Simulate spawning a handler task with child_token (same pattern as run())
+        let task_cancel = conn_cancel.child_token();
+        let started = Arc::clone(&task_started);
+        let cancelled = Arc::clone(&task_cancelled);
+        let counter_clone = Arc::clone(&counter);
+        counter_clone.fetch_add(1, Ordering::Relaxed);
+
+        let handle = tokio::spawn(async move {
+            let _guard = scopeguard::guard((), |_| {
+                counter_clone.fetch_sub(1, Ordering::Relaxed);
+            });
+            started.store(true, Ordering::Release);
+
+            tokio::select! {
+                // Simulate a long-running handler (e.g. relay with 5min idle timeout)
+                _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                _ = task_cancel.cancelled() => {
+                    cancelled.store(true, Ordering::Release);
+                }
+            }
+        });
+
+        // Wait for task to start
+        tokio::task::yield_now().await;
+        assert!(task_started.load(Ordering::Acquire));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Simulate H2 connection closing → cancel all handlers
+        conn_cancel.cancel();
+
+        handle.await.unwrap();
+
+        assert!(
+            task_cancelled.load(Ordering::Acquire),
+            "Handler task should have been cancelled"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "Scopeguard should have decremented counter"
+        );
+    }
+
+    /// Verify that multiple handler tasks are all cancelled when conn_cancel fires.
+    #[tokio::test]
+    async fn test_conn_cancel_token_cancels_multiple_handlers() {
+        let conn_cancel = CancellationToken::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let task_cancel = conn_cancel.child_token();
+            let active_clone = Arc::clone(&active);
+            active_clone.fetch_add(1, Ordering::Relaxed);
+
+            handles.push(tokio::spawn(async move {
+                let _guard = scopeguard::guard((), |_| {
+                    active_clone.fetch_sub(1, Ordering::Relaxed);
+                });
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                    _ = task_cancel.cancelled() => {}
+                }
+            }));
+        }
+
+        tokio::task::yield_now().await;
+        assert_eq!(active.load(Ordering::Relaxed), 10);
+
+        // Cancel all at once
+        conn_cancel.cancel();
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            0,
+            "All handler tasks should have been cleaned up"
+        );
+    }
+
+    /// Verify that already-completed handlers are not affected by conn_cancel.
+    #[tokio::test]
+    async fn test_conn_cancel_ignores_completed_handlers() {
+        let conn_cancel = CancellationToken::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Spawn a handler that completes immediately
+        let task_cancel = conn_cancel.child_token();
+        let counter_clone = Arc::clone(&counter);
+        counter_clone.fetch_add(1, Ordering::Relaxed);
+
+        let handle = tokio::spawn(async move {
+            let _guard = scopeguard::guard((), |_| {
+                counter_clone.fetch_sub(1, Ordering::Relaxed);
+            });
+            tokio::select! {
+                _ = async { /* completes immediately */ } => {}
+                _ = task_cancel.cancelled() => {}
+            }
+        });
+
+        handle.await.unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // Cancel after handler already finished — should be a no-op
+        conn_cancel.cancel();
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }
