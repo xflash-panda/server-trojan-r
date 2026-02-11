@@ -47,7 +47,7 @@ impl TlsTransportListener {
         // Enable TLS session tickets for faster reconnection.
         // Clients that reconnect skip the full handshake, saving ~1 RTT.
         // Keys are automatically rotated by rustls's TicketSwitcher.
-        if let Ok(ticketer) = rustls::crypto::ring::Ticketer::new() {
+        if let Ok(ticketer) = rustls::crypto::aws_lc_rs::Ticketer::new() {
             config.ticketer = ticketer;
         }
 
