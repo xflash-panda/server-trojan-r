@@ -152,26 +152,30 @@ where
                 .max_message_size(Some(buf_size * 4)) // 4x buffer_size = 128KB (default 64MB)
                 .max_frame_size(Some(buf_size * 2)); // 2x buffer_size (default 16MB)
 
-            // WebSocket handshake with path validation
+            // WebSocket handshake with path validation and timeout
             let ws_path = network_settings.ws_path.clone();
-            let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(
-                stream,
-                |req: &Request, response: Response| {
-                    let path = req.uri().path();
-                    // For "/" or empty path, accept any path (Xray behavior)
-                    if !ws_path.is_empty() && ws_path != "/" && path != ws_path {
-                        log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
-                        let reject = http::Response::builder()
-                            .status(http::StatusCode::NOT_FOUND)
-                            .body(None)
-                            .unwrap();
-                        return Err(reject);
-                    }
-                    Ok(response)
-                },
-                Some(ws_config),
+            let ws_stream = tokio::time::timeout(
+                server.conn_config.request_timeout,
+                tokio_tungstenite::accept_hdr_async_with_config(
+                    stream,
+                    |req: &Request, response: Response| {
+                        let path = req.uri().path();
+                        // For "/" or empty path, accept any path (Xray behavior)
+                        if !ws_path.is_empty() && ws_path != "/" && path != ws_path {
+                            log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
+                            let reject = http::Response::builder()
+                                .status(http::StatusCode::NOT_FOUND)
+                                .body(None)
+                                .unwrap();
+                            return Err(reject);
+                        }
+                        Ok(response)
+                    },
+                    Some(ws_config),
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| anyhow!("WebSocket handshake timeout"))??;
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
@@ -460,5 +464,40 @@ mod tests {
         // Configured path is empty → accept all (Xray behavior)
         assert!(!check_path("", "/anything"));
         assert!(!check_path("", ""));
+    }
+
+    /// WS handshake must be wrapped in a timeout so that clients that complete
+    /// TLS but never send the HTTP Upgrade request don't hang forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_ws_handshake_timeout_fires() {
+        // Simulate a peer that completes TLS but sends nothing (no WS upgrade).
+        // We use a DuplexStream where the client side is immediately dropped,
+        // but importantly the server side stays open — so read returns Pending,
+        // not EOF. This mirrors a real slow-loris / scanner scenario.
+        let (server_stream, _client_stream) = tokio::io::duplex(1024);
+
+        let timeout_duration = std::time::Duration::from_secs(5);
+
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            timeout_duration,
+            tokio_tungstenite::accept_async(server_stream),
+        )
+        .await;
+
+        // Must be a timeout error, not a successful handshake
+        assert!(result.is_err(), "Should timeout, not succeed");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= timeout_duration,
+            "Should wait at least the timeout duration, elapsed={:?}",
+            elapsed
+        );
+        // Should not wait much longer than the timeout
+        assert!(
+            elapsed < timeout_duration + std::time::Duration::from_secs(1),
+            "Should not wait significantly longer than timeout, elapsed={:?}",
+            elapsed
+        );
     }
 }
