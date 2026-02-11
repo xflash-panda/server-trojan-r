@@ -66,6 +66,12 @@ impl DirectionalBuffer {
         self.shutdown_done
     }
 
+    /// Reader has received EOF (the peer closed their write side).
+    /// This is true before shutdown completes — use for half-close timer.
+    fn has_read_eof(&self) -> bool {
+        self.read_done
+    }
+
     fn bytes_transferred(&self) -> u64 {
         self.amt
     }
@@ -174,33 +180,36 @@ where
         // Poll a→b (upload: read from client, write to remote)
         if !a_to_b.is_done() {
             match a_to_b.poll_copy(cx, Pin::new(&mut *a), Pin::new(&mut *b)) {
-                Poll::Ready(Ok(())) => {
-                    // Client closed (upload EOF) → use uplinkOnly timeout for remaining download
-                    if !b_to_a.is_done() && half_close_deadline.is_none() {
-                        half_close_deadline = Some(Box::pin(tokio::time::sleep(
-                            tokio::time::Duration::from_secs(uplink_only_secs),
-                        )));
-                    }
-                }
+                Poll::Ready(Ok(())) | Poll::Pending => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
             }
         }
 
         // Poll b→a (download: read from remote, write to client)
         if !b_to_a.is_done() {
             match b_to_a.poll_copy(cx, Pin::new(&mut *b), Pin::new(&mut *a)) {
-                Poll::Ready(Ok(())) => {
-                    // Remote closed (download EOF) → use downlinkOnly timeout for remaining upload
-                    if !a_to_b.is_done() && half_close_deadline.is_none() {
-                        half_close_deadline = Some(Box::pin(tokio::time::sleep(
-                            tokio::time::Duration::from_secs(downlink_only_secs),
-                        )));
-                    }
-                }
+                Poll::Ready(Ok(())) | Poll::Pending => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
             }
+        }
+
+        // Set half-close timer on EOF detection, NOT on shutdown completion.
+        // Bug fix: poll_shutdown on WebSocket can return Pending indefinitely
+        // (e.g., flush blocked because realm/peer is slow), which prevented
+        // poll_copy from returning Ready(Ok(())), and the half-close timer
+        // was never set. Meanwhile the other direction kept transferring data,
+        // resetting the idle timer — causing the connection to live forever.
+        if a_to_b.has_read_eof() && !b_to_a.is_done() && half_close_deadline.is_none() {
+            // Client closed (upload EOF) → use uplinkOnly timeout for remaining download
+            half_close_deadline = Some(Box::pin(tokio::time::sleep(
+                tokio::time::Duration::from_secs(uplink_only_secs),
+            )));
+        }
+        if b_to_a.has_read_eof() && !a_to_b.is_done() && half_close_deadline.is_none() {
+            // Remote closed (download EOF) → use downlinkOnly timeout for remaining upload
+            half_close_deadline = Some(Box::pin(tokio::time::sleep(
+                tokio::time::Duration::from_secs(downlink_only_secs),
+            )));
         }
 
         // Reset idle deadline on data activity
@@ -546,6 +555,166 @@ mod tests {
             collector.upload.load(AtomicOrdering::Relaxed),
             result.a_to_b,
             "Upload stats should match bytes transferred"
+        );
+    }
+
+    /// A stream where poll_shutdown always returns Pending (simulates WS flush
+    /// blocked because realm/peer is slow). The reader sends EOF after data,
+    /// but the writer's shutdown never completes.
+    ///
+    /// This reproduces the realm connection leak: when the target server closes,
+    /// the relay tries to shutdown the client WS writer. If poll_shutdown hangs
+    /// (flush blocked by realm), the old code would never set the half-close
+    /// timer, and if the other direction kept sending data, the connection
+    /// would live forever.
+    struct ShutdownHangsStream {
+        /// Data to return on first read, then EOF
+        data: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for ShutdownHangsStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(data) = self.data.take() {
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                Poll::Ready(Ok(()))
+            } else {
+                // EOF
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl AsyncWrite for ShutdownHangsStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            // Simulate WS flush blocked by realm — never completes
+            Poll::Pending
+        }
+    }
+
+    /// Regression test for realm connection leak:
+    /// When remote EOF is received but poll_shutdown on client hangs,
+    /// the half-close timer must still fire based on EOF detection.
+    ///
+    /// Before fix: half-close timer only started when poll_copy returned
+    /// Ready(Ok(())), which required shutdown to complete. With hanging
+    /// shutdown, the timer never started → connection lived forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_fires_when_shutdown_hangs() {
+        // Remote sends "response" then EOF; its shutdown hangs (simulates WS via realm)
+        let mut remote = ShutdownHangsStream {
+            data: Some(b"response".to_vec()),
+        };
+        // Client never sends EOF (keeps connection open, like real client through realm)
+        let mut client = NeverEofSink;
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout 300s (should NOT trigger)
+            100, // uplink_only = 100s (should NOT trigger)
+            2,   // downlink_only = 2s (THIS should fire after remote EOF)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert!(!result.completed, "Should timeout, not complete normally");
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(2),
+            "Should wait at least downlink_only timeout"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Should fire promptly, not wait for idle timeout (300s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// A stream that accepts writes, never returns data on read (like NeverEofSink),
+    /// but whose poll_shutdown hangs (simulates WS flush blocked by realm).
+    struct NeverEofShutdownHangs;
+
+    impl AsyncRead for NeverEofShutdownHangs {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NeverEofShutdownHangs {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Same test but for the other direction: client EOF, shutdown on remote hangs.
+    /// Remote never sends EOF (keeps reading), so uplink_only timer should fire.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_fires_when_client_shutdown_hangs() {
+        // Client sends "request" then EOF
+        let mut client = Cursor::new(b"request".to_vec());
+        // Remote accepts writes but never sends data and shutdown hangs
+        let mut remote = NeverEofShutdownHangs;
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout (should NOT trigger)
+            2,   // uplink_only = 2s (THIS should fire after client EOF)
+            100, // downlink_only = 100s (should NOT trigger)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert!(!result.completed);
+        assert!(result.a_to_b > 0, "Client data should have been relayed");
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(2),
+            "Should wait at least uplink_only timeout"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Should fire promptly, not wait for idle timeout (300s), elapsed={:?}",
+            elapsed
         );
     }
 
