@@ -160,6 +160,10 @@ where
                 let _ = Sink::start_send(me.ws_stream.as_mut(), Message::Close(None));
             }
         }
-        self.as_mut().poll_flush(cx)
+        // Don't wait for flush to complete - this avoids hanging on slow peers (realm)
+        // during shutdown, which caused connection accumulation in high load scenarios.
+        // The Close frame will be sent best-effort, and the connection will be dropped
+        // immediately, freeing resources much faster.
+        Poll::Ready(Ok(()))
     }
 }
