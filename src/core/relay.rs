@@ -16,8 +16,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
-/// Shutdown timeout — prevents infinite hang when peer is unresponsive.
-const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Result of bidirectional copy with traffic stats
 #[derive(Debug, Clone, Copy)]
@@ -245,14 +243,13 @@ where
     let a_to_b_bytes = a_to_b.bytes_transferred();
     let b_to_a_bytes = b_to_a.bytes_transferred();
 
-    let completed = matches!(result, Ok(true));
-
-    // Graceful shutdown for streams that didn't complete normally.
-    // Sends WebSocket Close frames, gRPC trailers, or TCP FIN as appropriate.
-    if !completed {
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, tokio::io::AsyncWriteExt::shutdown(a)).await;
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, tokio::io::AsyncWriteExt::shutdown(b)).await;
-    }
+    // No graceful shutdown here on timeout/error — just drop streams immediately.
+    // This matches Xray behavior: timeout → close, no flush wait.
+    // The caller (handler.rs) handles shutdown for cancel_token scenarios.
+    //
+    // Previous code called shutdown() with a 5s timeout per stream, which
+    // blocked on poll_flush (e.g. tungstenite flush to slow realm), causing
+    // up to 10s extra delay per connection and connection accumulation at peak.
 
     // Always record traffic stats — regardless of success, timeout, or error
     if let Some((user_id, collector)) = stats {
@@ -379,9 +376,10 @@ mod tests {
         }
     }
 
-    /// Verify that streams are shut down when relay errors out.
+    /// Verify that relay does NOT call shutdown on error — caller handles cleanup.
+    /// (Changed from previous behavior where relay did graceful shutdown internally.)
     #[tokio::test]
-    async fn test_shutdown_called_on_relay_error() {
+    async fn test_no_shutdown_on_relay_error() {
         let client_shutdown = Arc::new(AtomicBool::new(false));
         let remote_shutdown = Arc::new(AtomicBool::new(false));
 
@@ -398,13 +396,14 @@ mod tests {
             copy_bidirectional_with_stats(&mut client, &mut remote, 300, 2, 5, 1024, None).await;
 
         assert!(result.is_err(), "Should return error from broken stream");
+        // Relay no longer calls shutdown — caller drops streams to close immediately
         assert!(
-            client_shutdown.load(Ordering::Acquire),
-            "Client stream should be shut down after error"
+            !client_shutdown.load(Ordering::Acquire),
+            "Relay should NOT call shutdown (caller handles cleanup)"
         );
         assert!(
-            remote_shutdown.load(Ordering::Acquire),
-            "Remote stream should be shut down after error"
+            !remote_shutdown.load(Ordering::Acquire),
+            "Relay should NOT call shutdown (caller handles cleanup)"
         );
     }
 
@@ -718,9 +717,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_shutdown_timeout_constant() {
-        assert_eq!(SHUTDOWN_TIMEOUT, std::time::Duration::from_secs(5));
+    /// Regression test: after half-close timeout, relay should NOT attempt
+    /// additional graceful shutdown (which calls flush then shutdown).
+    /// Xray behavior: timeout → drop immediately.
+    ///
+    /// Old code called shutdown() with 5s timeout per stream AFTER the relay
+    /// loop returned, blocking on poll_flush (e.g. tungstenite flush to slow
+    /// realm), causing up to 10s extra delay per connection and connection
+    /// accumulation during peak traffic.
+    ///
+    /// Uses ShutdownHangsStream (flush=Ready, shutdown=Pending) so that
+    /// the half-close timer can fire normally via poll_shutdown's Pending.
+    #[tokio::test(start_paused = true)]
+    async fn test_no_extra_shutdown_after_half_close_timeout() {
+        // Remote sends "response" then EOF; its shutdown hangs
+        let mut remote = ShutdownHangsStream {
+            data: Some(b"response".to_vec()),
+        };
+        // Client never sends EOF
+        let mut client = NeverEofSink;
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout (won't trigger)
+            100, // uplink_only (won't trigger)
+            2,   // downlink_only = 2s (fires after remote EOF)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert!(!result.completed);
+        // Should complete in ~2s (half-close timeout only).
+        // Old code: 2s + 5s (shutdown a) + 5s (shutdown b) = 12s
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(2),
+            "Should wait at least half-close timeout"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(4),
+            "Should NOT wait for extra shutdown timeouts, elapsed={:?}",
+            elapsed
+        );
     }
 
     /// Verify that &mut reference pattern allows callers to access and
