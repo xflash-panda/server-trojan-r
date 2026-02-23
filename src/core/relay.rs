@@ -16,7 +16,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
-
 /// Result of bidirectional copy with traffic stats
 #[derive(Debug, Clone, Copy)]
 pub struct CopyResult {
