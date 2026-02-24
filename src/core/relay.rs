@@ -29,7 +29,14 @@ pub struct CopyResult {
 
 /// Buffer for one direction of a bidirectional copy.
 ///
-/// State machine: Read → Write → Flush → (loop) or EOF → Shutdown → Done
+/// State machine: Read → Write → (loop) or EOF → Shutdown → Done
+///
+/// No explicit poll_flush step. Flushing is handled by poll_shutdown when the
+/// direction completes. Removing poll_flush from the hot loop prevents it from
+/// blocking indefinitely when the peer is slow (e.g., WS transport through realm
+/// with a full TCP buffer), which would prevent poll_copy from reading the next
+/// chunk and detecting EOF — causing connections to fall back to the 300s idle
+/// timeout instead of the 2-5s half-close timeout.
 struct DirectionalBuffer {
     buf: Vec<u8>,
     /// Start of unwritten data in buf
@@ -40,8 +47,6 @@ struct DirectionalBuffer {
     amt: u64,
     /// Reader returned EOF
     read_done: bool,
-    /// Writer needs flush
-    need_flush: bool,
     /// Writer shutdown complete — this direction is fully done
     shutdown_done: bool,
 }
@@ -54,7 +59,6 @@ impl DirectionalBuffer {
             cap: 0,
             amt: 0,
             read_done: false,
-            need_flush: false,
             shutdown_done: false,
         }
     }
@@ -76,7 +80,7 @@ impl DirectionalBuffer {
     /// Try to make maximum progress on this direction.
     ///
     /// Returns:
-    /// - `Poll::Ready(Ok(()))` — direction fully complete (EOF + flush + shutdown)
+    /// - `Poll::Ready(Ok(()))` — direction fully complete (EOF + shutdown)
     /// - `Poll::Ready(Err(e))` — I/O error
     /// - `Poll::Pending` — blocked on I/O, waker registered
     fn poll_copy<R: AsyncRead, W: AsyncWrite>(
@@ -103,16 +107,9 @@ impl DirectionalBuffer {
                 }
                 self.pos += i;
                 self.amt += i as u64;
-                self.need_flush = true;
             }
 
-            // Step 2: Flush after writing
-            if self.need_flush {
-                ready!(writer.as_mut().poll_flush(cx))?;
-                self.need_flush = false;
-            }
-
-            // Step 3: If reader hit EOF, shutdown writer
+            // Step 2: If reader hit EOF, shutdown writer
             if self.read_done {
                 // Ignore shutdown errors (peer may have already closed)
                 let _ = ready!(writer.as_mut().poll_shutdown(cx));
@@ -120,13 +117,13 @@ impl DirectionalBuffer {
                 return Poll::Ready(Ok(()));
             }
 
-            // Step 4: Read more data
+            // Step 3: Read more data
             let mut buf = ReadBuf::new(&mut self.buf);
             ready!(reader.as_mut().poll_read(cx, &mut buf))?;
             let n = buf.filled().len();
             if n == 0 {
                 self.read_done = true;
-                // Loop back to step 3 for shutdown
+                // Loop back to step 2 for shutdown
             } else {
                 self.pos = 0;
                 self.cap = n;
@@ -786,5 +783,94 @@ mod tests {
         tokio::io::AsyncWriteExt::shutdown(&mut remote)
             .await
             .unwrap();
+    }
+
+    /// A stream where poll_flush returns Pending (simulates WS transport where
+    /// tungstenite's flush is blocked because realm's TCP buffer is full).
+    /// Reads return data once then Pending (simulates client that sent a request
+    /// and is waiting for the response — connection alive but no new upload data).
+    struct FlushHangsStream {
+        read_data: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for FlushHangsStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(data) = self.read_data.take() {
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for FlushHangsStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Regression test: poll_flush blocking in relay prevents EOF detection,
+    /// causing connections to wait for idle timeout (300s) instead of half-close (2-5s).
+    ///
+    /// Scenario: target sends response then closes. Trojan writes response to client WS,
+    /// but poll_flush on client WS hangs (realm's TCP buffer full). poll_copy is stuck
+    /// at flush step, never reads the next chunk from remote which would return EOF.
+    /// Without EOF, half-close timer never starts → connection waits for idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_fires_when_flush_hangs_before_eof() {
+        // Remote: sends response data then EOF
+        let mut remote = ShutdownHangsStream {
+            data: Some(b"response".to_vec()),
+        };
+        // Client: sends request then waits. Flush hangs (slow realm).
+        let mut client = FlushHangsStream {
+            read_data: Some(b"request".to_vec()),
+        };
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            30,  // idle timeout = 30s (fallback — should NOT be needed)
+            100, // uplink_only (should NOT fire)
+            2,   // downlink_only = 2s (THIS should fire after remote EOF detected)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert!(!result.completed, "Should timeout, not complete normally");
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(2),
+            "Should wait at least downlink_only timeout"
+        );
+        // Key: should close at ~2s (half-close), NOT at ~30s (idle timeout).
+        // Bug: poll_flush blocks poll_copy from reading remote EOF, so half-close
+        // timer never starts, and connection waits for idle timeout instead.
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Should fire at half-close (~2s), not idle timeout (30s), elapsed={:?}",
+            elapsed
+        );
     }
 }
