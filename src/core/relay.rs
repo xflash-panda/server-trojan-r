@@ -29,14 +29,17 @@ pub struct CopyResult {
 
 /// Buffer for one direction of a bidirectional copy.
 ///
-/// State machine: Read → Write → (loop) or EOF → Shutdown → Done
+/// State machine: Read → Write → Flush (non-blocking) → (loop) or EOF → Shutdown → Done
 ///
-/// No explicit poll_flush step. Flushing is handled by poll_shutdown when the
-/// direction completes. Removing poll_flush from the hot loop prevents it from
-/// blocking indefinitely when the peer is slow (e.g., WS transport through realm
-/// with a full TCP buffer), which would prevent poll_copy from reading the next
-/// chunk and detecting EOF — causing connections to fall back to the 300s idle
-/// timeout instead of the 2-5s half-close timeout.
+/// The flush step is non-blocking (best-effort): if the peer is slow (e.g., WS
+/// transport through realm with a full TCP buffer), poll_flush returns Pending
+/// and we continue to read. This is critical for two reasons:
+/// 1. Direct connections: flush succeeds immediately, ensuring data reaches the
+///    client promptly (without it, data stays in the WS codec buffer until shutdown).
+/// 2. Realm connections: flush may return Pending, but we don't block — we continue
+///    reading to detect EOF and start the half-close timer. (The original blocking
+///    `ready!(poll_flush)` caused connections to fall back to the 300s idle timeout
+///    instead of the 2-5s half-close timeout.)
 struct DirectionalBuffer {
     buf: Vec<u8>,
     /// Start of unwritten data in buf
@@ -80,7 +83,7 @@ impl DirectionalBuffer {
     /// Try to make maximum progress on this direction.
     ///
     /// Returns:
-    /// - `Poll::Ready(Ok(()))` — direction fully complete (EOF + shutdown)
+    /// - `Poll::Ready(Ok(()))` — direction fully complete (EOF + flush + shutdown)
     /// - `Poll::Ready(Err(e))` — I/O error
     /// - `Poll::Pending` — blocked on I/O, waker registered
     fn poll_copy<R: AsyncRead, W: AsyncWrite>(
@@ -109,7 +112,15 @@ impl DirectionalBuffer {
                 self.amt += i as u64;
             }
 
-            // Step 2: If reader hit EOF, shutdown writer
+            // Step 2: Best-effort flush — push written data to the wire.
+            // Non-blocking: if peer is slow (Pending), continue to read for EOF detection.
+            // For direct connections, flush succeeds immediately, delivering data promptly.
+            // For realm connections, flush may Pending — data delivered when peer catches up.
+            if let Poll::Ready(Err(e)) = writer.as_mut().poll_flush(cx) {
+                return Poll::Ready(Err(e));
+            }
+
+            // Step 3: If reader hit EOF, shutdown writer
             if self.read_done {
                 // Ignore shutdown errors (peer may have already closed)
                 let _ = ready!(writer.as_mut().poll_shutdown(cx));
@@ -117,13 +128,13 @@ impl DirectionalBuffer {
                 return Poll::Ready(Ok(()));
             }
 
-            // Step 3: Read more data
+            // Step 4: Read more data
             let mut buf = ReadBuf::new(&mut self.buf);
             ready!(reader.as_mut().poll_read(cx, &mut buf))?;
             let n = buf.filled().len();
             if n == 0 {
                 self.read_done = true;
-                // Loop back to step 2 for shutdown
+                // Loop back to step 3 for shutdown
             } else {
                 self.pos = 0;
                 self.cap = n;
@@ -825,6 +836,172 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
+    }
+
+    /// Simulates a request-response client over a persistent tunnel.
+    ///
+    /// Models real behavior: client sends a request, waits for the response
+    /// to be flushed (delivered via network), then closes. Without flush in
+    /// the relay, the response stays in the WS codec buffer and the client
+    /// never receives it — causing the relay to hang until idle timeout.
+    struct RequestResponseClient {
+        /// Request data to send on first read
+        request: Option<Vec<u8>>,
+        /// Set by poll_write — indicates unflushed data exists
+        has_pending_write: bool,
+        /// Set by poll_flush when pending data is flushed — unlocks client read
+        response_delivered: Arc<AtomicBool>,
+        /// Waker for the read side, woken when flush delivers the response
+        read_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    }
+
+    impl AsyncRead for RequestResponseClient {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // First read: send the request
+            if let Some(data) = self.request.take() {
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                return Poll::Ready(Ok(()));
+            }
+            // Subsequent reads: wait until response has been flushed
+            if self.response_delivered.load(Ordering::Acquire) {
+                // Client received response → close tunnel (EOF)
+                Poll::Ready(Ok(()))
+            } else {
+                *self.read_waker.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for RequestResponseClient {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.has_pending_write = true;
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.has_pending_write {
+                self.has_pending_write = false;
+                self.response_delivered.store(true, Ordering::Release);
+                if let Some(waker) = self.read_waker.lock().unwrap().take() {
+                    waker.wake();
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            // Shutdown also delivers (WS poll_shutdown calls poll_ready which flushes)
+            if self.has_pending_write {
+                self.has_pending_write = false;
+                self.response_delivered.store(true, Ordering::Release);
+                if let Some(waker) = self.read_waker.lock().unwrap().take() {
+                    waker.wake();
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Remote server that sends one response then keeps connection open.
+    /// Models a persistent target (database, API) waiting for the next request.
+    struct PersistentRemote {
+        response: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for PersistentRemote {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(data) = self.response.take() {
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                Poll::Ready(Ok(()))
+            } else {
+                // Waiting for next request — connection alive, no EOF
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for PersistentRemote {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression test: without flush in relay, response data stays in WS codec
+    /// buffer and never reaches the client in direct-connect mode (no realm).
+    ///
+    /// Scenario: client sends request through WS tunnel, server sends response.
+    /// The relay writes the response to the WS transport (poll_write → start_send),
+    /// but without poll_flush, the data stays in tungstenite's codec buffer.
+    /// The client never receives the response, never sends more data or closes,
+    /// and the connection hangs until idle timeout.
+    ///
+    /// With non-blocking flush: data is delivered promptly, client sees response,
+    /// closes tunnel → half-close timer fires at 2s instead of idle timeout at 30s.
+    #[tokio::test(start_paused = true)]
+    async fn test_direct_connect_flush_delivers_response() {
+        let response_delivered = Arc::new(AtomicBool::new(false));
+        let read_waker = Arc::new(std::sync::Mutex::new(None));
+
+        let mut client = RequestResponseClient {
+            request: Some(b"GET /".to_vec()),
+            has_pending_write: false,
+            response_delivered: Arc::clone(&response_delivered),
+            read_waker: Arc::clone(&read_waker),
+        };
+        let mut remote = PersistentRemote {
+            response: Some(b"HTTP/1.1 200 OK".to_vec()),
+        };
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            30,  // idle timeout = 30s (should NOT fire if flush works)
+            2,   // uplink_only = 2s (fires after client EOF from successful flush)
+            100, // downlink_only (should NOT fire)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert!(result.a_to_b > 0, "Client request should be relayed");
+        assert!(result.b_to_a > 0, "Server response should be relayed");
+        // With flush: client receives response → EOF → uplink_only fires at ~2s
+        // Without flush: response stuck in buffer → idle timeout at 30s
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Response must be flushed promptly (direct connect), not wait for idle timeout (30s), elapsed={:?}",
+            elapsed
+        );
     }
 
     /// Regression test: poll_flush blocking in relay prevents EOF detection,
