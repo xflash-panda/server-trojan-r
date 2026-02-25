@@ -31,15 +31,16 @@ pub struct CopyResult {
 ///
 /// State machine: Read → Write → Flush (non-blocking) → (loop) or EOF → Shutdown → Done
 ///
-/// The flush step is non-blocking (best-effort): if the peer is slow (e.g., WS
-/// transport through realm with a full TCP buffer), poll_flush returns Pending
-/// and we continue to read. This is critical for two reasons:
-/// 1. Direct connections: flush succeeds immediately, ensuring data reaches the
-///    client promptly (without it, data stays in the WS codec buffer until shutdown).
-/// 2. Realm connections: flush may return Pending, but we don't block — we continue
-///    reading to detect EOF and start the half-close timer. (The original blocking
-///    `ready!(poll_flush)` caused connections to fall back to the 300s idle timeout
-///    instead of the 2-5s half-close timeout.)
+/// Two mechanisms ensure EOF detection is never blocked by slow peers (realm):
+///
+/// 1. Non-blocking flush (v0.2.6): poll_flush is best-effort — if Pending, we
+///    continue to read instead of blocking. Handles the case where all data is
+///    written but flush is slow.
+///
+/// 2. Probe read on write backpressure (v0.2.8): when poll_write returns Pending
+///    (WS sink full due to slow realm), we read into unused buffer space past `cap`
+///    to detect EOF. This mirrors Xray's two-goroutine design where read and write
+///    are independent. Handles responses > buffer_size through slow realm connections.
 struct DirectionalBuffer {
     buf: Vec<u8>,
     /// Start of unwritten data in buf
@@ -99,17 +100,50 @@ impl DirectionalBuffer {
         loop {
             // Step 1: Write buffered data
             while self.pos < self.cap {
-                let i = ready!(writer
+                match writer
                     .as_mut()
-                    .poll_write(cx, &self.buf[self.pos..self.cap]))?;
-                if i == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero bytes",
-                    )));
+                    .poll_write(cx, &self.buf[self.pos..self.cap])
+                {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write zero bytes",
+                        )));
+                    }
+                    Poll::Ready(Ok(i)) => {
+                        self.pos += i;
+                        self.amt += i as u64;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        // Write blocked (e.g., WS sink full due to slow realm).
+                        // Probe for EOF in unused buffer space so the half-close
+                        // timer can start even while write is stalled.
+                        // This mirrors Xray's two-goroutine design where read and
+                        // write are independent — EOF detection is never blocked
+                        // by write backpressure.
+                        if !self.read_done && self.cap < self.buf.len() {
+                            let mut read_buf = ReadBuf::new(&mut self.buf[self.cap..]);
+                            match reader.as_mut().poll_read(cx, &mut read_buf) {
+                                Poll::Ready(Ok(())) => {
+                                    let n = read_buf.filled().len();
+                                    if n == 0 {
+                                        self.read_done = true;
+                                    } else {
+                                        self.cap += n;
+                                    }
+                                }
+                                Poll::Ready(Err(_)) => {
+                                    // Reader broken — treat as EOF for timer purposes.
+                                    // Error propagated on next normal read cycle.
+                                    self.read_done = true;
+                                }
+                                Poll::Pending => {}
+                            }
+                        }
+                        return Poll::Pending;
+                    }
                 }
-                self.pos += i;
-                self.amt += i as u64;
             }
 
             // Step 2: Best-effort flush — push written data to the wire.
@@ -1000,6 +1034,144 @@ mod tests {
         assert!(
             elapsed < tokio::time::Duration::from_secs(10),
             "Response must be flushed promptly (direct connect), not wait for idle timeout (30s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// A stream where poll_write returns Pending after N successful writes.
+    /// Simulates WS transport where the sink is full (realm's TCP buffer full).
+    /// Read always returns Pending (client waiting for response, no more upload data).
+    struct WriteBlocksAfterN {
+        /// How many more writes to accept before blocking
+        writes_remaining: usize,
+    }
+
+    impl AsyncRead for WriteBlocksAfterN {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Client never sends more data (idle, waiting for response)
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for WriteBlocksAfterN {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.writes_remaining > 0 {
+                self.writes_remaining -= 1;
+                Poll::Ready(Ok(buf.len()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A remote server that sends multiple chunks of data then EOF.
+    struct MultiChunkThenEof {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl AsyncRead for MultiChunkThenEof {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.index < self.chunks.len() {
+                let data = &self.chunks[self.index];
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                self.index += 1;
+                Poll::Ready(Ok(()))
+            } else {
+                // EOF
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl AsyncWrite for MultiChunkThenEof {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression test: poll_write blocking in relay prevents EOF detection,
+    /// causing connections to wait for idle timeout (300s) instead of half-close (2-5s).
+    ///
+    /// Scenario: target sends two chunks then closes. Trojan writes chunk1 to
+    /// client WS successfully, reads chunk2, but poll_write for chunk2 returns
+    /// Pending (WS sink full, realm's TCP buffer full). poll_copy is stuck at
+    /// the write step, never reads the next chunk from remote which would be EOF.
+    /// Without EOF, half-close timer never starts → connection waits for idle timeout.
+    ///
+    /// This is the same class of bug as flush-blocking (v0.2.6 fix), but at the
+    /// write stage instead of the flush stage. Affects responses > buffer_size
+    /// through realm connections.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_fires_when_write_blocks_before_eof() {
+        // Client: accepts first write (chunk1), then blocks (realm buffer full)
+        let mut client = WriteBlocksAfterN {
+            writes_remaining: 1,
+        };
+        // Remote: sends two chunks then EOF
+        let mut remote = MultiChunkThenEof {
+            chunks: vec![b"chunk1-response".to_vec(), b"chunk2-response".to_vec()],
+            index: 0,
+        };
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            30,  // idle timeout = 30s (fallback — should NOT be needed)
+            100, // uplink_only (should NOT fire)
+            2,   // downlink_only = 2s (THIS should fire after remote EOF detected)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert!(!result.completed, "Should timeout, not complete normally");
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(2),
+            "Should wait at least downlink_only timeout"
+        );
+        // Key: should close at ~2s (half-close), NOT at ~30s (idle timeout).
+        // Bug: poll_write blocks poll_copy from reading remote EOF, so half-close
+        // timer never starts, and connection waits for idle timeout instead.
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(10),
+            "Should fire at half-close (~2s), not idle timeout (30s), elapsed={:?}",
             elapsed
         );
     }
