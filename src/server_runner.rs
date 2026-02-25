@@ -96,7 +96,7 @@ pub async fn accept_connection<S>(
     stream: S,
     peer_addr: std::net::SocketAddr,
     transport_type: TransportType,
-    network_settings: NetworkSettings,
+    network_settings: Arc<NetworkSettings>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -152,17 +152,19 @@ where
                 .max_message_size(Some(buf_size * 4)) // 4x buffer_size = 128KB (default 64MB)
                 .max_frame_size(Some(buf_size * 2)); // 2x buffer_size (default 16MB)
 
-            // WebSocket handshake with path validation and timeout
-            let ws_path = network_settings.ws_path.clone();
+            // WebSocket handshake with path validation and timeout.
+            // Capture Arc<NetworkSettings> in closure (atomic refcount increment)
+            // instead of cloning ws_path String (heap allocation).
+            let ns = Arc::clone(&network_settings);
             let ws_stream = tokio::time::timeout(
                 server.conn_config.request_timeout,
                 tokio_tungstenite::accept_hdr_async_with_config(
                     stream,
-                    |req: &Request, response: Response| {
+                    move |req: &Request, response: Response| {
                         let path = req.uri().path();
                         // For "/" or empty path, accept any path (Xray behavior)
-                        if !ws_path.is_empty() && ws_path != "/" && path != ws_path {
-                            log::debug!(path = %path, expected = %ws_path, "WebSocket path mismatch");
+                        if !ns.ws_path.is_empty() && ns.ws_path != "/" && path != ns.ws_path {
+                            log::debug!(path = %path, expected = %ns.ws_path, "WebSocket path mismatch");
                             let reject = http::Response::builder()
                                 .status(http::StatusCode::NOT_FOUND)
                                 .body(None)
@@ -240,11 +242,11 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
     let local_addr = listener.local_addr()?;
 
-    // Build network settings from config
-    let network_settings = NetworkSettings {
+    // Build network settings from config (Arc-wrapped to avoid per-connection String clones)
+    let network_settings = Arc::new(NetworkSettings {
         grpc_service_name: config.grpc_service_name.clone(),
         ws_path: config.ws_path.clone(),
-    };
+    });
 
     log::info!(
         address = %local_addr,
@@ -277,7 +279,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
 
                 let server = Arc::clone(&server);
                 let tls_acceptor = tls_acceptor.clone();
-                let network_settings = network_settings.clone();
+                let network_settings = Arc::clone(&network_settings);
 
                 tokio::spawn(async move {
                     // Hold permit for the lifetime of this connection
@@ -464,6 +466,29 @@ mod tests {
         // Configured path is empty → accept all (Xray behavior)
         assert!(!check_path("", "/anything"));
         assert!(!check_path("", ""));
+    }
+
+    /// Arc<NetworkSettings> clone is an atomic refcount increment (no heap allocation),
+    /// unlike NetworkSettings::clone() which clones two Strings per connection.
+    #[test]
+    fn test_network_settings_arc_clone_shares_data() {
+        use super::NetworkSettings;
+
+        let settings = Arc::new(NetworkSettings {
+            grpc_service_name: "trojan-grpc".to_string(),
+            ws_path: "/ws-secret-path".to_string(),
+        });
+
+        // Arc::clone only increments refcount — no String allocation
+        let cloned = Arc::clone(&settings);
+        assert!(Arc::ptr_eq(&settings, &cloned));
+        assert_eq!(cloned.grpc_service_name, "trojan-grpc");
+        assert_eq!(cloned.ws_path, "/ws-secret-path");
+
+        // Strong count reflects sharing
+        assert_eq!(Arc::strong_count(&settings), 2);
+        drop(cloned);
+        assert_eq!(Arc::strong_count(&settings), 1);
     }
 
     /// WS handshake must be wrapped in a timeout so that clients that complete
