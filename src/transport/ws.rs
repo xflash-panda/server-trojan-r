@@ -176,12 +176,13 @@ where
             self.closed = true;
             // Send WebSocket Close frame (best-effort, don't block on peer response)
             let me = &mut *self;
-            let sent = if let Poll::Ready(Ok(())) = Sink::poll_ready(Pin::new(&mut me.ws_stream), cx) {
-                let _ = Sink::start_send(Pin::new(&mut me.ws_stream), Message::Close(None));
-                true
-            } else {
-                false
-            };
+            let sent =
+                if let Poll::Ready(Ok(())) = Sink::poll_ready(Pin::new(&mut me.ws_stream), cx) {
+                    let _ = Sink::start_send(Pin::new(&mut me.ws_stream), Message::Close(None));
+                    true
+                } else {
+                    false
+                };
             tracing::info!(peer = %me.peer_addr, close_sent = sent, "WS shutdown");
         }
         // Don't wait for flush to complete - this avoids hanging on slow peers (realm)

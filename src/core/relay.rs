@@ -47,7 +47,9 @@ pub struct CopyResult {
     pub a_to_b: u64,
     /// Bytes transferred from B to A (download)
     pub b_to_a: u64,
-    /// Whether the copy completed normally (true) or timed out (false)
+    /// Whether the copy completed normally (true) or timed out (false).
+    /// Kept for test compatibility; production code uses `termination`.
+    #[allow(dead_code)]
     pub completed: bool,
     /// How the relay terminated (diagnostic)
     pub termination: RelayTermination,
