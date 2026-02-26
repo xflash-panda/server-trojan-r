@@ -178,7 +178,7 @@ where
             )
             .await
             .map_err(|_| anyhow!("WebSocket handshake timeout"))??;
-            let ws_transport = WebSocketTransport::new(ws_stream);
+            let ws_transport = WebSocketTransport::new(ws_stream, peer_addr);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
                 peer_addr,

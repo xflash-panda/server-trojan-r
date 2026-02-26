@@ -16,7 +16,31 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
-/// Result of bidirectional copy with traffic stats
+/// How the relay terminated
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayTermination {
+    /// Both directions completed normally (EOF + shutdown)
+    Completed,
+    /// Half-close timeout: one direction got EOF, other didn't finish in time
+    HalfCloseTimeout,
+    /// Idle timeout: no data transferred for idle_timeout_secs
+    IdleTimeout,
+    /// I/O error during relay
+    Error,
+}
+
+impl std::fmt::Display for RelayTermination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => f.write_str("completed"),
+            Self::HalfCloseTimeout => f.write_str("half_close_timeout"),
+            Self::IdleTimeout => f.write_str("idle_timeout"),
+            Self::Error => f.write_str("error"),
+        }
+    }
+}
+
+/// Result of bidirectional copy with traffic stats and diagnostic info
 #[derive(Debug, Clone, Copy)]
 pub struct CopyResult {
     /// Bytes transferred from A to B (upload)
@@ -25,6 +49,12 @@ pub struct CopyResult {
     pub b_to_a: u64,
     /// Whether the copy completed normally (true) or timed out (false)
     pub completed: bool,
+    /// How the relay terminated (diagnostic)
+    pub termination: RelayTermination,
+    /// Whether client (a) reader received EOF
+    pub client_eof: bool,
+    /// Whether remote (b) reader received EOF
+    pub remote_eof: bool,
 }
 
 /// Buffer for one direction of a bidirectional copy.
@@ -213,6 +243,8 @@ where
         idle_timeout_secs,
     )));
 
+    let mut termination = RelayTermination::Completed;
+
     let result: io::Result<bool> = std::future::poll_fn(|cx| {
         let bytes_before = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
 
@@ -220,7 +252,10 @@ where
         if !a_to_b.is_done() {
             match a_to_b.poll_copy(cx, Pin::new(&mut *a), Pin::new(&mut *b)) {
                 Poll::Ready(Ok(())) | Poll::Pending => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    termination = RelayTermination::Error;
+                    return Poll::Ready(Err(e));
+                }
             }
         }
 
@@ -228,7 +263,10 @@ where
         if !b_to_a.is_done() {
             match b_to_a.poll_copy(cx, Pin::new(&mut *b), Pin::new(&mut *a)) {
                 Poll::Ready(Ok(())) | Poll::Pending => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    termination = RelayTermination::Error;
+                    return Poll::Ready(Err(e));
+                }
             }
         }
 
@@ -261,18 +299,21 @@ where
 
         // Both directions done → completed normally
         if a_to_b.is_done() && b_to_a.is_done() {
+            termination = RelayTermination::Completed;
             return Poll::Ready(Ok(true));
         }
 
         // Half-close timeout
         if let Some(ref mut sleep) = half_close_deadline {
             if sleep.as_mut().poll(cx).is_ready() {
+                termination = RelayTermination::HalfCloseTimeout;
                 return Poll::Ready(Ok(false));
             }
         }
 
         // Idle timeout: fires precisely after idle_timeout_secs of inactivity
         if idle_deadline.as_mut().poll(cx).is_ready() {
+            termination = RelayTermination::IdleTimeout;
             return Poll::Ready(Ok(false));
         }
 
@@ -302,11 +343,17 @@ where
         }
     }
 
+    let client_eof = a_to_b.has_read_eof();
+    let remote_eof = b_to_a.has_read_eof();
+
     match result {
         Ok(completed) => Ok(CopyResult {
             a_to_b: a_to_b_bytes,
             b_to_a: b_to_a_bytes,
             completed,
+            termination,
+            client_eof,
+            remote_eof,
         }),
         Err(e) => Err(e),
     }
@@ -324,6 +371,9 @@ mod tests {
             a_to_b: 100,
             b_to_a: 200,
             completed: true,
+            termination: RelayTermination::Completed,
+            client_eof: true,
+            remote_eof: true,
         };
         let cloned = result;
         assert_eq!(cloned.a_to_b, 100);

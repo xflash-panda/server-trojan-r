@@ -12,6 +12,7 @@
 use bytes::Bytes;
 use futures_util::{Sink, Stream};
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -31,6 +32,7 @@ pub struct WebSocketTransport<S> {
     read_buffer: Bytes,
     read_pos: usize,
     closed: bool,
+    peer_addr: SocketAddr,
 }
 
 impl<S> WebSocketTransport<S>
@@ -38,12 +40,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     /// Create a new WebSocket transport from a WebSocket stream
-    pub fn new(ws_stream: TungsteniteStream<S>) -> Self {
+    pub fn new(ws_stream: TungsteniteStream<S>, peer_addr: SocketAddr) -> Self {
         Self {
             ws_stream,
             read_buffer: Bytes::new(),
             read_pos: 0,
             closed: false,
+            peer_addr,
         }
     }
 }
@@ -90,7 +93,18 @@ where
 
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(Ok(Message::Close(_))) | Some(Err(_))) => {
+            Poll::Ready(Some(Ok(Message::Close(frame)))) => {
+                tracing::info!(
+                    peer = %self.peer_addr,
+                    close_code = frame.as_ref().map(|f| f.code.into()).unwrap_or(0u16),
+                    close_reason = frame.as_ref().map(|f| f.reason.as_ref()).unwrap_or(""),
+                    "WS recv Close"
+                );
+                self.closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                tracing::info!(peer = %self.peer_addr, error = %e, "WS recv error");
                 self.closed = true;
                 Poll::Ready(Ok(()))
             }
@@ -100,6 +114,7 @@ where
                 Poll::Pending
             }
             Poll::Ready(None) => {
+                tracing::info!(peer = %self.peer_addr, "WS stream ended (None)");
                 self.closed = true;
                 Poll::Ready(Ok(()))
             }
@@ -161,9 +176,13 @@ where
             self.closed = true;
             // Send WebSocket Close frame (best-effort, don't block on peer response)
             let me = &mut *self;
-            if let Poll::Ready(Ok(())) = Sink::poll_ready(Pin::new(&mut me.ws_stream), cx) {
+            let sent = if let Poll::Ready(Ok(())) = Sink::poll_ready(Pin::new(&mut me.ws_stream), cx) {
                 let _ = Sink::start_send(Pin::new(&mut me.ws_stream), Message::Close(None));
-            }
+                true
+            } else {
+                false
+            };
+            tracing::info!(peer = %me.peer_addr, close_sent = sent, "WS shutdown");
         }
         // Don't wait for flush to complete - this avoids hanging on slow peers (realm)
         // during shutdown, which caused connection accumulation in high load scenarios.
