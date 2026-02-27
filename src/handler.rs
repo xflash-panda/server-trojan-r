@@ -238,7 +238,6 @@ impl<'a> ConnectContext<'a> {
         // Pass &mut so streams aren't moved into the future — this allows
         // graceful shutdown even when cancel_token drops the relay future.
         let stats = Arc::clone(&self.server.stats);
-        let relay_start = std::time::Instant::now();
         let relay_fut = copy_bidirectional_with_stats(
             &mut client_stream,
             &mut remote_stream,
@@ -251,35 +250,21 @@ impl<'a> ConnectContext<'a> {
 
         let cancelled = tokio::select! {
             result = relay_fut => {
-                let duration = relay_start.elapsed();
                 match result {
+                    Ok(r) if r.completed => {
+                        log::trace!(peer = %self.peer_addr, up = r.a_to_b, down = r.b_to_a, "Relay completed");
+                    }
                     Ok(r) => {
-                        log::info!(
-                            peer = %self.peer_addr,
-                            termination = %r.termination,
-                            client_eof = r.client_eof,
-                            remote_eof = r.remote_eof,
-                            up = r.a_to_b,
-                            down = r.b_to_a,
-                            duration_secs = duration.as_secs(),
-                            "Relay done"
-                        );
+                        log::debug!(peer = %self.peer_addr, up = r.a_to_b, down = r.b_to_a, "Connection timeout");
                     }
                     Err(e) => {
-                        log::info!(
-                            peer = %self.peer_addr,
-                            termination = "error",
-                            error = %e,
-                            duration_secs = duration.as_secs(),
-                            "Relay done"
-                        );
+                        log::debug!(peer = %self.peer_addr, error = %e, "Relay error");
                     }
                 }
                 false
             }
             _ = self.cancel_token.cancelled() => {
-                let duration = relay_start.elapsed();
-                log::info!(peer = %self.peer_addr, termination = "kicked", duration_secs = duration.as_secs(), "Relay done");
+                log::debug!(peer = %self.peer_addr, "Connection kicked");
                 true
             }
         };

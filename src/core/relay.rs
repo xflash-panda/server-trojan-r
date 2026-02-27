@@ -47,15 +47,16 @@ pub struct CopyResult {
     pub a_to_b: u64,
     /// Bytes transferred from B to A (download)
     pub b_to_a: u64,
-    /// Whether the copy completed normally (true) or timed out (false).
-    /// Kept for test compatibility; production code uses `termination`.
-    #[allow(dead_code)]
+    /// Whether the copy completed normally (true) or timed out (false)
     pub completed: bool,
-    /// How the relay terminated (diagnostic)
+    /// How the relay terminated (used by tests)
+    #[allow(dead_code)]
     pub termination: RelayTermination,
-    /// Whether client (a) reader received EOF
+    /// Whether client (a) reader received EOF (used by tests)
+    #[allow(dead_code)]
     pub client_eof: bool,
-    /// Whether remote (b) reader received EOF
+    /// Whether remote (b) reader received EOF (used by tests)
+    #[allow(dead_code)]
     pub remote_eof: bool,
 }
 
@@ -105,16 +106,19 @@ impl DirectionalBuffer {
         }
     }
 
+    #[inline]
     fn is_done(&self) -> bool {
         self.shutdown_done
     }
 
     /// Reader has received EOF (the peer closed their write side).
     /// This is true before shutdown completes — use for half-close timer.
+    #[inline]
     fn has_read_eof(&self) -> bool {
         self.read_done
     }
 
+    #[inline]
     fn bytes_transferred(&self) -> u64 {
         self.amt
     }
@@ -122,6 +126,7 @@ impl DirectionalBuffer {
     /// Whether flush succeeded during the last poll_copy call.
     /// True means data was confirmed sent to the TCP layer (reached the peer).
     /// False means data may be buffered in an intermediate layer (e.g., WS codec).
+    #[inline]
     fn has_flushed(&self) -> bool {
         self.flush_ok
     }
@@ -262,15 +267,22 @@ where
     let mut a_to_b = DirectionalBuffer::new(buffer_size);
     let mut b_to_a = DirectionalBuffer::new(buffer_size);
 
-    // Half-close deadline: set when one direction completes, fires after timeout
-    let mut half_close_deadline: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    // Pre-compute durations to avoid repeated conversion in the poll loop
+    let idle_timeout = tokio::time::Duration::from_secs(idle_timeout_secs);
+    let uplink_only_timeout = tokio::time::Duration::from_secs(uplink_only_secs);
+    let downlink_only_timeout = tokio::time::Duration::from_secs(downlink_only_secs);
+
+    // Half-close deadline: activated when one direction gets EOF, fires after timeout.
+    // Created upfront (stack-pinned) to avoid a Box::pin heap allocation per connection.
+    let half_close_sleep = tokio::time::sleep(tokio::time::Duration::ZERO);
+    tokio::pin!(half_close_sleep);
+    let mut half_close_active = false;
 
     // Idle timeout: single Sleep that resets on every data transfer.
     // Unlike interval(30s), this avoids waking active connections every 30s
     // and fires precisely at idle_timeout instead of ±30s granularity.
-    let mut idle_deadline = Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(
-        idle_timeout_secs,
-    )));
+    let idle_sleep = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
 
     let mut termination = RelayTermination::Completed;
 
@@ -306,17 +318,19 @@ where
         // poll_copy from returning Ready(Ok(())), and the half-close timer
         // was never set. Meanwhile the other direction kept transferring data,
         // resetting the idle timer — causing the connection to live forever.
-        if a_to_b.has_read_eof() && !b_to_a.is_done() && half_close_deadline.is_none() {
+        if a_to_b.has_read_eof() && !b_to_a.is_done() && !half_close_active {
             // Client closed (upload EOF) → use uplinkOnly timeout for remaining download
-            half_close_deadline = Some(Box::pin(tokio::time::sleep(
-                tokio::time::Duration::from_secs(uplink_only_secs),
-            )));
+            half_close_active = true;
+            half_close_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + uplink_only_timeout);
         }
-        if b_to_a.has_read_eof() && !a_to_b.is_done() && half_close_deadline.is_none() {
+        if b_to_a.has_read_eof() && !a_to_b.is_done() && !half_close_active {
             // Remote closed (download EOF) → use downlinkOnly timeout for remaining upload
-            half_close_deadline = Some(Box::pin(tokio::time::sleep(
-                tokio::time::Duration::from_secs(downlink_only_secs),
-            )));
+            half_close_active = true;
+            half_close_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + downlink_only_timeout);
         }
 
         // Reset idle deadline only when data is confirmed sent to the wire.
@@ -339,9 +353,9 @@ where
         let a_progress = a_to_b.bytes_transferred() > a_bytes_before && a_to_b.has_flushed();
         let b_progress = b_to_a.bytes_transferred() > b_bytes_before && b_to_a.has_flushed();
         if a_progress || b_progress {
-            idle_deadline.as_mut().reset(
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(idle_timeout_secs),
-            );
+            idle_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + idle_timeout);
         }
 
         // Both directions done → completed normally
@@ -351,15 +365,13 @@ where
         }
 
         // Half-close timeout
-        if let Some(ref mut sleep) = half_close_deadline {
-            if sleep.as_mut().poll(cx).is_ready() {
-                termination = RelayTermination::HalfCloseTimeout;
-                return Poll::Ready(Ok(false));
-            }
+        if half_close_active && half_close_sleep.as_mut().poll(cx).is_ready() {
+            termination = RelayTermination::HalfCloseTimeout;
+            return Poll::Ready(Ok(false));
         }
 
         // Idle timeout: fires precisely after idle_timeout_secs of inactivity
-        if idle_deadline.as_mut().poll(cx).is_ready() {
+        if idle_sleep.as_mut().poll(cx).is_ready() {
             termination = RelayTermination::IdleTimeout;
             return Poll::Ready(Ok(false));
         }
@@ -1469,6 +1481,92 @@ mod tests {
         assert!(
             elapsed < tokio::time::Duration::from_secs(30),
             "Should eventually idle-timeout after data stops, elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Verify that the pre-created half-close timer does not fire spuriously
+    /// when neither direction has received EOF.
+    ///
+    /// Regression test for stack-pin optimization: half_close_sleep is created
+    /// with Duration::ZERO (already expired) but gated by half_close_active flag.
+    /// If the flag check were missing, the expired timer would fire immediately
+    /// and the relay would terminate at ~0s instead of waiting for idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_timer_inactive_without_eof() {
+        // Both sides: read returns Pending (no data, no EOF)
+        let mut client = NeverEofSink;
+        let mut remote = NeverEofSink;
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            3,   // idle timeout = 3s (THIS should fire)
+            1,   // uplink_only = 1s (should NOT fire — no EOF)
+            1,   // downlink_only = 1s (should NOT fire — no EOF)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::IdleTimeout,
+            "Should terminate via idle timeout, not half-close"
+        );
+        // Key: should idle-timeout at 3s, NOT half-close at 0-1s.
+        // Without half_close_active guard, the pre-created Duration::ZERO timer
+        // would fire immediately → elapsed ≈ 0s.
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(3),
+            "Should wait for idle timeout (3s), not fire early, elapsed={:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(5),
+            "Should fire at idle timeout (~3s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Verify half-close timer fires correctly with zero-second timeout.
+    ///
+    /// Edge case for stack-pin optimization: the pre-created timer starts with
+    /// Duration::ZERO, then gets reset to (now + 0s) on EOF detection.
+    /// Tests that reset with zero duration works correctly and doesn't confuse
+    /// the "already expired" initial state with the "just activated" state.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_zero_timeout_fires_immediately() {
+        let mut client = Cursor::new(b"data".to_vec()); // Client sends data then EOF
+        let mut remote = NeverEofSink; // Remote never sends EOF
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout = high (should NOT fire)
+            0,   // uplink_only = 0s (immediate after client EOF)
+            300, // downlink_only = high (should NOT fire)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::HalfCloseTimeout,
+            "Should terminate via half-close timeout"
+        );
+        assert!(result.client_eof, "Client should have sent EOF");
+        // With 0s timeout, should fire essentially immediately after client EOF
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(1),
+            "Zero-second half-close should fire immediately, elapsed={:?}",
             elapsed
         );
     }
