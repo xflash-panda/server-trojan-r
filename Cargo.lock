@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "server-trojan-r"
-version = "0.2.10+debug.2"
+version = "0.2.10+debug.3"
 dependencies = [
  "acl-engine-r",
  "anyhow",
