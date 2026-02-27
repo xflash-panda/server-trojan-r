@@ -1,6 +1,6 @@
 [package]
 name = "server-trojan-r"
-version = "0.2.10+debug.3"
+version = "0.2.11"
 edition = "2021"
 
 [dependencies]
@@ -23,14 +23,12 @@ serde_yaml = "0.9"
 toml = "1.0"
 tonic = "0.14"
 tokio-stream = "0.1.18"
-futures = "0.3.32"
 h2 = "0.4.13"
 http = "1.4.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["tracing-log", "std", "local-time", "fmt", "ansi"] }
 time = { version = "0.3", features = ["macros", "local-offset"] }
-pin-project-lite = "0.2"
 tokio-util = "0.7"
 scopeguard = "1.2.0"
 dashmap = "6.1"
