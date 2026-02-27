@@ -117,8 +117,20 @@ impl ConnectionManager {
         kicked
     }
 
+    /// Cancel all active connections (for graceful shutdown).
+    ///
+    /// Returns the number of connections cancelled. Each cancelled connection
+    /// will send a WS Close frame and TCP FIN before being dropped.
+    pub fn cancel_all(&self) -> usize {
+        let mut cancelled = 0;
+        for entry in self.connections.iter() {
+            entry.value().cancel_token.cancel();
+            cancelled += 1;
+        }
+        cancelled
+    }
+
     /// Get the number of active connections
-    #[allow(dead_code)]
     pub fn connection_count(&self) -> usize {
         self.connections.len()
     }
@@ -321,6 +333,85 @@ mod tests {
             assert_eq!(manager.connection_count(), 0);
             assert_eq!(manager.user_count(), 0);
         }
+    }
+
+    #[test]
+    fn test_connection_manager_cancel_all() {
+        let manager = ConnectionManager::new();
+        let (_, token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+        let (_, token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
+        let (_, token3) = manager.register(2, "127.0.0.1:1236".parse().unwrap());
+
+        assert!(!token1.is_cancelled());
+        assert!(!token2.is_cancelled());
+        assert!(!token3.is_cancelled());
+
+        let cancelled = manager.cancel_all();
+        assert_eq!(cancelled, 3);
+        assert!(token1.is_cancelled());
+        assert!(token2.is_cancelled());
+        assert!(token3.is_cancelled());
+    }
+
+    /// Regression test: shutdown without cancel_all leaves connections alive,
+    /// causing realm to receive RST instead of WS Close + TCP FIN on restart.
+    ///
+    /// RED:   Without cancel_all, handlers block on cancel_token → connections never drain
+    /// GREEN: With cancel_all + drain loop, all connections clean up within the deadline
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_without_cancel_all_leaves_connections_undrained() {
+        use std::time::Duration;
+
+        let manager = ConnectionManager::new();
+
+        // Spawn 100 handlers that mimic real handler.rs behavior:
+        //   wait on cancel_token → stream shutdown → scopeguard unregister
+        for i in 0..100i64 {
+            let m = manager.clone();
+            let (conn_id, cancel_token) = manager.register(
+                i % 10,
+                SocketAddr::from(([127, 0, 0, 1], (1000 + i) as u16)),
+            );
+            tokio::spawn(async move {
+                // Relay phase: blocked until cancelled
+                cancel_token.cancelled().await;
+                // Simulate WS Close + TCP FIN (handler.rs SHUTDOWN_TIMEOUT)
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                // scopeguard: unregister
+                m.unregister(conn_id);
+            });
+        }
+
+        assert_eq!(manager.connection_count(), 100);
+
+        // RED: old shutdown — no cancel_all, just wait.
+        // Handlers are blocked on cancel_token, nothing drains.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            manager.connection_count(),
+            100,
+            "BUG: without cancel_all, connections stay alive → realm gets RST on exit"
+        );
+
+        // GREEN: new shutdown — cancel_all + drain loop (mirrors main.rs).
+        let cancelled = manager.cancel_all();
+        assert_eq!(cancelled, 100);
+
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = manager.connection_count();
+            if remaining == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < drain_deadline,
+                "Drain timeout: {remaining} connections remaining"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(manager.connection_count(), 0);
+        assert_eq!(manager.user_count(), 0);
     }
 
     /// Test that high-contention concurrent register/unregister for the SAME user
