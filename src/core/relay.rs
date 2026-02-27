@@ -85,6 +85,11 @@ struct DirectionalBuffer {
     read_done: bool,
     /// Writer shutdown complete — this direction is fully done
     shutdown_done: bool,
+    /// Whether flush succeeded during the last poll_copy call.
+    /// Used to distinguish data actually sent to the peer (flushed) from data
+    /// merely buffered in an intermediate layer (e.g., tungstenite's WS write buffer).
+    /// The idle timer should only reset when data reaches the wire, not when it's buffered.
+    flush_ok: bool,
 }
 
 impl DirectionalBuffer {
@@ -96,6 +101,7 @@ impl DirectionalBuffer {
             amt: 0,
             read_done: false,
             shutdown_done: false,
+            flush_ok: false,
         }
     }
 
@@ -113,6 +119,13 @@ impl DirectionalBuffer {
         self.amt
     }
 
+    /// Whether flush succeeded during the last poll_copy call.
+    /// True means data was confirmed sent to the TCP layer (reached the peer).
+    /// False means data may be buffered in an intermediate layer (e.g., WS codec).
+    fn has_flushed(&self) -> bool {
+        self.flush_ok
+    }
+
     /// Try to make maximum progress on this direction.
     ///
     /// Returns:
@@ -128,6 +141,11 @@ impl DirectionalBuffer {
         if self.shutdown_done {
             return Poll::Ready(Ok(()));
         }
+
+        // Reset flush flag each call; set sticky-true when flush succeeds.
+        // This tracks whether ANY data was confirmed sent to the wire during
+        // this poll_copy invocation.
+        self.flush_ok = false;
 
         loop {
             // Step 1: Write buffered data
@@ -182,8 +200,17 @@ impl DirectionalBuffer {
             // Non-blocking: if peer is slow (Pending), continue to read for EOF detection.
             // For direct connections, flush succeeds immediately, delivering data promptly.
             // For realm connections, flush may Pending — data delivered when peer catches up.
-            if let Poll::Ready(Err(e)) = writer.as_mut().poll_flush(cx) {
-                return Poll::Ready(Err(e));
+            //
+            // Track flush result: Ready(Ok(())) means data reached the TCP layer.
+            // Pending means data is still in an intermediate buffer (e.g., tungstenite).
+            // The idle timer only resets on confirmed flush — prevents zombie connections
+            // where writes succeed into a buffer but never reach the peer (v0.2.10 fix).
+            match writer.as_mut().poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.flush_ok = true; // sticky: stays true for this poll_copy call
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {} // data buffered but not sent; don't set flush_ok
             }
 
             // Step 3: If reader hit EOF, shutdown writer
@@ -248,7 +275,8 @@ where
     let mut termination = RelayTermination::Completed;
 
     let result: io::Result<bool> = std::future::poll_fn(|cx| {
-        let bytes_before = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
+        let a_bytes_before = a_to_b.bytes_transferred();
+        let b_bytes_before = b_to_a.bytes_transferred();
 
         // Poll a→b (upload: read from client, write to remote)
         if !a_to_b.is_done() {
@@ -291,9 +319,26 @@ where
             )));
         }
 
-        // Reset idle deadline on data activity
-        let bytes_after = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
-        if bytes_after > bytes_before {
+        // Reset idle deadline only when data is confirmed sent to the wire.
+        //
+        // Bug fix (v0.2.10): Previously, the idle timer reset on any bytes_transferred
+        // increase — but poll_write on WS returns Ok(n) when data enters tungstenite's
+        // internal buffer, NOT when it reaches the TCP layer. With realm in front:
+        //   target sends data → WS poll_write Ok (buffered in tungstenite) → amt++ → timer reset!
+        //   BUT flush Pending (realm not reading) → data never reaches peer
+        // This caused zombie connections: tungstenite's 64KB buffer absorbed writes,
+        // keeping the idle timer alive indefinitely. Realm occasionally draining small
+        // amounts reopened the buffer, restarting the cycle.
+        //
+        // Fix: only reset idle timer when BOTH conditions are true:
+        //   1. New bytes were written (bytes_transferred increased)
+        //   2. Flush succeeded (data confirmed sent to TCP layer)
+        // For direct connections, flush always succeeds → no behavior change.
+        // For realm connections, flush Pending when peer is slow → timer not reset →
+        // zombie connections correctly time out.
+        let a_progress = a_to_b.bytes_transferred() > a_bytes_before && a_to_b.has_flushed();
+        let b_progress = b_to_a.bytes_transferred() > b_bytes_before && b_to_a.has_flushed();
+        if a_progress || b_progress {
             idle_deadline.as_mut().reset(
                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(idle_timeout_secs),
             );
@@ -1271,6 +1316,159 @@ mod tests {
         assert!(
             elapsed < tokio::time::Duration::from_secs(10),
             "Should fire at half-close (~2s), not idle timeout (30s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Regression test (v0.2.10): idle timer must NOT reset when data is written to
+    /// an intermediate buffer but never flushed to the wire.
+    ///
+    /// Scenario (realm connection leak):
+    ///   target sends response every 1s → relay writes to client WS (poll_write Ok,
+    ///   data enters tungstenite's 64KB buffer) → amt increases → BUT flush Pending
+    ///   (realm not reading) → data never reaches the peer.
+    ///
+    /// Before fix: idle timer reset on bytes_transferred increase alone, so the
+    /// connection lived forever — tungstenite's buffer absorbed writes, keeping the
+    /// timer alive even though no data was delivered. With realm occasionally draining
+    /// small amounts, the cycle repeated indefinitely, causing 54k+ zombie connections.
+    ///
+    /// After fix: idle timer only resets when flush succeeds (data confirmed on wire).
+    /// Buffered-only writes do NOT reset the timer → connection correctly times out.
+    ///
+    /// Red/green: without `has_flushed()` check, the 20 periodic writes (at 1s intervals)
+    /// keep resetting the idle timer → relay terminates at ~25s instead of ~5s.
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timer_not_reset_by_buffered_writes() {
+        use tokio::io::AsyncWriteExt;
+
+        // Client (a): accepts writes into buffer, flush never completes (realm blocking).
+        // Read returns Pending (client not sending any data).
+        let mut client = FlushHangsStream {
+            read_data: None, // no client data → poll_read always Pending
+        };
+
+        // Remote (b): sends data every 1s via a spawned task, simulating a target
+        // server streaming response data through realm. Uses DuplexStream so the
+        // relay sees real AsyncRead/AsyncWrite with proper waker behavior.
+        let (mut test_writer, mut relay_remote) = tokio::io::duplex(4096);
+
+        let sender = tokio::spawn(async move {
+            // Send 20 chunks at 1s intervals — enough to keep resetting the idle timer
+            // well past 5s if the bug exists (unflushed writes reset timer).
+            for _ in 0..20 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if test_writer.write_all(b"response-data").await.is_err() {
+                    break; // relay closed
+                }
+            }
+            // Keep connection open (no EOF) — will be aborted when test ends
+            std::future::pending::<()>().await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut relay_remote,
+            5,   // idle timeout = 5s (THIS should fire — flush never succeeds)
+            100, // uplink_only (should NOT fire — no client EOF)
+            100, // downlink_only (should NOT fire — no remote EOF)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        sender.abort();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::IdleTimeout,
+            "Should terminate via idle timeout"
+        );
+        assert!(
+            result.b_to_a > 0,
+            "Data should have been written (buffered)"
+        );
+        assert!(!result.client_eof, "Client did not send EOF");
+        assert!(!result.remote_eof, "Remote did not send EOF");
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(5),
+            "Should wait at least idle timeout (5s)"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(7),
+            "Should fire at idle timeout (~5s), not be kept alive by buffered writes, elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Companion test (v0.2.10): direct connection (flush succeeds) → idle timer
+    /// SHOULD reset on data activity, keeping the connection alive.
+    ///
+    /// Ensures the has_flushed() guard doesn't break direct-connect behavior.
+    /// Without realm, poll_flush returns Ready(Ok(())) → flush_ok=true → timer resets.
+    ///
+    /// Red/green: always green — passes both with and without has_flushed() check,
+    /// since flush succeeds and both code paths reset the timer.
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timer_resets_on_flushed_writes() {
+        use tokio::io::AsyncWriteExt;
+
+        // Client (a): flush succeeds (direct connection, no realm).
+        // Read returns Pending (no client data).
+        let mut client = PersistentRemote {
+            response: None, // read=Pending, write=Ok, flush=Ok
+        };
+
+        // Remote (b): sends data every 2s for 10 rounds (t=0,2,...18) via DuplexStream.
+        // Flush succeeds → timer resets each send → connection alive until t=23s.
+        let (mut test_writer, mut relay_remote) = tokio::io::duplex(4096);
+
+        let sender = tokio::spawn(async move {
+            for i in 0..10 {
+                if i > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+                if test_writer.write_all(b"flushed-data").await.is_err() {
+                    break;
+                }
+            }
+            // Keep connection open (no EOF)
+            std::future::pending::<()>().await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut relay_remote,
+            5,   // idle timeout = 5s — but flushed writes keep resetting it
+            100, // uplink_only
+            100, // downlink_only
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        sender.abort();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::IdleTimeout,
+            "Should terminate via idle timeout after data stops"
+        );
+        // Data flows until t=18, then 5s idle → terminates at ~t=23s.
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(20),
+            "Direct connection: flushed writes should keep idle timer alive, elapsed={:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(30),
+            "Should eventually idle-timeout after data stops, elapsed={:?}",
             elapsed
         );
     }
