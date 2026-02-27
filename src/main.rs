@@ -90,6 +90,9 @@ async fn main() -> Result<()> {
     // Build connection config from CLI args
     let conn_config = config::ConnConfig::from_cli(&cli);
 
+    // Clone conn_manager before moving into Server (for graceful shutdown)
+    let conn_manager_for_shutdown = conn_manager.clone();
+
     // Build server using the builder pattern
     let server = Arc::new(
         Server::builder()
@@ -167,9 +170,32 @@ async fn main() -> Result<()> {
     // Graceful shutdown sequence
     log::info!("Server stopped, performing graceful shutdown...");
 
+    // Cancel all active connections so they send WS Close + TCP FIN to realm,
+    // instead of being force-dropped (RST) when the runtime exits.
+    // This prevents realm from holding stale connections and reduces thundering
+    // herd on restart (realm closes client connections cleanly → clients reconnect
+    // more gradually instead of all timing out simultaneously).
+    let cancelled = conn_manager_for_shutdown.cancel_all();
+    if cancelled > 0 {
+        log::info!("Cancelled {cancelled} connections, draining...");
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = conn_manager_for_shutdown.connection_count();
+            if remaining == 0 {
+                log::info!("All connections drained");
+                break;
+            }
+            if tokio::time::Instant::now() >= drain_deadline {
+                log::warn!("{remaining} connections remaining after drain timeout");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     // Wait for shutdown handler to complete and get api_manager
     if let Ok(api_for_shutdown) = shutdown_handle.await {
-        // Shutdown background tasks first (ensures final traffic report is sent)
+        // Shutdown background tasks after drain (final traffic report includes drained traffic)
         background_handle.shutdown().await;
 
         // Unregister node
