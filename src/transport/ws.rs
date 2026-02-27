@@ -76,34 +76,36 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // Read directly from WebSocket stream
-        match Stream::poll_next(Pin::new(&mut self.ws_stream), cx) {
-            Poll::Ready(Some(Ok(Message::Binary(data)))) => {
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
+        // Read from WebSocket stream, looping to skip non-binary messages (Ping/Pong/Text)
+        // without returning Pending + wake_by_ref (which causes a spurious poll cycle).
+        loop {
+            return match Stream::poll_next(Pin::new(&mut self.ws_stream), cx) {
+                Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                    let to_copy = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..to_copy]);
 
-                if to_copy < data.len() {
-                    // Zero-copy slice
-                    self.read_buffer = data.slice(to_copy..);
-                    self.read_pos = 0;
+                    if to_copy < data.len() {
+                        // Zero-copy slice
+                        self.read_buffer = data.slice(to_copy..);
+                        self.read_pos = 0;
+                    }
+
+                    Poll::Ready(Ok(()))
                 }
-
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ok(Message::Close(_))) | Some(Err(_))) => {
-                self.closed = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ok(_))) => {
-                // Skip non-binary messages
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(None) => {
-                self.closed = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Ok(Message::Close(_))) | Some(Err(_))) => {
+                    self.closed = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Some(Ok(_))) => {
+                    // Skip non-binary messages, poll again immediately
+                    continue;
+                }
+                Poll::Ready(None) => {
+                    self.closed = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            };
         }
     }
 }
@@ -194,5 +196,107 @@ mod tests {
     fn test_websocket_transport_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<WebSocketTransport<tokio::io::DuplexStream>>();
+    }
+
+    /// Helper: create a connected (client_ws, server_transport) pair over DuplexStream.
+    async fn ws_pair() -> (
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        WebSocketTransport<tokio::io::DuplexStream>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (client_ws, server_ws) = tokio::join!(
+            async {
+                tokio_tungstenite::client_async("ws://localhost/", client_io)
+                    .await
+                    .unwrap()
+                    .0
+            },
+            async { tokio_tungstenite::accept_async(server_io).await.unwrap() },
+        );
+        (client_ws, WebSocketTransport::new(server_ws))
+    }
+
+    /// Verify that poll_read skips a Text message and returns the following
+    /// Binary message data.
+    ///
+    /// Regression test for loop optimization: replaced wake_by_ref() + Pending
+    /// with a loop that continues past non-binary messages. If the loop were
+    /// broken (e.g. returning Pending without re-polling), this test would hang.
+    #[tokio::test]
+    async fn test_poll_read_skips_text_message() {
+        use futures_util::SinkExt;
+        use tokio::io::AsyncReadExt;
+
+        let (mut client_ws, mut transport) = ws_pair().await;
+
+        // Client sends: Text (should be skipped) → Binary (should be read)
+        client_ws
+            .send(Message::Text("skip me".into()))
+            .await
+            .unwrap();
+        client_ws
+            .send(Message::Binary(Bytes::from_static(b"real data")))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = transport.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"real data",
+            "Should skip Text and return Binary"
+        );
+    }
+
+    /// Verify that poll_read skips multiple consecutive non-binary messages
+    /// before returning Binary data.
+    ///
+    /// Tests the loop handles repeated non-binary messages without spinning
+    /// or dropping data.
+    #[tokio::test]
+    async fn test_poll_read_skips_consecutive_non_binary_messages() {
+        use futures_util::SinkExt;
+        use tokio::io::AsyncReadExt;
+
+        let (mut client_ws, mut transport) = ws_pair().await;
+
+        // Client sends: Text, Text, Ping → then Binary
+        client_ws.send(Message::Text("msg1".into())).await.unwrap();
+        client_ws.send(Message::Text("msg2".into())).await.unwrap();
+        client_ws
+            .send(Message::Ping(Bytes::from_static(b"ping")))
+            .await
+            .unwrap();
+        client_ws
+            .send(Message::Binary(Bytes::from_static(b"payload")))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = transport.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"payload",
+            "Should skip all non-binary messages and return Binary"
+        );
+    }
+
+    /// Verify that Close message after non-binary messages is handled correctly.
+    ///
+    /// Tests: Text → Close → read should return 0 bytes (EOF).
+    #[tokio::test]
+    async fn test_poll_read_close_after_non_binary() {
+        use futures_util::SinkExt;
+        use tokio::io::AsyncReadExt;
+
+        let (mut client_ws, mut transport) = ws_pair().await;
+
+        // Client sends: Text → Close
+        client_ws.send(Message::Text("skip".into())).await.unwrap();
+        client_ws.send(Message::Close(None)).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = transport.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "Close after non-binary should return EOF (0 bytes)");
     }
 }

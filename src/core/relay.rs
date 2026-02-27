@@ -16,7 +16,31 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::hooks::{StatsCollector, UserId};
 use std::sync::Arc;
 
-/// Result of bidirectional copy with traffic stats
+/// How the relay terminated
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayTermination {
+    /// Both directions completed normally (EOF + shutdown)
+    Completed,
+    /// Half-close timeout: one direction got EOF, other didn't finish in time
+    HalfCloseTimeout,
+    /// Idle timeout: no data transferred for idle_timeout_secs
+    IdleTimeout,
+    /// I/O error during relay
+    Error,
+}
+
+impl std::fmt::Display for RelayTermination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Completed => f.write_str("completed"),
+            Self::HalfCloseTimeout => f.write_str("half_close_timeout"),
+            Self::IdleTimeout => f.write_str("idle_timeout"),
+            Self::Error => f.write_str("error"),
+        }
+    }
+}
+
+/// Result of bidirectional copy with traffic stats and diagnostic info
 #[derive(Debug, Clone, Copy)]
 pub struct CopyResult {
     /// Bytes transferred from A to B (upload)
@@ -25,6 +49,15 @@ pub struct CopyResult {
     pub b_to_a: u64,
     /// Whether the copy completed normally (true) or timed out (false)
     pub completed: bool,
+    /// How the relay terminated (used by tests)
+    #[allow(dead_code)]
+    pub termination: RelayTermination,
+    /// Whether client (a) reader received EOF (used by tests)
+    #[allow(dead_code)]
+    pub client_eof: bool,
+    /// Whether remote (b) reader received EOF (used by tests)
+    #[allow(dead_code)]
+    pub remote_eof: bool,
 }
 
 /// Buffer for one direction of a bidirectional copy.
@@ -53,6 +86,11 @@ struct DirectionalBuffer {
     read_done: bool,
     /// Writer shutdown complete — this direction is fully done
     shutdown_done: bool,
+    /// Whether flush succeeded during the last poll_copy call.
+    /// Used to distinguish data actually sent to the peer (flushed) from data
+    /// merely buffered in an intermediate layer (e.g., tungstenite's WS write buffer).
+    /// The idle timer should only reset when data reaches the wire, not when it's buffered.
+    flush_ok: bool,
 }
 
 impl DirectionalBuffer {
@@ -64,21 +102,33 @@ impl DirectionalBuffer {
             amt: 0,
             read_done: false,
             shutdown_done: false,
+            flush_ok: false,
         }
     }
 
+    #[inline]
     fn is_done(&self) -> bool {
         self.shutdown_done
     }
 
     /// Reader has received EOF (the peer closed their write side).
     /// This is true before shutdown completes — use for half-close timer.
+    #[inline]
     fn has_read_eof(&self) -> bool {
         self.read_done
     }
 
+    #[inline]
     fn bytes_transferred(&self) -> u64 {
         self.amt
+    }
+
+    /// Whether flush succeeded during the last poll_copy call.
+    /// True means data was confirmed sent to the TCP layer (reached the peer).
+    /// False means data may be buffered in an intermediate layer (e.g., WS codec).
+    #[inline]
+    fn has_flushed(&self) -> bool {
+        self.flush_ok
     }
 
     /// Try to make maximum progress on this direction.
@@ -96,6 +146,11 @@ impl DirectionalBuffer {
         if self.shutdown_done {
             return Poll::Ready(Ok(()));
         }
+
+        // Reset flush flag each call; set sticky-true when flush succeeds.
+        // This tracks whether ANY data was confirmed sent to the wire during
+        // this poll_copy invocation.
+        self.flush_ok = false;
 
         loop {
             // Step 1: Write buffered data
@@ -150,8 +205,17 @@ impl DirectionalBuffer {
             // Non-blocking: if peer is slow (Pending), continue to read for EOF detection.
             // For direct connections, flush succeeds immediately, delivering data promptly.
             // For realm connections, flush may Pending — data delivered when peer catches up.
-            if let Poll::Ready(Err(e)) = writer.as_mut().poll_flush(cx) {
-                return Poll::Ready(Err(e));
+            //
+            // Track flush result: Ready(Ok(())) means data reached the TCP layer.
+            // Pending means data is still in an intermediate buffer (e.g., tungstenite).
+            // The idle timer only resets on confirmed flush — prevents zombie connections
+            // where writes succeed into a buffer but never reach the peer (v0.2.10 fix).
+            match writer.as_mut().poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.flush_ok = true; // sticky: stays true for this poll_copy call
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {} // data buffered but not sent; don't set flush_ok
             }
 
             // Step 3: If reader hit EOF, shutdown writer
@@ -203,24 +267,37 @@ where
     let mut a_to_b = DirectionalBuffer::new(buffer_size);
     let mut b_to_a = DirectionalBuffer::new(buffer_size);
 
-    // Half-close deadline: set when one direction completes, fires after timeout
-    let mut half_close_deadline: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    // Pre-compute durations to avoid repeated conversion in the poll loop
+    let idle_timeout = tokio::time::Duration::from_secs(idle_timeout_secs);
+    let uplink_only_timeout = tokio::time::Duration::from_secs(uplink_only_secs);
+    let downlink_only_timeout = tokio::time::Duration::from_secs(downlink_only_secs);
+
+    // Half-close deadline: activated when one direction gets EOF, fires after timeout.
+    // Created upfront (stack-pinned) to avoid a Box::pin heap allocation per connection.
+    let half_close_sleep = tokio::time::sleep(tokio::time::Duration::ZERO);
+    tokio::pin!(half_close_sleep);
+    let mut half_close_active = false;
 
     // Idle timeout: single Sleep that resets on every data transfer.
     // Unlike interval(30s), this avoids waking active connections every 30s
     // and fires precisely at idle_timeout instead of ±30s granularity.
-    let mut idle_deadline = Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(
-        idle_timeout_secs,
-    )));
+    let idle_sleep = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
+
+    let mut termination = RelayTermination::Completed;
 
     let result: io::Result<bool> = std::future::poll_fn(|cx| {
-        let bytes_before = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
+        let a_bytes_before = a_to_b.bytes_transferred();
+        let b_bytes_before = b_to_a.bytes_transferred();
 
         // Poll a→b (upload: read from client, write to remote)
         if !a_to_b.is_done() {
             match a_to_b.poll_copy(cx, Pin::new(&mut *a), Pin::new(&mut *b)) {
                 Poll::Ready(Ok(())) | Poll::Pending => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    termination = RelayTermination::Error;
+                    return Poll::Ready(Err(e));
+                }
             }
         }
 
@@ -228,7 +305,10 @@ where
         if !b_to_a.is_done() {
             match b_to_a.poll_copy(cx, Pin::new(&mut *b), Pin::new(&mut *a)) {
                 Poll::Ready(Ok(())) | Poll::Pending => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    termination = RelayTermination::Error;
+                    return Poll::Ready(Err(e));
+                }
             }
         }
 
@@ -238,41 +318,61 @@ where
         // poll_copy from returning Ready(Ok(())), and the half-close timer
         // was never set. Meanwhile the other direction kept transferring data,
         // resetting the idle timer — causing the connection to live forever.
-        if a_to_b.has_read_eof() && !b_to_a.is_done() && half_close_deadline.is_none() {
+        if a_to_b.has_read_eof() && !b_to_a.is_done() && !half_close_active {
             // Client closed (upload EOF) → use uplinkOnly timeout for remaining download
-            half_close_deadline = Some(Box::pin(tokio::time::sleep(
-                tokio::time::Duration::from_secs(uplink_only_secs),
-            )));
+            half_close_active = true;
+            half_close_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + uplink_only_timeout);
         }
-        if b_to_a.has_read_eof() && !a_to_b.is_done() && half_close_deadline.is_none() {
+        if b_to_a.has_read_eof() && !a_to_b.is_done() && !half_close_active {
             // Remote closed (download EOF) → use downlinkOnly timeout for remaining upload
-            half_close_deadline = Some(Box::pin(tokio::time::sleep(
-                tokio::time::Duration::from_secs(downlink_only_secs),
-            )));
+            half_close_active = true;
+            half_close_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + downlink_only_timeout);
         }
 
-        // Reset idle deadline on data activity
-        let bytes_after = a_to_b.bytes_transferred() + b_to_a.bytes_transferred();
-        if bytes_after > bytes_before {
-            idle_deadline.as_mut().reset(
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(idle_timeout_secs),
-            );
+        // Reset idle deadline only when data is confirmed sent to the wire.
+        //
+        // Bug fix (v0.2.10): Previously, the idle timer reset on any bytes_transferred
+        // increase — but poll_write on WS returns Ok(n) when data enters tungstenite's
+        // internal buffer, NOT when it reaches the TCP layer. With realm in front:
+        //   target sends data → WS poll_write Ok (buffered in tungstenite) → amt++ → timer reset!
+        //   BUT flush Pending (realm not reading) → data never reaches peer
+        // This caused zombie connections: tungstenite's 64KB buffer absorbed writes,
+        // keeping the idle timer alive indefinitely. Realm occasionally draining small
+        // amounts reopened the buffer, restarting the cycle.
+        //
+        // Fix: only reset idle timer when BOTH conditions are true:
+        //   1. New bytes were written (bytes_transferred increased)
+        //   2. Flush succeeded (data confirmed sent to TCP layer)
+        // For direct connections, flush always succeeds → no behavior change.
+        // For realm connections, flush Pending when peer is slow → timer not reset →
+        // zombie connections correctly time out.
+        let a_progress = a_to_b.bytes_transferred() > a_bytes_before && a_to_b.has_flushed();
+        let b_progress = b_to_a.bytes_transferred() > b_bytes_before && b_to_a.has_flushed();
+        if a_progress || b_progress {
+            idle_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + idle_timeout);
         }
 
         // Both directions done → completed normally
         if a_to_b.is_done() && b_to_a.is_done() {
+            termination = RelayTermination::Completed;
             return Poll::Ready(Ok(true));
         }
 
         // Half-close timeout
-        if let Some(ref mut sleep) = half_close_deadline {
-            if sleep.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Ok(false));
-            }
+        if half_close_active && half_close_sleep.as_mut().poll(cx).is_ready() {
+            termination = RelayTermination::HalfCloseTimeout;
+            return Poll::Ready(Ok(false));
         }
 
         // Idle timeout: fires precisely after idle_timeout_secs of inactivity
-        if idle_deadline.as_mut().poll(cx).is_ready() {
+        if idle_sleep.as_mut().poll(cx).is_ready() {
+            termination = RelayTermination::IdleTimeout;
             return Poll::Ready(Ok(false));
         }
 
@@ -302,11 +402,17 @@ where
         }
     }
 
+    let client_eof = a_to_b.has_read_eof();
+    let remote_eof = b_to_a.has_read_eof();
+
     match result {
         Ok(completed) => Ok(CopyResult {
             a_to_b: a_to_b_bytes,
             b_to_a: b_to_a_bytes,
             completed,
+            termination,
+            client_eof,
+            remote_eof,
         }),
         Err(e) => Err(e),
     }
@@ -324,6 +430,9 @@ mod tests {
             a_to_b: 100,
             b_to_a: 200,
             completed: true,
+            termination: RelayTermination::Completed,
+            client_eof: true,
+            remote_eof: true,
         };
         let cloned = result;
         assert_eq!(cloned.a_to_b, 100);
@@ -1219,6 +1328,245 @@ mod tests {
         assert!(
             elapsed < tokio::time::Duration::from_secs(10),
             "Should fire at half-close (~2s), not idle timeout (30s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Regression test (v0.2.10): idle timer must NOT reset when data is written to
+    /// an intermediate buffer but never flushed to the wire.
+    ///
+    /// Scenario (realm connection leak):
+    ///   target sends response every 1s → relay writes to client WS (poll_write Ok,
+    ///   data enters tungstenite's 64KB buffer) → amt increases → BUT flush Pending
+    ///   (realm not reading) → data never reaches the peer.
+    ///
+    /// Before fix: idle timer reset on bytes_transferred increase alone, so the
+    /// connection lived forever — tungstenite's buffer absorbed writes, keeping the
+    /// timer alive even though no data was delivered. With realm occasionally draining
+    /// small amounts, the cycle repeated indefinitely, causing 54k+ zombie connections.
+    ///
+    /// After fix: idle timer only resets when flush succeeds (data confirmed on wire).
+    /// Buffered-only writes do NOT reset the timer → connection correctly times out.
+    ///
+    /// Red/green: without `has_flushed()` check, the 20 periodic writes (at 1s intervals)
+    /// keep resetting the idle timer → relay terminates at ~25s instead of ~5s.
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timer_not_reset_by_buffered_writes() {
+        use tokio::io::AsyncWriteExt;
+
+        // Client (a): accepts writes into buffer, flush never completes (realm blocking).
+        // Read returns Pending (client not sending any data).
+        let mut client = FlushHangsStream {
+            read_data: None, // no client data → poll_read always Pending
+        };
+
+        // Remote (b): sends data every 1s via a spawned task, simulating a target
+        // server streaming response data through realm. Uses DuplexStream so the
+        // relay sees real AsyncRead/AsyncWrite with proper waker behavior.
+        let (mut test_writer, mut relay_remote) = tokio::io::duplex(4096);
+
+        let sender = tokio::spawn(async move {
+            // Send 20 chunks at 1s intervals — enough to keep resetting the idle timer
+            // well past 5s if the bug exists (unflushed writes reset timer).
+            for _ in 0..20 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if test_writer.write_all(b"response-data").await.is_err() {
+                    break; // relay closed
+                }
+            }
+            // Keep connection open (no EOF) — will be aborted when test ends
+            std::future::pending::<()>().await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut relay_remote,
+            5,   // idle timeout = 5s (THIS should fire — flush never succeeds)
+            100, // uplink_only (should NOT fire — no client EOF)
+            100, // downlink_only (should NOT fire — no remote EOF)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        sender.abort();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::IdleTimeout,
+            "Should terminate via idle timeout"
+        );
+        assert!(
+            result.b_to_a > 0,
+            "Data should have been written (buffered)"
+        );
+        assert!(!result.client_eof, "Client did not send EOF");
+        assert!(!result.remote_eof, "Remote did not send EOF");
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(5),
+            "Should wait at least idle timeout (5s)"
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(7),
+            "Should fire at idle timeout (~5s), not be kept alive by buffered writes, elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Companion test (v0.2.10): direct connection (flush succeeds) → idle timer
+    /// SHOULD reset on data activity, keeping the connection alive.
+    ///
+    /// Ensures the has_flushed() guard doesn't break direct-connect behavior.
+    /// Without realm, poll_flush returns Ready(Ok(())) → flush_ok=true → timer resets.
+    ///
+    /// Red/green: always green — passes both with and without has_flushed() check,
+    /// since flush succeeds and both code paths reset the timer.
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timer_resets_on_flushed_writes() {
+        use tokio::io::AsyncWriteExt;
+
+        // Client (a): flush succeeds (direct connection, no realm).
+        // Read returns Pending (no client data).
+        let mut client = PersistentRemote {
+            response: None, // read=Pending, write=Ok, flush=Ok
+        };
+
+        // Remote (b): sends data every 2s for 10 rounds (t=0,2,...18) via DuplexStream.
+        // Flush succeeds → timer resets each send → connection alive until t=23s.
+        let (mut test_writer, mut relay_remote) = tokio::io::duplex(4096);
+
+        let sender = tokio::spawn(async move {
+            for i in 0..10 {
+                if i > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+                if test_writer.write_all(b"flushed-data").await.is_err() {
+                    break;
+                }
+            }
+            // Keep connection open (no EOF)
+            std::future::pending::<()>().await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut relay_remote,
+            5,   // idle timeout = 5s — but flushed writes keep resetting it
+            100, // uplink_only
+            100, // downlink_only
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        sender.abort();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::IdleTimeout,
+            "Should terminate via idle timeout after data stops"
+        );
+        // Data flows until t=18, then 5s idle → terminates at ~t=23s.
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(20),
+            "Direct connection: flushed writes should keep idle timer alive, elapsed={:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(30),
+            "Should eventually idle-timeout after data stops, elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Verify that the pre-created half-close timer does not fire spuriously
+    /// when neither direction has received EOF.
+    ///
+    /// Regression test for stack-pin optimization: half_close_sleep is created
+    /// with Duration::ZERO (already expired) but gated by half_close_active flag.
+    /// If the flag check were missing, the expired timer would fire immediately
+    /// and the relay would terminate at ~0s instead of waiting for idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_timer_inactive_without_eof() {
+        // Both sides: read returns Pending (no data, no EOF)
+        let mut client = NeverEofSink;
+        let mut remote = NeverEofSink;
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            3, // idle timeout = 3s (THIS should fire)
+            1, // uplink_only = 1s (should NOT fire — no EOF)
+            1, // downlink_only = 1s (should NOT fire — no EOF)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::IdleTimeout,
+            "Should terminate via idle timeout, not half-close"
+        );
+        // Key: should idle-timeout at 3s, NOT half-close at 0-1s.
+        // Without half_close_active guard, the pre-created Duration::ZERO timer
+        // would fire immediately → elapsed ≈ 0s.
+        assert!(
+            elapsed >= tokio::time::Duration::from_secs(3),
+            "Should wait for idle timeout (3s), not fire early, elapsed={:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(5),
+            "Should fire at idle timeout (~3s), elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Verify half-close timer fires correctly with zero-second timeout.
+    ///
+    /// Edge case for stack-pin optimization: the pre-created timer starts with
+    /// Duration::ZERO, then gets reset to (now + 0s) on EOF detection.
+    /// Tests that reset with zero duration works correctly and doesn't confuse
+    /// the "already expired" initial state with the "just activated" state.
+    #[tokio::test(start_paused = true)]
+    async fn test_half_close_zero_timeout_fires_immediately() {
+        let mut client = Cursor::new(b"data".to_vec()); // Client sends data then EOF
+        let mut remote = NeverEofSink; // Remote never sends EOF
+
+        let start = tokio::time::Instant::now();
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300, // idle timeout = high (should NOT fire)
+            0,   // uplink_only = 0s (immediate after client EOF)
+            300, // downlink_only = high (should NOT fire)
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.termination,
+            RelayTermination::HalfCloseTimeout,
+            "Should terminate via half-close timeout"
+        );
+        assert!(result.client_eof, "Client should have sent EOF");
+        // With 0s timeout, should fire essentially immediately after client EOF
+        assert!(
+            elapsed < tokio::time::Duration::from_secs(1),
+            "Zero-second half-close should fire immediately, elapsed={:?}",
             elapsed
         );
     }
