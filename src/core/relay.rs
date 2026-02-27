@@ -1502,9 +1502,9 @@ mod tests {
         let result = copy_bidirectional_with_stats(
             &mut client,
             &mut remote,
-            3,   // idle timeout = 3s (THIS should fire)
-            1,   // uplink_only = 1s (should NOT fire — no EOF)
-            1,   // downlink_only = 1s (should NOT fire — no EOF)
+            3, // idle timeout = 3s (THIS should fire)
+            1, // uplink_only = 1s (should NOT fire — no EOF)
+            1, // downlink_only = 1s (should NOT fire — no EOF)
             1024,
             None,
         )

@@ -241,7 +241,11 @@ mod tests {
 
         let mut buf = [0u8; 64];
         let n = transport.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"real data", "Should skip Text and return Binary");
+        assert_eq!(
+            &buf[..n],
+            b"real data",
+            "Should skip Text and return Binary"
+        );
     }
 
     /// Verify that poll_read skips multiple consecutive non-binary messages
@@ -257,14 +261,8 @@ mod tests {
         let (mut client_ws, mut transport) = ws_pair().await;
 
         // Client sends: Text, Text, Ping → then Binary
-        client_ws
-            .send(Message::Text("msg1".into()))
-            .await
-            .unwrap();
-        client_ws
-            .send(Message::Text("msg2".into()))
-            .await
-            .unwrap();
+        client_ws.send(Message::Text("msg1".into())).await.unwrap();
+        client_ws.send(Message::Text("msg2".into())).await.unwrap();
         client_ws
             .send(Message::Ping(Bytes::from_static(b"ping")))
             .await
@@ -277,7 +275,8 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = transport.read(&mut buf).await.unwrap();
         assert_eq!(
-            &buf[..n], b"payload",
+            &buf[..n],
+            b"payload",
             "Should skip all non-binary messages and return Binary"
         );
     }
@@ -293,14 +292,8 @@ mod tests {
         let (mut client_ws, mut transport) = ws_pair().await;
 
         // Client sends: Text → Close
-        client_ws
-            .send(Message::Text("skip".into()))
-            .await
-            .unwrap();
-        client_ws
-            .send(Message::Close(None))
-            .await
-            .unwrap();
+        client_ws.send(Message::Text("skip".into())).await.unwrap();
+        client_ws.send(Message::Close(None)).await.unwrap();
 
         let mut buf = [0u8; 64];
         let n = transport.read(&mut buf).await.unwrap();
