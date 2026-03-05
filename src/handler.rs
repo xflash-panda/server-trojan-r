@@ -101,7 +101,7 @@ pub async fn process_connection(
     )
     .await
     .map_err(|_| {
-        log::info!(peer = %meta.peer_addr, stage = "request_timeout", "Connection failed");
+        log::debug!(peer = %meta.peer_addr, stage = "request_timeout", "Connection failed");
         anyhow!("Request read timeout")
     })??;
 
@@ -259,7 +259,7 @@ impl<'a> ConnectContext<'a> {
                 let duration = relay_start.elapsed().as_secs();
                 match result {
                     Ok(r) => {
-                        log::info!(
+                        log::debug!(
                             peer = %self.peer_addr,
                             target = %self.target,
                             up = r.a_to_b,
@@ -272,7 +272,7 @@ impl<'a> ConnectContext<'a> {
                         );
                     }
                     Err(e) => {
-                        log::info!(
+                        log::debug!(
                             peer = %self.peer_addr,
                             target = %self.target,
                             duration_secs = duration,
