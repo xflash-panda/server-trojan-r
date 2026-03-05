@@ -1,8 +1,8 @@
 # Connection Accumulation Investigation
 
 **Date**: 2026-03-05
-**Version**: v0.2.15+debug.2
-**Status**: Active — pre-relay connection leak confirmed, awaiting debug.2 stage diagnostics
+**Version**: v0.2.15+debug.3
+**Status**: Fix deployed — default max_connections=10000 semaphore backpressure, awaiting verification
 
 ## Problem
 
@@ -16,6 +16,8 @@ trojan-r vs Xray (same client, same environment, no realm, nftables port forward
 
 ## Phase 1: Relay Diagnostics (v0.2.15+debug.1)
 
+Added info-level relay termination logging: termination reason, EOF status, duration.
+
 ### Termination distribution (3-minute sample after restart)
 
 | Termination | Count | Percent | Meaning |
@@ -28,16 +30,6 @@ trojan-r vs Xray (same client, same environment, no realm, nftables port forward
 
 All 714 idle_timeout connections: **client_eof=false AND remote_eof=false**
 — genuine HTTP keep-alive, neither side closed. Correct behavior.
-
-### Connection duration distribution
-
-| Duration | Count | Notes |
-|----------|-------|-------|
-| 0s | 6,280 | Fast request-response |
-| 120s | 611 | Full idle timeout (keep-alive) |
-| 15s | 359 | Moderate keep-alive |
-| 1s | 280 | Short connections |
-| 65s | 149 | Various |
 
 ### Connection count after restart
 
@@ -66,117 +58,97 @@ Within 30 minutes of restart, ESTAB climbed back to **42,860** — proving an ac
 | Outbound ESTABLISHED (sport != :36548) | 8,263 |
 | **Difference (stuck pre-relay)** | **~37,000** |
 
-- Outbound connections only exist for connections that reached the relay phase (connected to target)
+- Outbound connections only exist for connections that reached the relay phase
 - 37k inbound connections have no matching outbound = never reached relay
-- These connections are stuck in pre-relay stages: TLS handshake, WS handshake, or request read
-
-### All stuck connections have data in queues
-
-```
-ss -tno state established sport = :36548 | awk idle analysis:
-idle: 0  → ALL 45,593 connections have pending data
-```
-
-No truly idle connections — the kernel has data for them, but the application isn't reading it.
-
-### Pre-relay timeouts should prevent this
-
-| Stage | Timeout | Expected cleanup |
-|-------|---------|-----------------|
-| TLS handshake | 10s | tokio::time::timeout |
-| WS handshake | 5s | tokio::time::timeout |
-| Request read | 5s | tokio::time::timeout |
-| **Maximum pre-relay lifetime** | **20s** | All stages combined |
-
-With 20s max pre-relay lifetime, at most `connection_rate × 20` connections should be in pre-relay stages. At 100 conn/s, that's 2,000 — not 37,000.
-
-### Root cause hypothesis: Tokio runtime overload (death spiral)
-
-1. Connection leak starts (cause TBD) → task count grows
-2. At 45k+ tokio tasks, the runtime can't poll all tasks promptly
-3. Timer fires (e.g., TLS 10s timeout) → wakes task → but task sits in run queue
-4. By the time task is polled, new connections have arrived → more tasks
-5. Timeout result is observed late or task is never polled → connection never cleaned up
-6. **Death spiral**: more stuck connections → slower polling → more stuck connections
-
-Evidence:
-- Restart instantly fixes the problem (fresh runtime, no task backlog)
-- Connections have data in kernel buffers but app isn't reading → tasks not being polled
-- CPU was 75.8% before restart → runtime saturated
+- All stuck connections have data in kernel buffers (idle: 0) — app isn't reading
 
 ## Phase 3: Stage Logging (v0.2.15+debug.2)
 
-### Changes deployed
+Added info-level logging at each pre-relay failure point (TLS, WS, request stages).
 
-Added info-level logging at each pre-relay failure point:
+### Stage failure distribution (3-minute sample, 45k ESTAB)
 
-| Log | Stage label | Trigger |
-|-----|-------------|---------|
-| TLS handshake error | `stage=tls` | TLS handshake fails |
-| TLS handshake timeout | `stage=tls_timeout` | 10s timeout fires |
-| WS handshake timeout | `stage=ws_timeout` | 5s timeout fires |
-| Request read timeout | `stage=request_timeout` | 5s timeout fires |
+| Stage | Count | Percent | Meaning |
+|-------|-------|---------|---------|
+| `tls` (TLS handshake error) | 1,424 | 80% | TLS EOF — scanners/probes |
+| `tls_timeout` (10s timeout) | 329 | 18.5% | TLS handshake hung |
+| `request_timeout` (5s timeout) | 24 | 1.3% | Request read hung |
+| `ws_timeout` (5s timeout) | 2 | 0.1% | WS handshake hung |
+| **Total stage failures** | **1,779** | | |
+| **Relay completions** | **3,739** | | |
 
-### Diagnostic commands (run after debug.2 is live)
+### Key insight: timeouts fire but can't keep up
+
+- Timeouts ARE working (354 timeout events / 3 min)
+- Total processing rate: ~30.6 connections/sec
+- But 35k connections are stuck — **spawned as tasks but not yet polled**
+- Timeout timer only starts on first poll → unpolled tasks never time out
+
+## Root Cause: Accept Loop Death Spiral
+
+### Mechanism
+
+1. `max_connections = 0` (default) → no semaphore → accept loop has no backpressure
+2. `listener.accept()` + `tokio::spawn()` runs as fast as connections arrive
+3. At 45k+ spawned tasks, tokio's run queue grows → new tasks wait longer for first poll
+4. `tokio::time::timeout()` only creates the timer on first poll
+5. Unpolled tasks → timeouts don't start → connections never cleaned up
+6. More stuck connections → more tasks → slower polling → **death spiral**
+
+### Evidence
+
+| Evidence | Supports |
+|----------|----------|
+| Restart drops 49k → 1.5k instantly | Fresh runtime, no task backlog |
+| Climbs back to 45k within 30 min | Active leak, not stale connections |
+| 35k inbound vs 12k outbound | Connections stuck in pre-relay stages |
+| All connections have kernel buffer data | Tasks not being polled (app not reading) |
+| 354 timeouts fire / 3 min | Timeouts work but can't consume 35k backlog |
+| 75.8% CPU before restart | Runtime saturated |
+
+## Fix: Default max_connections = 10,000 (v0.2.15+debug.3)
+
+### Change
+
+```
+- default_value_t = 0           // unlimited, no semaphore
++ default_value_t = 10_000      // semaphore always active
+```
+
+### How it works
+
+- Existing semaphore in accept loop now always active with default 10k permits
+- When concurrent connections reach 10k, `semaphore.acquire()` blocks accept loop
+- TCP SYN queue absorbs incoming connections at kernel level (no reject)
+- When tasks complete and release permits, accept resumes
+- Prevents task count from reaching death spiral threshold (~45k)
+
+### Why 10,000?
+
+- Xray handles same traffic with 2,000-4,000 connections
+- 10k = 2.5-5x headroom over Xray
+- At ~235KB per connection: 10k × 235KB = ~2.3GB memory (manageable)
+- Well below the ~45k death spiral threshold
+- `--max_connections 0` still available for explicitly unlimited
+
+### Diagnostic logs
+
+All debug.1/debug.2 info-level diagnostic logs reverted to debug level.
+Info level reserved for business logs only. Use `--log_mode debug` to see diagnostics.
+
+## Verification Commands
 
 ```bash
-# Stage distribution — WHERE are connections failing?
-journalctl -u strojan-agent --no-pager --since "3 min ago" \
-  | grep "Connection failed" | grep -oP 'stage=\w+' | sort | uniq -c | sort -rn
+# After deploying debug.3, monitor ESTAB count
+watch -n 30 'ss -tan state established sport = :36548 | wc -l'
 
-# Stage failure rate over time
-journalctl -u strojan-agent --no-pager --since "10 min ago" \
-  | grep "Connection failed" | grep -oP 'stage=\w+' \
-  | awk '{print strftime("%H:%M", systime()), $0}' | sort | uniq -c
+# Should stabilize at or below 10,000 (not climb to 45k+)
+# If it stabilizes at 2,000-4,000 (like Xray), the fix is confirmed
 
-# Compare: relay completions vs stage failures
-echo "=== Relay completions ===" && \
-journalctl -u strojan-agent --no-pager --since "3 min ago" \
-  | grep "Relay done" | wc -l && \
-echo "=== Stage failures ===" && \
-journalctl -u strojan-agent --no-pager --since "3 min ago" \
-  | grep "Connection failed" | wc -l
-
-# Current ESTAB count
-ss -tan state established sport = :36548 | wc -l
+# Check semaphore is active in startup log
+journalctl -u strojan-agent --no-pager | grep "Server started" | tail -1
+# Should show max_connections=10000
 ```
-
-### Expected results
-
-| If stage = ... | Meaning | Fix |
-|----------------|---------|-----|
-| `tls_timeout` dominant | TLS handshakes hanging | Reduce TLS timeout, investigate TLS library |
-| `ws_timeout` dominant | WS handshakes hanging after TLS | Reduce WS timeout, investigate tungstenite |
-| `request_timeout` dominant | Request reads hanging after WS | Reduce request timeout |
-| **No stage logs** | **Timeouts never fire** | **Confirms runtime overload — tasks not polled** |
-| Mixed / low counts | Normal failure distribution | Look elsewhere |
-
-**Most likely outcome**: Few or no stage failure logs, confirming that timeouts fire but tasks are never polled (runtime overload hypothesis).
-
-## Proposed Fix: Per-Task Safety Timeout
-
-Wrap the entire `tokio::spawn` task body with a hard timeout:
-
-```rust
-tokio::spawn(async move {
-    match tokio::time::timeout(safety_duration, handle_connection(...)).await {
-        Ok(result) => { /* normal path */ }
-        Err(_) => {
-            log::warn!(peer = %peer_addr, "Connection killed by safety timeout");
-            // drop cleans up TCP + TLS + WS
-        }
-    }
-});
-```
-
-**Proposed value**: `idle_timeout + 30s` = **150s** (2.5 minutes)
-
-- Covers all pre-relay stages (20s) + full relay idle timeout (120s) + margin (10s)
-- Any connection alive beyond 150s is definitively leaked
-- Drop handler cleans up TCP FD, TLS state, WS buffers
-- Independent of tokio timer reliability — `select!` on the outer future
-
-**Why not `max_connections`?** User preference: connection limits should be controlled by the system (ulimit/sysctl), not application-level.
 
 ## Per-Connection Memory Overhead
 
@@ -194,6 +166,7 @@ tokio::spawn(async move {
 |-------------|--------|
 | 1,500 | ~350MB |
 | 3,000 | ~700MB |
+| 10,000 | ~2.3GB |
 | 49,000 | ~11.5GB |
 
 ## Timeline
@@ -203,7 +176,11 @@ tokio::spawn(async move {
 | T+0h | Observed 49,613 ESTAB, 11.6GB RSS, 75.8% CPU |
 | T+0h | Deployed v0.2.15+debug.1 (relay termination logging) |
 | T+0h | Restarted → ESTAB dropped to 1,473 |
+| T+0.2h | Relay diagnostics: 89% completed, relay logic healthy |
 | T+0.5h | ESTAB climbed back to 42,860 — recurrence confirmed |
 | T+1h | Analysis: 37k connections stuck in pre-relay stages |
 | T+1h | Deployed v0.2.15+debug.2 (pre-relay stage logging) |
-| T+1h | **Awaiting diagnostic results** |
+| T+1.5h | Stage data: timeouts work (354/3min) but can't keep up with 35k backlog |
+| T+1.5h | Root cause identified: accept loop death spiral (no backpressure) |
+| T+2h | Deployed v0.2.15+debug.3 (default max_connections=10000, logs→debug) |
+| T+2h | **Awaiting verification** |
