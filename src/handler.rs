@@ -239,6 +239,7 @@ impl<'a> ConnectContext<'a> {
         // Relay data with stats tracking and cancellation support.
         // Pass &mut so streams aren't moved into the future — this allows
         // graceful shutdown even when cancel_token drops the relay future.
+        let relay_start = std::time::Instant::now();
         let stats = Arc::clone(&self.server.stats);
         let relay_fut = copy_bidirectional_with_stats(
             &mut client_stream,
@@ -252,15 +253,29 @@ impl<'a> ConnectContext<'a> {
 
         let cancelled = tokio::select! {
             result = relay_fut => {
+                let duration = relay_start.elapsed().as_secs();
                 match result {
-                    Ok(r) if r.completed => {
-                        log::trace!(peer = %self.peer_addr, up = r.a_to_b, down = r.b_to_a, "Relay completed");
-                    }
                     Ok(r) => {
-                        log::debug!(peer = %self.peer_addr, up = r.a_to_b, down = r.b_to_a, "Connection timeout");
+                        log::info!(
+                            peer = %self.peer_addr,
+                            target = %self.target,
+                            up = r.a_to_b,
+                            down = r.b_to_a,
+                            duration_secs = duration,
+                            termination = %r.termination,
+                            client_eof = r.client_eof,
+                            remote_eof = r.remote_eof,
+                            "Relay done"
+                        );
                     }
                     Err(e) => {
-                        log::debug!(peer = %self.peer_addr, error = %e, "Relay error");
+                        log::info!(
+                            peer = %self.peer_addr,
+                            target = %self.target,
+                            duration_secs = duration,
+                            error = %e,
+                            "Relay error"
+                        );
                     }
                 }
                 false
