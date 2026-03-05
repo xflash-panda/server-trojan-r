@@ -177,7 +177,10 @@ where
                 ),
             )
             .await
-            .map_err(|_| anyhow!("WebSocket handshake timeout"))??;
+            .map_err(|_| {
+                log::info!(peer = %peer_addr, stage = "ws_timeout", "Connection failed");
+                anyhow!("WebSocket handshake timeout")
+            })??;
             let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
@@ -305,15 +308,14 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                             .await
                             {
                                 Ok(Ok(tls_stream)) => {
-                                    log::debug!(peer = %peer_addr, "TLS handshake successful");
                                     accept_connection(server, tls_stream, peer_addr, transport_type, network_settings).await
                                 }
                                 Ok(Err(e)) => {
-                                    log::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                                    log::info!(peer = %peer_addr, error = %e, stage = "tls", "Connection failed");
                                     Err(anyhow!("TLS handshake failed: {}", e))
                                 }
                                 Err(_) => {
-                                    log::debug!(peer = %peer_addr, "TLS handshake timeout");
+                                    log::info!(peer = %peer_addr, stage = "tls_timeout", "Connection failed");
                                     Err(anyhow!("TLS handshake timeout"))
                                 }
                             }
@@ -324,9 +326,8 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                     .await;
 
                     if let Err(e) = result {
-                        log::debug!(peer = %peer_addr, error = %e, "Connection error");
+                        log::info!(peer = %peer_addr, error = %e, "Connection error");
                     }
-                    log::connection(peer_addr, "closed");
                 });
             }
             Err(e) => {

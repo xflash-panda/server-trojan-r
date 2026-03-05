@@ -100,7 +100,10 @@ pub async fn process_connection(
         read_trojan_request(&mut stream, &mut buf, buffer_size),
     )
     .await
-    .map_err(|_| anyhow!("Request read timeout"))??;
+    .map_err(|_| {
+        log::info!(peer = %meta.peer_addr, stage = "request_timeout", "Connection failed");
+        anyhow!("Request read timeout")
+    })??;
 
     // Free request parsing buffer immediately — payload is an independent Bytes.
     // Saves 32KB per connection during the relay phase.
