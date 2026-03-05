@@ -504,18 +504,11 @@ mod tests {
     fn test_default_max_connections_prevents_death_spiral() {
         use crate::config::DEFAULT_MAX_CONNECTIONS;
 
-        assert!(
-            DEFAULT_MAX_CONNECTIONS > 0,
-            "Default must be bounded, not unlimited (0)"
-        );
-        assert!(
-            DEFAULT_MAX_CONNECTIONS >= 1024,
-            "Default must allow at least 1024 concurrent connections"
-        );
-        assert!(
-            DEFAULT_MAX_CONNECTIONS <= 65535,
-            "Default should not be excessively large"
-        );
+        const {
+            assert!(DEFAULT_MAX_CONNECTIONS > 0);
+            assert!(DEFAULT_MAX_CONNECTIONS >= 1024);
+            assert!(DEFAULT_MAX_CONNECTIONS <= 65535);
+        }
     }
 
     /// When default max_connections is used, a semaphore must be created (not None).
