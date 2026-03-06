@@ -177,6 +177,7 @@ impl BackgroundTasks {
                     _ = interval.tick() => {
                         if let Err(e) = fetch_users_once(&api_manager, &user_manager).await {
                             log::debug!(error = %e, "Fetch users tick skipped");
+                            api_manager.reset_client().await;
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -204,6 +205,7 @@ impl BackgroundTasks {
                     _ = interval.tick() => {
                         if let Err(e) = report_traffic_once(&api_manager, &stats_collector).await {
                             log::warn!(error = %e, "Failed to report traffic");
+                            api_manager.reset_client().await;
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -236,7 +238,10 @@ impl BackgroundTasks {
                     _ = interval.tick() => {
                         match api_manager.heartbeat().await {
                             Ok(()) => log::info!("Heartbeat sent"),
-                            Err(e) => log::warn!(error = %e, "Failed to send heartbeat"),
+                            Err(e) => {
+                                log::warn!(error = %e, "Failed to send heartbeat");
+                                api_manager.reset_client().await;
+                            }
                         }
                     }
                     _ = shutdown_rx.changed() => {

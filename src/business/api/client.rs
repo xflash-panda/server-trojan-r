@@ -159,6 +159,10 @@ impl ApiManager {
             .map_err(|e| anyhow!("Invalid endpoint: {}", e))?
             .connect_timeout(timeout)
             .timeout(timeout)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
             .connect()
             .await
             .map_err(|e| anyhow!("Failed to connect to gRPC server {}: {}", endpoint, e))?;
@@ -179,6 +183,16 @@ impl ApiManager {
         let client = self.connect().await?;
         *self.client.write().await = Some(client.clone());
         Ok(client)
+    }
+
+    /// Reset cached gRPC client, forcing a fresh connection on next request.
+    /// Called when a gRPC request fails to ensure stale connections are discarded.
+    pub async fn reset_client(&self) {
+        let mut client_guard = self.client.write().await;
+        if client_guard.is_some() {
+            *client_guard = None;
+            log::warn!("gRPC client reset, will reconnect on next request");
+        }
     }
 
     /// Get the state file path
