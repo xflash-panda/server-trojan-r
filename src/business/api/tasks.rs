@@ -1,6 +1,6 @@
 //! Background tasks for periodic API operations
 
-use super::client::UserTraffic;
+use server_client_rs::models::UserTraffic;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;

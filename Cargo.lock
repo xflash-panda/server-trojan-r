@@ -1972,7 +1972,6 @@ dependencies = [
  "hex",
  "hostname",
  "http",
- "http-body",
  "humantime",
  "rustls",
  "rustls-pemfile",

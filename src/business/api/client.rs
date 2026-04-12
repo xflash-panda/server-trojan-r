@@ -10,7 +10,7 @@ use server_agent_proto_rs::{
     VerifyRequest,
 };
 use server_client_rs::models::{
-    parse_raw_config_response, unmarshal_users, NodeType, TrojanConfig,
+    parse_raw_config_response, unmarshal_users, NodeType, TrafficStats, TrojanConfig, UserTraffic,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,65 +31,6 @@ struct PanelState {
     node_id: Option<u32>,
     /// Server port from API config
     server_port: Option<u16>,
-}
-
-/// User traffic data for submission
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserTraffic {
-    pub user_id: i64,
-    /// Upload bytes
-    pub u: u64,
-    /// Download bytes
-    pub d: u64,
-    /// Count/connections
-    #[serde(default)]
-    pub n: u64,
-}
-
-impl UserTraffic {
-    /// Create a new UserTraffic instance with connection count
-    pub fn with_count(user_id: i64, upload: u64, download: u64, count: u64) -> Self {
-        Self {
-            user_id,
-            u: upload,
-            d: download,
-            n: count,
-        }
-    }
-}
-
-/// Aggregated traffic statistics
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TrafficStats {
-    /// Total count
-    pub count: i64,
-    /// Total requests
-    pub requests: i64,
-    /// User IDs
-    pub user_ids: Vec<i64>,
-    /// Per-user request counts
-    #[serde(default)]
-    pub user_requests: std::collections::HashMap<i64, i64>,
-}
-
-impl TrafficStats {
-    /// Create a new empty TrafficStats instance
-    pub fn new() -> Self {
-        Self {
-            count: 0,
-            requests: 0,
-            user_ids: Vec::new(),
-            user_requests: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Add a user's request count
-    pub fn add_user(&mut self, user_id: i64, requests: i64) {
-        self.user_ids.push(user_id);
-        self.user_requests.insert(user_id, requests);
-        self.requests += requests;
-        self.count += 1;
-    }
 }
 
 /// Configuration for the panel service
@@ -585,28 +526,6 @@ impl ApiManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_user_traffic_with_count() {
-        let traffic = UserTraffic::with_count(1, 100, 200, 5);
-        assert_eq!(traffic.user_id, 1);
-        assert_eq!(traffic.u, 100);
-        assert_eq!(traffic.d, 200);
-        assert_eq!(traffic.n, 5);
-    }
-
-    #[test]
-    fn test_traffic_stats_add_user() {
-        let mut stats = TrafficStats::new();
-        stats.add_user(1, 10);
-        stats.add_user(2, 20);
-
-        assert_eq!(stats.count, 2);
-        assert_eq!(stats.requests, 30);
-        assert_eq!(stats.user_ids, vec![1, 2]);
-        assert_eq!(stats.user_requests.get(&1), Some(&10));
-        assert_eq!(stats.user_requests.get(&2), Some(&20));
-    }
 
     #[test]
     fn test_panel_state_serialization() {
