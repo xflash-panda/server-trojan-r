@@ -1,4 +1,4 @@
-# server-r-panel 提取计划（HTTP 优先）
+# server-panel-rs 提取计划（HTTP 优先）
 
 ## 分支
 
@@ -7,7 +7,7 @@
 
 ## 目标
 
-从 `server-trojan-rs` 的 `business/` 模块提取面板通信逻辑为独立 crate `server-r-panel`，供 Trojan、TUIC 等代理服务器复用。
+从 `server-trojan-rs` 的 `business/` 模块提取面板通信逻辑为独立 crate `server-panel-rs`，供 Trojan、TUIC 等代理服务器复用。
 
 ## 架构原则
 
@@ -19,7 +19,7 @@
 ## 模块结构
 
 ```
-server-r-panel/
+server-panel-rs/
 ├── Cargo.toml
 └── src/
     ├── lib.rs            # 公开导出 + password_to_hex()
@@ -55,7 +55,7 @@ tokio-test = "0.4"
 
 ### Task 1: crate 脚手架
 
-在 `/Users/alex/code/rust/xflash-panda/server-r-panel/` 创建：
+在 `/Users/alex/code/rust/xflash-panda/server-panel-rs/` 创建：
 - `Cargo.toml`（上述依赖）
 - `src/lib.rs`（空模块声明）
 - `src/types.rs`, `src/stats.rs`, `src/user_manager.rs`, `src/client.rs`, `src/tasks.rs`（空文件）
@@ -157,7 +157,7 @@ pub use server_client_rs::NodeType;
 pub fn password_to_hex(password: &str) -> [u8; 56] { ... }
 ```
 
-### Task 8: 编译测试 server-r-panel
+### Task 8: 编译测试 server-panel-rs
 
 - `cargo fmt`
 - `cargo clippy`
@@ -166,7 +166,7 @@ pub fn password_to_hex(password: &str) -> [u8; 56] { ... }
 ### Task 9: 接入 server-trojan-rs
 
 **Cargo.toml 变更：**
-- 新增 `server-r-panel` path 依赖
+- 新增 `server-panel-rs` path 依赖
 - 移除 `hostname`、`scopeguard`（被 panel 内部消化）
 - 保留 `server-client-rs`（仍需 `TrojanConfig` 等类型）
 
@@ -174,7 +174,7 @@ pub fn password_to_hex(password: &str) -> [u8; 56] { ... }
 
 ```rust
 // business/mod.rs
-use server_r_panel as panel;
+use server_panel_rs as panel;
 
 pub use panel::{ApiManager, BackgroundTasks, TaskConfig, UserManager};
 
