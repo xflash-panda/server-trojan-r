@@ -121,7 +121,7 @@ pub struct UserDiff {
 - 构造函数接收 `PanelConfig` 替代 `CliArgs`
 - `NodeType` 来自 `PanelConfig.node_type`（不硬编码 Trojan）
 - `fetch_config()` 返回 `NodeConfigEnum`（消费者自己调 `.as_trojan()` / `.as_tuic()`）
-- `fetch_users()` 返回 `Vec<crate::types::User>`（从 `server_client_rs::User` 转换）
+- `fetch_users()` 返回 `Result<Option<Vec<User>>>`：`Some` = 新数据，`None` = ETag 未变更（不再用 Error 做控制流）
 - 日志用 `tracing` 宏替代 `crate::logger::log`
 - `PersistentState`、状态文件管理原样迁移
 - `state_file_path` 由 `PanelConfig.data_dir` + node_id 计算
