@@ -133,6 +133,9 @@ pub struct UserDiff {
 - 引用更新为 crate 内部类型（`StatsCollector`, `ApiManager`, `UserManager`）
 - `fetch_users_once` 调用 `user_manager.update()` 并记录 `UserDiff`
 - **新增 `on_user_diff` 回调**：`BackgroundTasks::on_user_diff(self, f: Arc<dyn Fn(UserDiff) + Send + Sync>) -> Self`
+  - 回调在 BG runtime（2-worker）上执行，不在 main runtime
+  - `kick_user()` 是纯内存操作（遍历 DashMap + cancel CancellationToken），微秒级，无性能问题
+  - 消费者应避免在回调中执行阻塞 I/O 或耗时操作
 - `report_traffic_once`：`stats.reset_all()` → 转换为 `server_client_rs::UserTraffic` → `api.submit_traffic()`
 - `format_bytes` 辅助函数原样迁移
 - `TaskConfig`, `BackgroundTasksHandle` 原样迁移
