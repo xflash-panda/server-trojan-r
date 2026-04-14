@@ -1623,6 +1623,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "server-panel-rs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/xflash-panda/server-panel-rs.git?tag=v0.1.0#5ad686a214417ac5579074bc3152324cb31743f0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "dashmap",
+ "hex",
+ "hostname",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "server-client-rs",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "server-trojan-rs"
 version = "0.2.23"
 dependencies = [
@@ -1636,8 +1655,6 @@ dependencies = [
  "dashmap",
  "futures-util",
  "h2",
- "hex",
- "hostname",
  "http",
  "humantime",
  "rustls",
@@ -1646,8 +1663,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "server-client-rs",
- "sha2",
+ "server-panel-rs",
  "socket2",
  "tempfile",
  "thiserror",

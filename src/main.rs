@@ -31,7 +31,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::business::{
-    ApiAuthenticator, ApiManager, ApiStatsCollector, BackgroundTasks, TaskConfig, UserManager,
+    ApiManager, BackgroundTasks, PanelConfig, PanelStatsCollector, TaskConfig, TrojanAuthenticator,
+    TrojanStatsCollector, UserManager,
 };
 use crate::core::{ConnectionManager, Server};
 
@@ -59,14 +60,26 @@ async fn main() -> Result<()> {
     // Create connection manager (shared between core and business layers)
     let conn_manager = ConnectionManager::new();
 
+    // Create panel config
+    let panel_config = PanelConfig {
+        api: cli.api.clone(),
+        token: cli.token.clone(),
+        node_id: cli.node,
+        node_type: server_panel_rs::NodeType::Trojan,
+        data_dir: cli.data_dir.to_string_lossy().to_string(),
+        api_timeout: cli.api_timeout.as_secs(),
+        debug: cli.log_mode == "debug",
+    };
+
     // Create API manager
-    let api_manager = Arc::new(ApiManager::new(&cli)?);
+    let api_manager = Arc::new(ApiManager::new(panel_config)?);
 
     // Create user manager
-    let user_manager = Arc::new(UserManager::new(conn_manager.clone()));
+    let user_manager = Arc::new(UserManager::new());
 
     // Fetch configuration from remote panel (needed for port before registration)
-    let remote_config = api_manager.fetch_config().await?;
+    let node_config = api_manager.fetch_config().await?;
+    let remote_config = node_config.as_trojan()?.clone();
 
     // Initialize node with port from config
     let register_id = api_manager.initialize(remote_config.server_port).await?;
@@ -74,16 +87,18 @@ async fn main() -> Result<()> {
 
     // Fetch initial users
     let users = api_manager.fetch_users().await?;
-    user_manager.init(&users);
+    if let Some(users) = users {
+        user_manager.init(&users);
+    }
 
     // Build server config
     let server_config = config::ServerConfig::from_remote(&remote_config, &cli)?;
 
     // Create authenticator using shared user map
-    let authenticator = Arc::new(ApiAuthenticator::new(user_manager.get_users_arc()));
+    let authenticator = Arc::new(TrojanAuthenticator(user_manager.get_users_arc()));
 
     // Create stats collector
-    let stats_collector = Arc::new(ApiStatsCollector::new());
+    let stats_collector = Arc::new(PanelStatsCollector::new());
 
     // Build router from ACL config
     let router = server_runner::build_router(&server_config, cli.refresh_geodata).await?;
@@ -95,28 +110,36 @@ async fn main() -> Result<()> {
     let conn_manager_for_shutdown = conn_manager.clone();
 
     // Build server using the builder pattern
+    let trojan_stats = Arc::new(TrojanStatsCollector(Arc::clone(&stats_collector)));
     let server = Arc::new(
         Server::builder()
             .authenticator(authenticator)
-            .stats(Arc::clone(&stats_collector) as Arc<dyn core::hooks::StatsCollector>)
+            .stats(trojan_stats as Arc<dyn core::hooks::StatsCollector>)
             .router(router)
             .conn_manager(conn_manager)
             .conn_config(conn_config)
             .build(),
     );
 
-    // Start background tasks
+    // Start background tasks with on_user_diff callback for kick
     let task_config = TaskConfig::new(
         cli.fetch_users_interval,
         cli.report_traffics_interval,
         cli.heartbeat_interval,
     );
+    let conn_mgr_for_kick = conn_manager_for_shutdown.clone();
+    let on_diff = Arc::new(move |diff: server_panel_rs::UserDiff| {
+        for uid in diff.removed_ids.iter().chain(diff.uuid_changed_ids.iter()) {
+            conn_mgr_for_kick.kick_user(*uid);
+        }
+    });
     let background_tasks = BackgroundTasks::new(
         task_config,
         Arc::clone(&api_manager),
         Arc::clone(&user_manager),
         Arc::clone(&stats_collector),
-    );
+    )
+    .on_user_diff(on_diff);
     let background_handle = background_tasks.start();
 
     // Create cancellation token for graceful shutdown
