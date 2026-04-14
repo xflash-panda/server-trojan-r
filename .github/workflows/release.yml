@@ -36,6 +36,9 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Configure private deps access
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PRIVATE_DEPS_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
 
@@ -62,6 +65,10 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Pre-fetch dependencies
+        if: matrix.use_cross
+        run: cargo fetch
 
       - name: Build release (cargo)
         if: ${{ !matrix.use_cross }}
