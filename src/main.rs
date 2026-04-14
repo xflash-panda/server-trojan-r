@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         token: cli.token.clone(),
         node_id: cli.node,
         node_type: server_panel_rs::NodeType::Trojan,
-        data_dir: cli.data_dir.to_string_lossy().to_string(),
+        state_file_path: cli.data_dir.join(format!("node-{}.state", cli.node)),
         api_timeout: cli.api_timeout.as_secs(),
         debug: cli.log_mode == "debug",
     };

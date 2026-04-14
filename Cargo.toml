@@ -36,7 +36,7 @@ arc-swap = "1"
 acl-engine-r = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.1", features = ["async"] }
 
 # Panel Integration
-server-panel-rs = { git = "ssh://git@github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.1" }
+server-panel-rs = { path = "../server-panel-rs" }
 socket2 = "0.6"
 
 [[bin]]
