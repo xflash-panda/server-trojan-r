@@ -9,6 +9,9 @@ use crate::core::UserId;
 pub use panel_core::{
     BackgroundTasks, StatsCollector as PanelStatsCollector, TaskConfig, UserManager,
 };
+
+/// Trojan-specific UserManager using SHA-224 hex keys ([u8; 56])
+pub type TrojanUserManager = UserManager<[u8; 56]>;
 pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig};
 
 /// Newtype bridging panel::StatsCollector to core::hooks::StatsCollector trait
@@ -29,7 +32,7 @@ impl StatsCollector for TrojanStatsCollector {
 }
 
 /// Newtype bridging UserManager::authenticate() to core::hooks::Authenticator trait
-pub struct TrojanAuthenticator(pub Arc<UserManager>);
+pub struct TrojanAuthenticator(pub Arc<TrojanUserManager>);
 
 impl Authenticator for TrojanAuthenticator {
     fn authenticate(&self, password: &[u8; 56]) -> Option<UserId> {
@@ -52,7 +55,7 @@ mod tests {
     }
 
     fn make_authenticator(entries: &[(&str, i64)]) -> TrojanAuthenticator {
-        let um = UserManager::new();
+        let um = TrojanUserManager::new(panel_core::password_to_hex);
         let users: Vec<User> = entries
             .iter()
             .map(|(uuid, id)| create_user(*id, uuid))
@@ -84,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_authenticate_hot_reload() {
-        let um = Arc::new(UserManager::new());
+        let um = Arc::new(TrojanUserManager::new(panel_core::password_to_hex));
         um.init(&[create_user(1, "uuid-1")]);
         let auth = TrojanAuthenticator(Arc::clone(&um));
 
