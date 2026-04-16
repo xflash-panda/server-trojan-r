@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::business::{
     ApiManager, BackgroundTasks, NodeType, PanelApi, PanelConfig, PanelStatsCollector, TaskConfig,
-    TrojanAuthenticator, TrojanStatsCollector, UserManager,
+    TrojanAuthenticator, TrojanStatsCollector, TrojanUserManager,
 };
 use crate::core::{ConnectionManager, Server};
 
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     let api_manager = Arc::new(ApiManager::new(panel_config));
 
     // Create user manager (panel-core)
-    let user_manager = Arc::new(UserManager::new());
+    let user_manager = Arc::new(TrojanUserManager::new(panel_core::password_to_hex));
 
     // Fetch configuration from remote panel
     let node_config = api_manager.fetch_config().await?;
