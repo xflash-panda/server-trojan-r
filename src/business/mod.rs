@@ -17,10 +17,13 @@ pub use panel_core::{
     TaskConfig, UserManager,
 };
 
+/// Trojan-specific UserManager using SHA-224 hex keys ([u8; 56])
+pub type TrojanUserManager = UserManager<[u8; 56]>;
+
 /// Trojan authenticator wrapping panel-core's UserManager.
 ///
 /// Delegates SHA224 password lookup to UserManager's lock-free ArcSwap map.
-pub struct TrojanAuthenticator(pub Arc<UserManager>);
+pub struct TrojanAuthenticator(pub Arc<TrojanUserManager>);
 
 impl Authenticator for TrojanAuthenticator {
     fn authenticate(&self, password: &[u8; 56]) -> Option<UserId> {
@@ -53,7 +56,7 @@ mod tests {
 
     #[test]
     fn test_trojan_authenticator_empty() {
-        let user_manager = Arc::new(UserManager::new());
+        let user_manager = Arc::new(TrojanUserManager::new(panel_core::password_to_hex));
         let auth = TrojanAuthenticator(user_manager);
         let password = [b'x'; 56];
         assert_eq!(auth.authenticate(&password), None);
@@ -61,7 +64,7 @@ mod tests {
 
     #[test]
     fn test_trojan_authenticator_with_users() {
-        let user_manager = Arc::new(UserManager::new());
+        let user_manager = Arc::new(TrojanUserManager::new(panel_core::password_to_hex));
         let users = vec![panel_core::User {
             id: 42,
             uuid: "test-uuid-123".to_string(),
