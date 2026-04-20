@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
             .server_name
             .clone()
             .unwrap_or_else(|| cli.server_host.clone()),
-        ca_cert_path: cli.ca_cert_path.clone(),
+        ca_cert_path: cli.ca_file.clone(),
     };
 
     // Create API manager (connect-rpc via QUIC/H3)
