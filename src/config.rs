@@ -98,11 +98,11 @@ pub struct CliArgs {
 
     /// CA certificate path for panel TLS (omit for system trust store)
     #[arg(
-        long = "ca_cert_path",
-        env = "X_PANDA_TROJAN_CA_CERT_PATH",
+        long = "ca_file",
+        env = "X_PANDA_TROJAN_CA_FILE",
         value_name = "PATH"
     )]
-    pub ca_cert_path: Option<String>,
+    pub ca_file: Option<String>,
 
     /// Log mode: debug, info, warn, error (default: info)
     #[arg(long, env = "X_PANDA_TROJAN_LOG_MODE", default_value = "info")]
@@ -477,7 +477,7 @@ mod tests {
             block_private_ip: true,
             refresh_geodata: false,
             server_name: None,
-            ca_cert_path: None,
+            ca_file: None,
         }
     }
 
@@ -516,7 +516,7 @@ mod tests {
             downlink_only_timeout: Duration::from_secs(5),
             max_connections: 0,
             server_name: None,
-            ca_cert_path: None,
+            ca_file: None,
         };
         (cli, temp_dir)
     }
