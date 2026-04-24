@@ -10,6 +10,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::business::IpVersion;
+
+fn parse_ip_version(s: &str) -> Result<IpVersion, String> {
+    match s.to_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => Ok(IpVersion::V4),
+        "v6" | "ipv6" | "6" => Ok(IpVersion::V6),
+        "auto" | "dual" => Ok(IpVersion::Auto),
+        other => Err(format!(
+            "Invalid IP version '{}'. Use 'v4', 'v6', or 'auto'",
+            other
+        )),
+    }
+}
+
 /// Parse duration string (e.g., "60s", "2m", "1h") or plain seconds
 fn parse_duration(s: &str) -> Result<Duration, String> {
     // Try parsing as humantime duration first (e.g., "60s", "2m", "1h30m")
@@ -154,6 +168,16 @@ pub struct CliArgs {
     /// Refresh geodata files (geoip.dat, geosite.dat) on startup
     #[arg(long, env = "X_PANDA_TROJAN_REFRESH_GEODATA", default_value_t = false)]
     pub refresh_geodata: bool,
+
+    /// IP version preference for panel API connections (auto, v4, v6)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_PANEL_IP_VERSION",
+        default_value = "v4",
+        value_parser = parse_ip_version,
+        help_heading = "Network"
+    )]
+    pub panel_ip_version: IpVersion,
 }
 
 /// Default maximum concurrent connections.
@@ -449,6 +473,7 @@ mod tests {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             block_private_ip: true,
             refresh_geodata: false,
+            panel_ip_version: IpVersion::V4,
         }
     }
 
@@ -486,6 +511,7 @@ mod tests {
             tcp_nodelay: true,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             refresh_geodata: false,
+            panel_ip_version: IpVersion::V4,
         };
         (cli, temp_dir)
     }
@@ -860,5 +886,39 @@ mod tests {
         assert_ne!(config.uplink_only_timeout, config.downlink_only_timeout);
         assert_eq!(config.uplink_only_timeout_secs(), 1);
         assert_eq!(config.downlink_only_timeout_secs(), 99);
+    }
+
+    #[test]
+    fn test_parse_ip_version_valid() {
+        let cases = [
+            ("v4", IpVersion::V4),
+            ("V4", IpVersion::V4),
+            ("ipv4", IpVersion::V4),
+            ("IPv4", IpVersion::V4),
+            ("4", IpVersion::V4),
+            ("v6", IpVersion::V6),
+            ("V6", IpVersion::V6),
+            ("ipv6", IpVersion::V6),
+            ("IPv6", IpVersion::V6),
+            ("6", IpVersion::V6),
+            ("auto", IpVersion::Auto),
+            ("Auto", IpVersion::Auto),
+            ("AUTO", IpVersion::Auto),
+            ("dual", IpVersion::Auto),
+            ("Dual", IpVersion::Auto),
+        ];
+        for (input, expected) in &cases {
+            assert_eq!(
+                parse_ip_version(input).unwrap(),
+                *expected,
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_version_invalid() {
+        assert!(parse_ip_version("invalid").is_err());
+        assert!(parse_ip_version("bad").is_err());
     }
 }
