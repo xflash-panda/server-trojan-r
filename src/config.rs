@@ -347,8 +347,6 @@ impl ConnConfig {
 /// Runtime server configuration (built from remote panel config + CLI args)
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Host address to bind
-    pub host: String,
     /// Port number
     pub port: u16,
     /// Enable WebSocket mode
@@ -401,7 +399,6 @@ impl ServerConfig {
         let key = Some(PathBuf::from(&cli.key_file));
 
         Ok(Self {
-            host: "0.0.0.0".to_string(), // Always bind to all interfaces
             port: remote.server_port,
             enable_ws,
             enable_grpc,
@@ -703,20 +700,6 @@ mod tests {
             config.acl_conf_file,
             Some(PathBuf::from("/path/to/acl.yaml"))
         );
-    }
-
-    #[test]
-    fn test_server_config_host_always_binds_all() {
-        let remote = TrojanConfig {
-            server_port: 8080,
-            network: None,
-            websocket_config: None,
-            grpc_config: None,
-        };
-        let cli = create_test_cli_args();
-        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
-
-        assert_eq!(config.host, "0.0.0.0");
     }
 
     #[test]

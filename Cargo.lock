@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "server-trojan-rs"
-version = "0.2.28"
+version = "0.2.29"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
@@ -1556,6 +1556,7 @@ dependencies = [
  "h2",
  "http",
  "humantime",
+ "libc",
  "panel-core",
  "panel-http",
  "rustls",
