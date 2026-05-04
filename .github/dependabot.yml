@@ -13,4 +13,12 @@ updates:
       - xflash-panda-git
     schedule:
       interval: "weekly"
+    target-branch: "dev/agent-master"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    registries:
+      - xflash-panda-git
+    schedule:
+      interval: "weekly"
     target-branch: "dev/master"
