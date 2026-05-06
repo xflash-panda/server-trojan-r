@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::business::{IpVersion, NodeConfigEnum};
+use crate::config_auto::MaxConnections;
 
 /// Parse IP version string (v4, v6, auto) into IpVersion enum
 fn parse_ip_version(s: &str) -> Result<IpVersion, String> {
@@ -194,14 +195,15 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_DOWNLINK_ONLY_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
     pub downlink_only_timeout: Duration,
 
-    /// Maximum concurrent connections (default: 10000, 0 = unlimited)
+    /// Maximum concurrent connections. Use 'auto' to derive a sensible cap
+    /// from CPU cores, total RAM, and the file-descriptor limit.
     #[arg(
         long,
         env = "X_PANDA_TROJAN_MAX_CONNECTIONS",
-        default_value_t = DEFAULT_MAX_CONNECTIONS,
+        default_value = "auto",
         help_heading = "Performance"
     )]
-    pub max_connections: usize,
+    pub max_connections: MaxConnections,
 }
 
 impl CliArgs {
@@ -314,15 +316,6 @@ pub fn parse_trojan_config(config_enum: NodeConfigEnum) -> Result<TrojanConfig> 
     }
 }
 
-/// Default maximum concurrent connections.
-///
-/// Prevents accept loop death spiral: without a bound, `tokio::spawn` creates
-/// tasks faster than the runtime can poll them. At 45k+ tasks, new tasks sit in
-/// the run queue unpolled, their timeouts never start, and connections accumulate
-/// indefinitely. The semaphore pauses `accept()` when at capacity, letting the
-/// TCP SYN queue absorb bursts while existing tasks drain normally.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
-
 /// Default gRPC service name (Xray compatible)
 pub const DEFAULT_GRPC_SERVICE_NAME: &str = "GunService";
 
@@ -355,8 +348,13 @@ pub struct ConnConfig {
 }
 
 impl ConnConfig {
-    /// Create from CLI args
-    pub fn from_cli(cli: &CliArgs) -> Self {
+    /// Create from CLI args plus a pre-resolved `max_connections`.
+    ///
+    /// The caller owns `config_auto::resolve(cli.max_connections)` so that
+    /// the resolved value used for enforcement and the value used for
+    /// diagnostic logging are guaranteed to come from the same call —
+    /// no implicit "trust me, resolve is idempotent" contract.
+    pub fn from_cli(cli: &CliArgs, max_connections: usize) -> Self {
         Self {
             idle_timeout: cli.conn_idle_timeout,
             uplink_only_timeout: cli.uplink_only_timeout,
@@ -367,7 +365,7 @@ impl ConnConfig {
             buffer_size: cli.buffer_size,
             tcp_backlog: cli.tcp_backlog,
             tcp_nodelay: cli.tcp_nodelay,
-            max_connections: cli.max_connections,
+            max_connections,
         }
     }
 
@@ -489,7 +487,7 @@ mod tests {
             tcp_nodelay: true,
             uplink_only_timeout: Duration::from_secs(2),
             downlink_only_timeout: Duration::from_secs(5),
-            max_connections: 0,
+            max_connections: MaxConnections::Fixed(10_000),
             block_private_ip: true,
             refresh_geodata: false,
             server_name: None,
@@ -531,7 +529,7 @@ mod tests {
             tcp_nodelay: true,
             uplink_only_timeout: Duration::from_secs(2),
             downlink_only_timeout: Duration::from_secs(5),
-            max_connections: 0,
+            max_connections: MaxConnections::Fixed(10_000),
             server_name: None,
             ca_file: None,
             panel_ip_version: IpVersion::V4,
@@ -612,18 +610,30 @@ mod tests {
     }
 
     #[test]
-    fn test_conn_config_from_cli_max_connections_default_unlimited() {
+    fn test_conn_config_from_cli_max_connections_passes_through() {
+        // from_cli is now a thin transcription: whatever resolved usize the
+        // caller hands in is the value enforcement uses.  Both fixed and
+        // auto-resolved values flow through the same way.
         let cli = create_test_cli_args();
-        let config = ConnConfig::from_cli(&cli);
-        assert_eq!(config.max_connections, 0); // default: unlimited
+        let config = ConnConfig::from_cli(&cli, 10_000);
+        assert_eq!(config.max_connections, 10_000);
+
+        let config_custom = ConnConfig::from_cli(&cli, 100_000);
+        assert_eq!(config_custom.max_connections, 100_000);
     }
 
     #[test]
-    fn test_conn_config_from_cli_max_connections_custom() {
-        let mut cli = create_test_cli_args();
-        cli.max_connections = 100000;
-        let config = ConnConfig::from_cli(&cli);
-        assert_eq!(config.max_connections, 100000);
+    fn test_conn_config_from_cli_accepts_resolved_auto_value() {
+        // Auto must always produce a positive value — never 0 — to prevent
+        // the accept-loop death spiral that an unlimited semaphore caused
+        // in the original 0-default era.
+        use crate::config_auto;
+
+        let cli = create_test_cli_args();
+        let resolved = config_auto::resolve(MaxConnections::Auto).value;
+        assert!(resolved >= 1, "auto must resolve to a positive value");
+        let config = ConnConfig::from_cli(&cli, resolved);
+        assert_eq!(config.max_connections, resolved);
     }
 
     #[test]
@@ -810,7 +820,7 @@ mod tests {
     #[test]
     fn test_conn_config_uplink_downlink_defaults() {
         let cli = create_test_cli_args();
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.uplink_only_timeout, Duration::from_secs(2));
         assert_eq!(config.downlink_only_timeout, Duration::from_secs(5));
         assert_eq!(config.uplink_only_timeout_secs(), 2);
@@ -822,7 +832,7 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.uplink_only_timeout = Duration::from_secs(10);
         cli.downlink_only_timeout = Duration::from_secs(30);
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.uplink_only_timeout_secs(), 10);
         assert_eq!(config.downlink_only_timeout_secs(), 30);
     }
@@ -832,7 +842,7 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.uplink_only_timeout = Duration::from_secs(1);
         cli.downlink_only_timeout = Duration::from_secs(60);
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_ne!(
             config.uplink_only_timeout_secs(),
             config.downlink_only_timeout_secs()
@@ -846,7 +856,7 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.uplink_only_timeout = Duration::ZERO;
         cli.downlink_only_timeout = Duration::ZERO;
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.uplink_only_timeout_secs(), 0);
         assert_eq!(config.downlink_only_timeout_secs(), 0);
     }
