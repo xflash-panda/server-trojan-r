@@ -10,6 +10,7 @@
 mod acl;
 mod business;
 mod config;
+mod config_auto;
 mod core;
 mod error;
 mod handler;
@@ -109,8 +110,42 @@ async fn main() -> Result<()> {
     // Build router from ACL config
     let router = server_runner::build_router(&server_config, cli.refresh_geodata).await?;
 
-    // Build connection config from CLI args
-    let conn_config = config::ConnConfig::from_cli(&cli);
+    // Resolve max_connections (auto or fixed) once, then feed the same
+    // value to enforcement (ConnConfig) and diagnostics (log).
+    let resolved_max = config_auto::resolve(cli.max_connections);
+    let bd = resolved_max.breakdown;
+    let mode = match resolved_max.mode {
+        config_auto::ResolveMode::Auto => "auto",
+        config_auto::ResolveMode::Fixed => "fixed",
+    };
+    log::info!(
+        mode = mode,
+        value = resolved_max.value,
+        cpus = resolved_max.cpus,
+        total_mem_kb = resolved_max.total_mem_kb,
+        nofile_soft = resolved_max.nofile_soft,
+        cpu_cap = bd.cpu_cap,
+        mem_cap = bd.mem_cap,
+        fd_cap = bd.fd_cap,
+        limiting = bd.limiting.as_str(),
+        "max_connections resolved"
+    );
+    if resolved_max.mode == config_auto::ResolveMode::Fixed
+        && config_auto::fixed_exceeds_auto_cap(resolved_max.value, &bd)
+    {
+        log::warn!(
+            value = resolved_max.value,
+            cpu_cap = bd.cpu_cap,
+            mem_cap = bd.mem_cap,
+            fd_cap = bd.fd_cap,
+            limiting = bd.limiting.as_str(),
+            "max_connections=fixed exceeds the auto-derived safe cap"
+        );
+    }
+
+    // Build connection config from CLI args, passing the resolved value so
+    // enforcement and the log line above can never disagree.
+    let conn_config = config::ConnConfig::from_cli(&cli, resolved_max.value);
 
     // Clone conn_manager before moving into Server (for graceful shutdown)
     let conn_manager_for_shutdown = conn_manager.clone();
