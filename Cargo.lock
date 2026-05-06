@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "server-trojan-rs"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
