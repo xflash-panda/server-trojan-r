@@ -10,6 +10,21 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::business::IpVersion;
+use crate::config_auto::MaxConnections;
+
+fn parse_ip_version(s: &str) -> Result<IpVersion, String> {
+    match s.to_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => Ok(IpVersion::V4),
+        "v6" | "ipv6" | "6" => Ok(IpVersion::V6),
+        "auto" | "dual" => Ok(IpVersion::Auto),
+        other => Err(format!(
+            "Invalid IP version '{}'. Use 'v4', 'v6', or 'auto'",
+            other
+        )),
+    }
+}
+
 /// Parse duration string (e.g., "60s", "2m", "1h") or plain seconds
 fn parse_duration(s: &str) -> Result<Duration, String> {
     // Try parsing as humantime duration first (e.g., "60s", "2m", "1h30m")
@@ -142,28 +157,30 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_DOWNLINK_ONLY_TIMEOUT", default_value = "5s", value_parser = parse_duration, help_heading = "Performance")]
     pub downlink_only_timeout: Duration,
 
-    /// Maximum concurrent connections (default: 10000, 0 = unlimited)
+    /// Maximum concurrent connections. Use 'auto' to derive a sensible cap
+    /// from CPU cores, total RAM, and the file-descriptor limit.
     #[arg(
         long,
         env = "X_PANDA_TROJAN_MAX_CONNECTIONS",
-        default_value_t = DEFAULT_MAX_CONNECTIONS,
+        default_value = "auto",
         help_heading = "Performance"
     )]
-    pub max_connections: usize,
+    pub max_connections: MaxConnections,
 
     /// Refresh geodata files (geoip.dat, geosite.dat) on startup
     #[arg(long, env = "X_PANDA_TROJAN_REFRESH_GEODATA", default_value_t = false)]
     pub refresh_geodata: bool,
-}
 
-/// Default maximum concurrent connections.
-///
-/// Prevents accept loop death spiral: without a bound, `tokio::spawn` creates
-/// tasks faster than the runtime can poll them. At 45k+ tasks, new tasks sit in
-/// the run queue unpolled, their timeouts never start, and connections accumulate
-/// indefinitely. The semaphore pauses `accept()` when at capacity, letting the
-/// TCP SYN queue absorb bursts while existing tasks drain normally.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+    /// IP version preference for panel API connections (auto, v4, v6)
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_PANEL_IP_VERSION",
+        default_value = "v4",
+        value_parser = parse_ip_version,
+        help_heading = "Network"
+    )]
+    pub panel_ip_version: IpVersion,
+}
 
 impl CliArgs {
     /// Parse CLI arguments
@@ -312,8 +329,13 @@ pub struct ConnConfig {
 }
 
 impl ConnConfig {
-    /// Create from CLI args
-    pub fn from_cli(cli: &CliArgs) -> Self {
+    /// Create from CLI args plus a pre-resolved `max_connections`.
+    ///
+    /// The caller owns `config_auto::resolve(cli.max_connections)` so that
+    /// the resolved value used for enforcement and the value used for
+    /// diagnostic logging are guaranteed to come from the same call —
+    /// no implicit "trust me, resolve is idempotent" contract.
+    pub fn from_cli(cli: &CliArgs, max_connections: usize) -> Self {
         Self {
             idle_timeout: cli.conn_idle_timeout,
             uplink_only_timeout: cli.uplink_only_timeout,
@@ -324,7 +346,7 @@ impl ConnConfig {
             buffer_size: cli.buffer_size,
             tcp_backlog: cli.tcp_backlog,
             tcp_nodelay: cli.tcp_nodelay,
-            max_connections: cli.max_connections,
+            max_connections,
         }
     }
 
@@ -347,8 +369,6 @@ impl ConnConfig {
 /// Runtime server configuration (built from remote panel config + CLI args)
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Host address to bind
-    pub host: String,
     /// Port number
     pub port: u16,
     /// Enable WebSocket mode
@@ -401,7 +421,6 @@ impl ServerConfig {
         let key = Some(PathBuf::from(&cli.key_file));
 
         Ok(Self {
-            host: "0.0.0.0".to_string(), // Always bind to all interfaces
             port: remote.server_port,
             enable_ws,
             enable_grpc,
@@ -449,9 +468,10 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_connections: MaxConnections::Fixed(10_000),
             block_private_ip: true,
             refresh_geodata: false,
+            panel_ip_version: IpVersion::V4,
         }
     }
 
@@ -487,8 +507,9 @@ mod tests {
             buffer_size: 32 * 1024,
             tcp_backlog: 1024,
             tcp_nodelay: true,
-            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_connections: MaxConnections::Fixed(10_000),
             refresh_geodata: false,
+            panel_ip_version: IpVersion::V4,
         };
         (cli, temp_dir)
     }
@@ -706,20 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn test_server_config_host_always_binds_all() {
-        let remote = TrojanConfig {
-            server_port: 8080,
-            network: None,
-            websocket_config: None,
-            grpc_config: None,
-        };
-        let cli = create_test_cli_args();
-        let config = ServerConfig::from_remote(&remote, &cli).unwrap();
-
-        assert_eq!(config.host, "0.0.0.0");
-    }
-
-    #[test]
     fn test_server_config_default_ws_path() {
         let remote = TrojanConfig {
             server_port: 443,
@@ -827,24 +834,36 @@ mod tests {
     }
 
     #[test]
-    fn test_conn_config_from_cli_max_connections_default_unlimited() {
+    fn test_conn_config_from_cli_max_connections_passes_through() {
+        // from_cli is now a thin transcription: whatever resolved usize the
+        // caller hands in is the value enforcement uses.  Both fixed and
+        // auto-resolved values flow through the same way.
         let cli = create_test_cli_args();
-        let config = ConnConfig::from_cli(&cli);
-        assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
+        let config = ConnConfig::from_cli(&cli, 10_000);
+        assert_eq!(config.max_connections, 10_000);
+
+        let config_custom = ConnConfig::from_cli(&cli, 100_000);
+        assert_eq!(config_custom.max_connections, 100_000);
     }
 
     #[test]
-    fn test_conn_config_from_cli_max_connections_custom() {
-        let mut cli = create_test_cli_args();
-        cli.max_connections = 100000;
-        let config = ConnConfig::from_cli(&cli);
-        assert_eq!(config.max_connections, 100000);
+    fn test_conn_config_from_cli_accepts_resolved_auto_value() {
+        // Auto must always produce a positive value — never 0 — to prevent
+        // the accept-loop death spiral that an unlimited semaphore caused
+        // in the original 0-default era.
+        use crate::config_auto;
+
+        let cli = create_test_cli_args();
+        let resolved = config_auto::resolve(MaxConnections::Auto).value;
+        assert!(resolved >= 1, "auto must resolve to a positive value");
+        let config = ConnConfig::from_cli(&cli, resolved);
+        assert_eq!(config.max_connections, resolved);
     }
 
     #[test]
     fn test_conn_config_uplink_only_timeout_default() {
         let cli = create_test_cli_args();
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.uplink_only_timeout, Duration::from_secs(2));
         assert_eq!(config.uplink_only_timeout_secs(), 2);
     }
@@ -852,7 +871,7 @@ mod tests {
     #[test]
     fn test_conn_config_downlink_only_timeout_default() {
         let cli = create_test_cli_args();
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.downlink_only_timeout, Duration::from_secs(5));
         assert_eq!(config.downlink_only_timeout_secs(), 5);
     }
@@ -862,7 +881,7 @@ mod tests {
         let mut cli = create_test_cli_args();
         cli.uplink_only_timeout = Duration::from_secs(10);
         cli.downlink_only_timeout = Duration::from_secs(30);
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_eq!(config.uplink_only_timeout_secs(), 10);
         assert_eq!(config.downlink_only_timeout_secs(), 30);
     }
@@ -873,9 +892,43 @@ mod tests {
         // Verify the two timeouts are independent fields
         cli.uplink_only_timeout = Duration::from_secs(1);
         cli.downlink_only_timeout = Duration::from_secs(99);
-        let config = ConnConfig::from_cli(&cli);
+        let config = ConnConfig::from_cli(&cli, 10_000);
         assert_ne!(config.uplink_only_timeout, config.downlink_only_timeout);
         assert_eq!(config.uplink_only_timeout_secs(), 1);
         assert_eq!(config.downlink_only_timeout_secs(), 99);
+    }
+
+    #[test]
+    fn test_parse_ip_version_valid() {
+        let cases = [
+            ("v4", IpVersion::V4),
+            ("V4", IpVersion::V4),
+            ("ipv4", IpVersion::V4),
+            ("IPv4", IpVersion::V4),
+            ("4", IpVersion::V4),
+            ("v6", IpVersion::V6),
+            ("V6", IpVersion::V6),
+            ("ipv6", IpVersion::V6),
+            ("IPv6", IpVersion::V6),
+            ("6", IpVersion::V6),
+            ("auto", IpVersion::Auto),
+            ("Auto", IpVersion::Auto),
+            ("AUTO", IpVersion::Auto),
+            ("dual", IpVersion::Auto),
+            ("Dual", IpVersion::Auto),
+        ];
+        for (input, expected) in &cases {
+            assert_eq!(
+                parse_ip_version(input).unwrap(),
+                *expected,
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ip_version_invalid() {
+        assert!(parse_ip_version("invalid").is_err());
+        assert!(parse_ip_version("bad").is_err());
     }
 }

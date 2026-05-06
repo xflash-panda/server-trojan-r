@@ -1,6 +1,6 @@
 [package]
 name = "server-trojan-rs"
-version = "0.2.28"
+version = "0.2.31"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,7 @@ anyhow = "1.0"
 bytes = "1.11"
 clap = { version = "4.6", features = ["derive", "env"] }
 humantime = "2.1"
+libc = "0.2"
 tokio-rustls = "0.26.4"
 rustls = { version = "0.23.36", features = ["aws_lc_rs"] }
 rustls-pemfile = "2.2.0"
@@ -35,8 +36,8 @@ arc-swap = "1"
 acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs.git", tag = "v0.4.4", features = ["async"] }
 
 # Panel Integration
-panel-core = { git = "https://github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.7" }
-panel-http = { git = "https://github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.7" }
+panel-core = { git = "https://github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.10" }
+panel-http = { git = "https://github.com/xflash-panda/server-panel-rs.git", tag = "v0.1.10" }
 socket2 = "0.6"
 
 [[bin]]

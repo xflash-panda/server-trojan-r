@@ -206,7 +206,6 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
     use crate::transport::TlsTransportListener;
     use tokio::sync::Semaphore;
 
-    let addr = format!("{}:{}", config.host, config.port);
     let (transport_type, has_tls) = build_transport_config(config);
 
     // Connection limiter: 0 = unlimited
@@ -227,23 +226,8 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
         None
     };
 
-    // Bind TCP listener with SO_REUSEADDR for fast restarts
-    let socket_addr: std::net::SocketAddr = addr.parse()?;
-    let socket = socket2::Socket::new(
-        match socket_addr {
-            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
-            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
-        },
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    // Allow immediate rebind after restart (skip TIME_WAIT)
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&socket_addr.into())?;
-    socket.listen(server.conn_config.tcp_backlog)?;
-
-    let listener = tokio::net::TcpListener::from_std(socket.into())?;
+    // Bind TCP listener with IPv4+IPv6 dual-stack support
+    let listener = crate::net::bind_dual_stack(config.port, server.conn_config.tcp_backlog)?;
     let local_addr = listener.local_addr()?;
 
     // Build network settings from config (Arc-wrapped to avoid per-connection String clones)
@@ -512,25 +496,45 @@ mod tests {
     /// and their timeouts never start (task not polled yet). Connections accumulate
     /// indefinitely → death spiral.
     ///
-    /// Fix: default to a bounded value so the semaphore always provides backpressure.
+    /// Fix: the `auto` resolver always returns a positive value (`.max(1)`),
+    /// and the `MaxConnections` parser rejects `0`, so a bounded semaphore is
+    /// always created in practice.
+    ///
+    /// Hardware-independent guarantee: feed the pure `compute_auto` function
+    /// a representative minimum production config (1 CPU, 1 GB RAM, the
+    /// systemd default 65536 nofile) and assert the result is within a sane
+    /// operational range — meaningfully bounded but not absurdly small.
     #[test]
     fn test_default_max_connections_prevents_death_spiral() {
-        use crate::config::DEFAULT_MAX_CONNECTIONS;
+        use crate::config_auto::{self, MaxConnections};
 
-        const {
-            assert!(DEFAULT_MAX_CONNECTIONS > 0);
-            assert!(DEFAULT_MAX_CONNECTIONS >= 1024);
-            assert!(DEFAULT_MAX_CONNECTIONS <= 65535);
-        }
+        // Real host smoke test: never zero, always usable.
+        let resolved = config_auto::resolve(MaxConnections::Auto);
+        assert!(
+            resolved.value >= 1,
+            "auto-resolved max_connections must be >= 1 to prevent death spiral"
+        );
+
+        // Hardware-independent floor for a minimum production node.
+        // 1 CPU, 1 GB RAM, 65536 fd:
+        //   cpu_cap = 1*1500*1000/200 = 7500
+        //   mem_cap = 1024*1024*0.5/200 ≈ 2621  ← binds
+        //   fd_cap  = (65536-1024)/2 = 32256
+        let min_prod = config_auto::compute_auto(1, 1024 * 1024, 65_536);
+        assert!(
+            min_prod.value >= 2_000 && min_prod.value <= 10_000,
+            "min production config must yield a sensible cap, got {}",
+            min_prod.value
+        );
     }
 
-    /// When default max_connections is used, a semaphore must be created (not None).
+    /// When default (auto) max_connections is used, a semaphore must be created (not None).
     /// This is the key invariant that prevents the death spiral.
     #[tokio::test]
     async fn test_default_max_connections_creates_semaphore() {
-        use crate::config::DEFAULT_MAX_CONNECTIONS;
+        use crate::config_auto::{self, MaxConnections};
 
-        let max_connections = DEFAULT_MAX_CONNECTIONS;
+        let max_connections = config_auto::resolve(MaxConnections::Auto).value;
         let conn_limiter = if max_connections > 0 {
             Some(Arc::new(Semaphore::new(max_connections)))
         } else {
@@ -541,10 +545,7 @@ mod tests {
             conn_limiter.is_some(),
             "Default config must create a semaphore for backpressure"
         );
-        assert_eq!(
-            conn_limiter.unwrap().available_permits(),
-            DEFAULT_MAX_CONNECTIONS
-        );
+        assert_eq!(conn_limiter.unwrap().available_permits(), max_connections);
     }
 
     /// WS handshake must be wrapped in a timeout so that clients that complete

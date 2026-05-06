@@ -12,7 +12,7 @@ pub use panel_core::{
 
 /// Trojan-specific UserManager using SHA-224 hex keys ([u8; 56])
 pub type TrojanUserManager = UserManager<[u8; 56]>;
-pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig};
+pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig, IpVersion};
 
 /// Newtype bridging panel::StatsCollector to core::hooks::StatsCollector trait
 pub struct TrojanStatsCollector(pub Arc<PanelStatsCollector>);
