@@ -253,4 +253,100 @@ mod tests {
         assert!(!is_private);
         assert!(resolved.is_none());
     }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_hits_cache_on_second_call() {
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "hit.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]),
+        );
+        let addr = Address::Domain("hit.example".into(), 80);
+
+        resolve_socket_addr(&cache, &addr).await.unwrap();
+        resolve_socket_addr(&cache, &addr).await.unwrap();
+
+        assert_eq!(
+            mock.call_count("hit.example"),
+            1,
+            "cache must coalesce the second call"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_singleflight_coalesces_concurrent_calls() {
+        use futures_util::future::join_all;
+
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "race.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))]),
+        );
+        // Force concurrent callers to overlap inside the resolver.
+        mock.set_delay(Some(std::time::Duration::from_millis(50)));
+
+        let futs: Vec<_> = (0..100)
+            .map(|_| {
+                let c = cache.clone();
+                tokio::spawn(async move {
+                    let addr = Address::Domain("race.example".into(), 80);
+                    resolve_socket_addr(&c, &addr).await.unwrap();
+                })
+            })
+            .collect();
+        join_all(futs).await;
+
+        assert_eq!(
+            mock.call_count("race.example"),
+            1,
+            "singleflight must collapse 100 concurrent misses into one resolver call"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_negative_caching_holds_not_found() {
+        let (cache, mock) = mock_cache();
+        // Unmapped host => NotFound on every direct resolver call.
+        let addr = Address::Domain("nx.example".into(), 80);
+
+        let _ = resolve_socket_addr(&cache, &addr).await;
+        let _ = resolve_socket_addr(&cache, &addr).await;
+
+        assert_eq!(
+            mock.call_count("nx.example"),
+            1,
+            "negative caching must hold the NotFound result"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_refetches_after_positive_ttl_expires() {
+        // moka uses std::time::Instant (not tokio's mock clock), so we must use
+        // a short real TTL + real sleep. This mirrors the approach used in
+        // dns-cache-rs's own `positive_ttl_expires_then_re_resolves` test.
+        let mock = std::sync::Arc::new(dns_cache_rs::MockResolver::new());
+        mock.set(
+            "ttl.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3))]),
+        );
+        let cache = dns_cache_rs::DnsCache::builder()
+            .resolver_arc(mock.clone() as std::sync::Arc<dyn dns_cache_rs::Resolver>)
+            .ttl(std::time::Duration::from_millis(200))
+            .build()
+            .expect("DnsCache build with short TTL");
+        let addr = Address::Domain("ttl.example".into(), 80);
+
+        resolve_socket_addr(&cache, &addr).await.unwrap();
+        assert_eq!(mock.call_count("ttl.example"), 1);
+
+        // Advance past the 200ms TTL with a 400ms margin to absorb CI jitter.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        resolve_socket_addr(&cache, &addr).await.unwrap();
+        assert_eq!(
+            mock.call_count("ttl.example"),
+            2,
+            "after TTL expiry the resolver must be invoked again"
+        );
+    }
 }
