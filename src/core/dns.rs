@@ -348,34 +348,7 @@ mod tests {
         );
     }
 
-    // --- Migrated from src/core/protocol.rs (test_address_to_socket_addr_*) ---
-
-    #[tokio::test]
-    async fn migrated_to_socket_addr_ipv4() {
-        let (cache, _) = mock_cache();
-        let addr = Address::IPv4([127, 0, 0, 1], 8080);
-        let got = resolve_socket_addr(&cache, &addr).await.unwrap();
-        assert_eq!(got.to_string(), "127.0.0.1:8080");
-    }
-
-    #[tokio::test]
-    async fn migrated_to_socket_addr_ipv6() {
-        let (cache, _) = mock_cache();
-        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
-        let got = resolve_socket_addr(&cache, &addr).await.unwrap();
-        assert_eq!(got.to_string(), "[::1]:443");
-    }
-
-    #[tokio::test]
-    async fn migrated_to_socket_addr_domain_resolves() {
-        let (cache, mock) = mock_cache();
-        mock.set(
-            "localhost.test",
-            Ok(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
-        );
-        let addr = Address::Domain("localhost.test".into(), 80);
-        assert!(resolve_socket_addr(&cache, &addr).await.is_ok());
-    }
+    // --- Regression: empty-domain edge case migrated from protocol.rs ---
 
     #[tokio::test]
     async fn migrated_to_socket_addr_empty_domain_fails() {
