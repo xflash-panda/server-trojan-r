@@ -10,8 +10,7 @@
 
 use bytes::{Bytes, BytesMut};
 use std::borrow::Cow;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::net::lookup_host;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::logger::log;
 
@@ -171,24 +170,6 @@ impl Address {
             Address::IPv4(ip, _) => Cow::Owned(Ipv4Addr::from(*ip).to_string()),
             Address::IPv6(ip, _) => Cow::Owned(Ipv6Addr::from(*ip).to_string()),
             Address::Domain(domain, _) => Cow::Borrowed(domain),
-        }
-    }
-
-    /// Resolve to socket address
-    pub async fn to_socket_addr(&self) -> std::io::Result<SocketAddr> {
-        match self {
-            Address::IPv4(ip, port) => Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(*ip)), *port)),
-            Address::IPv6(ip, port) => Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(*ip)), *port)),
-            Address::Domain(domain, port) => {
-                let addr_str = format!("{}:{}", domain, port);
-                let mut addrs = lookup_host(&addr_str).await?;
-                addrs.next().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("no addresses found for {}", domain),
-                    )
-                })
-            }
         }
     }
 }
@@ -587,36 +568,6 @@ mod tests {
             TrojanRequest::decode_zerocopy(&mut buf),
             DecodeResult::Invalid(_)
         ));
-    }
-
-    #[tokio::test]
-    async fn test_address_to_socket_addr_ipv4() {
-        let addr = Address::IPv4([127, 0, 0, 1], 8080);
-        let socket_addr = addr.to_socket_addr().await.unwrap();
-        assert_eq!(socket_addr.to_string(), "127.0.0.1:8080");
-    }
-
-    #[tokio::test]
-    async fn test_address_to_socket_addr_ipv6() {
-        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
-        let socket_addr = addr.to_socket_addr().await.unwrap();
-        assert_eq!(socket_addr.to_string(), "[::1]:443");
-    }
-
-    #[tokio::test]
-    async fn test_address_to_socket_addr_domain() {
-        let addr = Address::Domain("localhost".to_string(), 80);
-        let result = addr.to_socket_addr().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_address_to_socket_addr_domain_resolution() {
-        // Test with an empty domain which should fail
-        let addr = Address::Domain("".to_string(), 80);
-        let result = addr.to_socket_addr().await;
-        // Empty domain should fail to resolve
-        assert!(result.is_err());
     }
 
     #[test]

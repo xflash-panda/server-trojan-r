@@ -7,6 +7,7 @@ use std::sync::Arc;
 use super::connection::ConnectionManager;
 use super::hooks::{Authenticator, DirectRouter, OutboundRouter, StatsCollector};
 use crate::config::ConnConfig;
+use dns_cache_rs::DnsCache;
 
 /// Core proxy server
 pub struct Server {
@@ -20,6 +21,8 @@ pub struct Server {
     pub conn_manager: ConnectionManager,
     /// Connection performance configuration
     pub conn_config: ConnConfig,
+    /// Shared DNS cache (cloned into routers; cheap — Arc-backed).
+    pub dns_cache: DnsCache,
 }
 
 impl Server {
@@ -36,6 +39,7 @@ pub struct ServerBuilder {
     router: Option<Arc<dyn OutboundRouter>>,
     conn_manager: Option<ConnectionManager>,
     conn_config: Option<ConnConfig>,
+    dns_cache: Option<DnsCache>,
 }
 
 impl Default for ServerBuilder {
@@ -53,6 +57,7 @@ impl ServerBuilder {
             router: None,
             conn_manager: None,
             conn_config: None,
+            dns_cache: None,
         }
     }
 
@@ -86,16 +91,26 @@ impl ServerBuilder {
         self
     }
 
+    /// Set shared DNS cache (required — `build()` panics if not set).
+    pub fn dns_cache(mut self, cache: DnsCache) -> Self {
+        self.dns_cache = Some(cache);
+        self
+    }
+
     /// Build the server
     ///
-    /// Panics if authenticator, stats collector or conn_config is not set
+    /// Panics if authenticator, stats collector, conn_config, or dns_cache is not set
     pub fn build(self) -> Server {
+        let dns_cache = self.dns_cache.expect("dns_cache is required");
         Server {
             authenticator: self.authenticator.expect("authenticator is required"),
             stats: self.stats.expect("stats collector is required"),
-            router: self.router.unwrap_or_else(|| Arc::new(DirectRouter::new())),
+            router: self
+                .router
+                .unwrap_or_else(|| Arc::new(DirectRouter::with_cache(true, dns_cache.clone()))),
             conn_manager: self.conn_manager.unwrap_or_default(),
             conn_config: self.conn_config.expect("conn_config is required"),
+            dns_cache,
         }
     }
 }
@@ -157,6 +172,7 @@ mod tests {
             .authenticator(Arc::new(TestAuthenticator))
             .stats(Arc::new(TestStatsCollector::new()))
             .conn_config(test_conn_config())
+            .dns_cache(dns_cache_rs::DnsCache::new())
             .build();
     }
 
@@ -168,6 +184,7 @@ mod tests {
             .stats(Arc::new(TestStatsCollector::new()))
             .conn_manager(conn_manager)
             .conn_config(test_conn_config())
+            .dns_cache(dns_cache_rs::DnsCache::new())
             .build();
     }
 }

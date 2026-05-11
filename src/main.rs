@@ -107,8 +107,13 @@ async fn main() -> Result<()> {
     let panel_stats = Arc::new(PanelStatsCollector::new());
     let stats_collector = Arc::new(TrojanStatsCollector(Arc::clone(&panel_stats)));
 
-    // Build router from ACL config
-    let router = server_runner::build_router(&server_config, cli.refresh_geodata).await?;
+    // Construct the shared DNS cache once. `DnsCache: Clone` over Arc, so all
+    // call sites (router, Server) share the same moka-backed storage.
+    let dns_cache = dns_cache_rs::DnsCache::new();
+
+    // Build router from ACL config (shares dns_cache).
+    let router =
+        server_runner::build_router(&server_config, cli.refresh_geodata, dns_cache.clone()).await?;
 
     // Resolve max_connections (auto or fixed) once, then feed the same
     // value to enforcement (ConnConfig) and diagnostics (log).
@@ -158,6 +163,7 @@ async fn main() -> Result<()> {
             .router(router)
             .conn_manager(conn_manager)
             .conn_config(conn_config)
+            .dns_cache(dns_cache)
             .build(),
     );
 
