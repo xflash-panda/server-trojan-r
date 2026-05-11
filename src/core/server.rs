@@ -91,7 +91,7 @@ impl ServerBuilder {
         self
     }
 
-    /// Set shared DNS cache (optional; defaults to `DnsCache::new()`).
+    /// Set shared DNS cache (required — `build()` panics if not set).
     pub fn dns_cache(mut self, cache: DnsCache) -> Self {
         self.dns_cache = Some(cache);
         self
