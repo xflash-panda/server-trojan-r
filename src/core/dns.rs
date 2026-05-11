@@ -181,4 +181,76 @@ mod tests {
         let err = resolve_socket_addr(&cache, &addr).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
+
+    #[tokio::test]
+    async fn check_private_and_resolve_ipv4_private_literal() {
+        let (cache, mock) = mock_cache();
+        let addr = Address::IPv4([10, 0, 0, 1], 80);
+        let (is_private, resolved) = check_private_and_resolve(&cache, &addr).await;
+        assert!(is_private);
+        assert!(resolved.is_none());
+        assert_eq!(mock.total_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn check_private_and_resolve_ipv6_private_literal() {
+        let (cache, mock) = mock_cache();
+        // ::1 is loopback
+        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 80);
+        let (is_private, resolved) = check_private_and_resolve(&cache, &addr).await;
+        assert!(is_private);
+        assert!(resolved.is_none());
+        assert_eq!(mock.total_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn check_private_and_resolve_public_ip_literal() {
+        let (cache, mock) = mock_cache();
+        let addr = Address::IPv4([8, 8, 8, 8], 53);
+        let (is_private, resolved) = check_private_and_resolve(&cache, &addr).await;
+        assert!(!is_private);
+        assert!(
+            resolved.is_none(),
+            "IP literals never carry a resolved addr"
+        );
+        assert_eq!(mock.total_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn check_private_and_resolve_domain_resolves_to_private() {
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "internal.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))]),
+        );
+        let addr = Address::Domain("internal.example".into(), 443);
+        let (is_private, resolved) = check_private_and_resolve(&cache, &addr).await;
+        assert!(is_private);
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_private_and_resolve_domain_resolves_to_public() {
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "example.com",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]),
+        );
+        let addr = Address::Domain("example.com".into(), 443);
+        let (is_private, resolved) = check_private_and_resolve(&cache, &addr).await;
+        assert!(!is_private);
+        let sa = resolved.expect("public domain must return a resolved addr");
+        assert_eq!(sa, "93.184.216.34:443".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_private_and_resolve_domain_resolution_failure_returns_false_none() {
+        // Regression guard: preserves v0.2.31 behavior of failing open on
+        // DNS errors. Tightening this is out of scope for this refactor.
+        let (cache, _mock) = mock_cache();
+        let addr = Address::Domain("nx.invalid".into(), 80);
+        let (is_private, resolved) = check_private_and_resolve(&cache, &addr).await;
+        assert!(!is_private);
+        assert!(resolved.is_none());
+    }
 }
