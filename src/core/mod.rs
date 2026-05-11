@@ -7,6 +7,7 @@
 //! - Hook traits for extensibility
 
 mod connection;
+pub mod dns;
 pub mod hooks;
 pub mod ip_filter;
 mod protocol;
