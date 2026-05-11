@@ -118,12 +118,41 @@ impl OutboundRouter for DirectRouter {
 mod tests {
     use super::*;
 
+    use dns_cache_rs::{DnsCache, MockResolver};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    /// Build a `DnsCache` backed by a `MockResolver` that returns the given
+    /// result for the given host. Lets DirectRouter tests pin DNS behavior
+    /// without depending on the network.
+    fn mock_cache_with(
+        host: &str,
+        result: Result<Vec<IpAddr>, dns_cache_rs::DnsError>,
+    ) -> DnsCache {
+        let mock = Arc::new(MockResolver::new());
+        mock.set(host, result);
+        DnsCache::builder()
+            .resolver_arc(mock as Arc<dyn dns_cache_rs::Resolver>)
+            .build()
+            .expect("DnsCache build with MockResolver")
+    }
+
     #[tokio::test]
     async fn test_direct_router_public_domain() {
-        let router = DirectRouter::with_cache(true, dns_cache_rs::DnsCache::new());
+        let cache = mock_cache_with(
+            "example.com",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]),
+        );
+        let router = DirectRouter::with_cache(true, cache);
         let addr = Address::Domain("example.com".to_string(), 80);
         let result = router.route(&addr).await;
-        assert!(matches!(result, OutboundType::Direct { .. }));
+        assert!(matches!(
+            result,
+            OutboundType::Direct {
+                resolved: Some(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -178,10 +207,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_direct_router_domain_returns_resolved_addr() {
-        let router = DirectRouter::with_cache(true, dns_cache_rs::DnsCache::new());
-        // localhost resolves to 127.0.0.1 which is private → Reject
-        let addr = Address::Domain("localhost".to_string(), 80);
+    async fn test_direct_router_blocks_domain_resolving_to_private() {
+        // Replaces the previous network-based "localhost" test. Mocked
+        // resolver returns a private IP, so the router must Reject the
+        // domain target with block_private_ip=true.
+        let cache = mock_cache_with(
+            "internal.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))]),
+        );
+        let router = DirectRouter::with_cache(true, cache);
+        let addr = Address::Domain("internal.example".to_string(), 80);
         let result = router.route(&addr).await;
         assert!(matches!(result, OutboundType::Reject));
     }
