@@ -9,6 +9,7 @@ use crate::core::{hooks, Server};
 use crate::handler::process_connection;
 use crate::logger::log;
 use crate::transport::{ConnectionMeta, TransportStream, TransportType};
+use dns_cache_rs::DnsCache;
 
 use anyhow::{anyhow, Result};
 use socket2::{SockRef, TcpKeepalive};
@@ -33,6 +34,7 @@ pub fn build_transport_config(config: &config::ServerConfig) -> (TransportType, 
 pub async fn build_router(
     config: &config::ServerConfig,
     refresh_geodata: bool,
+    dns_cache: DnsCache,
 ) -> Result<Arc<dyn hooks::OutboundRouter>> {
     use crate::acl::AclRouter;
 
@@ -62,17 +64,19 @@ pub async fn build_router(
             "ACL router loaded"
         );
 
-        Ok(Arc::new(AclRouter::with_block_private_ip(
+        Ok(Arc::new(AclRouter::with_cache(
             engine,
             config.block_private_ip,
+            dns_cache,
         )) as Arc<dyn hooks::OutboundRouter>)
     } else {
         log::info!(
             block_private_ip = config.block_private_ip,
             "No ACL config, using direct connection for all traffic"
         );
-        Ok(Arc::new(hooks::DirectRouter::with_block_private_ip(
+        Ok(Arc::new(hooks::DirectRouter::with_cache(
             config.block_private_ip,
+            dns_cache,
         )) as Arc<dyn hooks::OutboundRouter>)
     }
 }
