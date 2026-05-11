@@ -99,9 +99,9 @@ impl ServerBuilder {
 
     /// Build the server
     ///
-    /// Panics if authenticator, stats collector or conn_config is not set
+    /// Panics if authenticator, stats collector, conn_config, or dns_cache is not set
     pub fn build(self) -> Server {
-        let dns_cache = self.dns_cache.unwrap_or_default();
+        let dns_cache = self.dns_cache.expect("dns_cache is required");
         Server {
             authenticator: self.authenticator.expect("authenticator is required"),
             stats: self.stats.expect("stats collector is required"),
@@ -172,6 +172,7 @@ mod tests {
             .authenticator(Arc::new(TestAuthenticator))
             .stats(Arc::new(TestStatsCollector::new()))
             .conn_config(test_conn_config())
+            .dns_cache(dns_cache_rs::DnsCache::new())
             .build();
     }
 
@@ -183,6 +184,7 @@ mod tests {
             .stats(Arc::new(TestStatsCollector::new()))
             .conn_manager(conn_manager)
             .conn_config(test_conn_config())
+            .dns_cache(dns_cache_rs::DnsCache::new())
             .build();
     }
 }
