@@ -341,7 +341,7 @@ async fn handle_direct_connect(
     // Fast path: no ACL handler, use simple TcpStream::connect with keepalive/nodelay
     let remote_addr = match resolved {
         Some(addr) => addr,
-        None => ctx.target.to_socket_addr().await?,
+        None => crate::core::dns::resolve_socket_addr(&ctx.server.dns_cache, ctx.target).await?,
     };
 
     let remote_stream = match tokio::time::timeout(

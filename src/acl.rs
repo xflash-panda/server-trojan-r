@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use dns_cache_rs::DnsCache;
 use serde::{Deserialize, Serialize};
 
 // Re-export types from acl-engine-rs
@@ -639,14 +640,17 @@ pub struct AclRouter {
     engine: AclEngine,
     /// Block connections to private/loopback IP addresses (SSRF protection)
     block_private_ip: bool,
+    /// Shared DNS cache (clone of `Server.dns_cache`).
+    dns_cache: DnsCache,
 }
 
 impl AclRouter {
-    /// Create a new ACL router with custom private IP blocking setting
-    pub fn with_block_private_ip(engine: AclEngine, block_private_ip: bool) -> Self {
+    /// Create a new ACL router sharing the given DNS cache.
+    pub fn with_cache(engine: AclEngine, block_private_ip: bool, dns_cache: DnsCache) -> Self {
         Self {
             engine,
             block_private_ip,
+            dns_cache,
         }
     }
 }
@@ -658,7 +662,8 @@ impl crate::core::hooks::OutboundRouter for AclRouter {
 
         // Check for private IP if blocking is enabled
         if self.block_private_ip {
-            let (is_private, resolved) = crate::core::hooks::check_private_and_resolve(addr).await;
+            let (is_private, resolved) =
+                crate::core::dns::check_private_and_resolve(&self.dns_cache, addr).await;
             if is_private {
                 log::debug!(target = %addr, "Blocked private address");
                 return crate::core::hooks::OutboundType::Reject;
@@ -1606,14 +1611,14 @@ acl:
     #[test]
     fn test_acl_router_blocks_private_ip_by_default() {
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, true);
+        let router = AclRouter::with_cache(engine, true, dns_cache_rs::DnsCache::new());
         assert!(router.block_private_ip);
     }
 
     #[test]
     fn test_acl_router_with_custom_block_setting() {
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, false);
+        let router = AclRouter::with_cache(engine, false, dns_cache_rs::DnsCache::new());
         assert!(!router.block_private_ip);
     }
 
@@ -1623,7 +1628,7 @@ acl:
         use crate::core::Address;
 
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, true);
+        let router = AclRouter::with_cache(engine, true, dns_cache_rs::DnsCache::new());
 
         // Test loopback
         let addr = Address::IPv4([127, 0, 0, 1], 80);
@@ -1655,7 +1660,7 @@ acl:
         use crate::core::Address;
 
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, true);
+        let router = AclRouter::with_cache(engine, true, dns_cache_rs::DnsCache::new());
 
         // Test loopback ::1
         let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 80);
@@ -1674,7 +1679,7 @@ acl:
         use crate::core::Address;
 
         let engine = AclEngine::new_default().unwrap();
-        let router = AclRouter::with_block_private_ip(engine, false);
+        let router = AclRouter::with_cache(engine, false, dns_cache_rs::DnsCache::new());
 
         // Private IP should be allowed when blocking is disabled
         let addr = Address::IPv4([127, 0, 0, 1], 80);
