@@ -8,8 +8,6 @@
 //! `main.rs`, owned by `Server`, and cloned into the routers (cheap —
 //! `DnsCache: Clone` over Arc).
 
-#![allow(dead_code)]
-
 use std::io;
 use std::net::SocketAddr;
 
@@ -347,6 +345,54 @@ mod tests {
             mock.call_count("ttl.example"),
             2,
             "after TTL expiry the resolver must be invoked again"
+        );
+    }
+
+    // --- Migrated from src/core/protocol.rs (test_address_to_socket_addr_*) ---
+
+    #[tokio::test]
+    async fn migrated_to_socket_addr_ipv4() {
+        let (cache, _) = mock_cache();
+        let addr = Address::IPv4([127, 0, 0, 1], 8080);
+        let got = resolve_socket_addr(&cache, &addr).await.unwrap();
+        assert_eq!(got.to_string(), "127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn migrated_to_socket_addr_ipv6() {
+        let (cache, _) = mock_cache();
+        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
+        let got = resolve_socket_addr(&cache, &addr).await.unwrap();
+        assert_eq!(got.to_string(), "[::1]:443");
+    }
+
+    #[tokio::test]
+    async fn migrated_to_socket_addr_domain_resolves() {
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "localhost.test",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
+        );
+        let addr = Address::Domain("localhost.test".into(), 80);
+        assert!(resolve_socket_addr(&cache, &addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn migrated_to_socket_addr_empty_domain_fails() {
+        // Pre-refactor: `Address::Domain("", 80).to_socket_addr()` returned Err.
+        // dns-cache-rs's normalize step rejects empty hosts → InvalidHost.
+        let (cache, _) = mock_cache();
+        let addr = Address::Domain(String::new(), 80);
+        let err = resolve_socket_addr(&cache, &addr).await.unwrap_err();
+        // Either NotFound (no addrs) or InvalidInput (empty host) is acceptable;
+        // we just need a hard error like the pre-refactor behavior.
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+            ),
+            "expected NotFound or InvalidInput, got {:?}",
+            err.kind()
         );
     }
 }
