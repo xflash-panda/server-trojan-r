@@ -110,7 +110,6 @@ pub(crate) async fn check_private_and_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
@@ -132,5 +131,54 @@ mod tests {
         let got = resolve_socket_addr(&cache, &addr).await.unwrap();
         assert_eq!(got, "127.0.0.1:8080".parse::<SocketAddr>().unwrap());
         assert_eq!(mock.total_calls(), 0, "IP literal must not hit resolver");
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_ipv6_literal_bypasses_cache() {
+        let (cache, mock) = mock_cache();
+        let addr = Address::IPv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 443);
+        let got = resolve_socket_addr(&cache, &addr).await.unwrap();
+        assert_eq!(got.to_string(), "[::1]:443");
+        assert_eq!(mock.total_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_domain_returns_first_address_with_port() {
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "example.com",
+            Ok(vec![
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ]),
+        );
+        let addr = Address::Domain("example.com".into(), 8080);
+        let got = resolve_socket_addr(&cache, &addr).await.unwrap();
+        assert_eq!(got, "93.184.216.34:8080".parse::<SocketAddr>().unwrap());
+        assert_eq!(mock.call_count("example.com"), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_domain_not_found_maps_to_io_not_found() {
+        let (cache, mock) = mock_cache();
+        // MockResolver returns NotFound for any unmapped host.
+        let addr = Address::Domain("nx.invalid".into(), 80);
+        let err = resolve_socket_addr(&cache, &addr).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(mock.call_count("nx.invalid") >= 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_socket_addr_domain_timeout_maps_to_io_timedout() {
+        let (cache, mock) = mock_cache();
+        mock.set(
+            "slow.example",
+            Err(dns_cache_rs::DnsError::Timeout(
+                std::time::Duration::from_millis(50),
+            )),
+        );
+        let addr = Address::Domain("slow.example".into(), 80);
+        let err = resolve_socket_addr(&cache, &addr).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
